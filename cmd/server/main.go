@@ -5,10 +5,12 @@ import (
 	"io"
 	"log"
 	"net"
-
-	"tcp-dormtun/internal/transport"
+	"time"
 
 	"github.com/xtaci/smux"
+
+	"tcp-dormtun/internal/proto"
+	"tcp-dormtun/internal/transport"
 )
 
 func main() {
@@ -56,10 +58,34 @@ func handleConn(conn net.Conn) {
 
 func handleStream(s *smux.Stream) {
 	defer s.Close()
-	log.Printf("stream %d opened", s.ID())
-	n, err := io.Copy(s, s)
-	if err != nil && err != io.EOF {
-		log.Printf("stream %d copy: %v", s.ID(), err)
+
+	target, err := proto.ReadTarget(s)
+	if err != nil {
+		log.Printf("stream %d: read target: %v", s.ID(), err)
+		return
 	}
-	log.Printf("stream %d closed, echoed %d bytes", s.ID(), n)
+	log.Printf("stream %d: dialing %s", s.ID(), target)
+
+	outConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		log.Printf("stream %d: dial %s failed: %v", s.ID(), target, err)
+		s.Write([]byte{0x01})
+		return
+	}
+	defer outConn.Close()
+
+	if _, err := s.Write([]byte{0x00}); err != nil {
+		log.Printf("stream %d: write status: %v", s.ID(), err)
+		return
+	}
+
+	relay(s, outConn)
+	log.Printf("stream %d: closed", s.ID())
+}
+
+func relay(a, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
+	<-done
 }

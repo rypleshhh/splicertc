@@ -1,3 +1,7 @@
+// Command gencert writes a throwaway self-signed TLS cert/key pair for
+// localhost, used only for local dev testing of the tunnel. Has nothing
+// to do with the tunnel's own protocol — replace with real certs (or
+// Reality-style pinning) for anything beyond loopback testing.
 package main
 
 import (

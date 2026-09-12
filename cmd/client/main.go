@@ -2,48 +2,96 @@ package main
 
 import (
 	"flag"
-	"fmt"
+	"io"
 	"log"
-
-	"tcp-dormtun/internal/transport"
+	"net"
 
 	"github.com/xtaci/smux"
+
+	"tcp-dormtun/internal/proto"
+	"tcp-dormtun/internal/socks5"
+	"tcp-dormtun/internal/transport"
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8443", "server address")
+	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
+	serverAddr := flag.String("server", "127.0.0.1:8443", "tunnel server address")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
 	flag.Parse()
 
-	conn, err := transport.Dial(*addr, *insecure)
+	conn, err := transport.Dial(*serverAddr, *insecure)
 	if err != nil {
-		log.Fatalf("dial: %v", err)
+		log.Fatalf("dial server: %v", err)
 	}
-	log.Printf("connected to %s", *addr)
-
 	sess, err := smux.Client(conn, nil)
 	if err != nil {
 		log.Fatalf("smux client: %v", err)
 	}
-	defer sess.Close()
+	log.Printf("connected to tunnel server %s", *serverAddr)
 
-	sendOnStream(sess, "first stream payload")
-	sendOnStream(sess, "second stream payload")
+	ln, err := net.Listen("tcp", *listenAddr)
+	if err != nil {
+		log.Fatalf("socks5 listen: %v", err)
+	}
+	log.Printf("SOCKS5 proxy listening on %s", *listenAddr)
+
+	for {
+		appConn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept: %v", err)
+			continue
+		}
+		go handleApp(appConn, sess)
+	}
 }
 
-func sendOnStream(sess *smux.Session, msg string) {
+func handleApp(appConn net.Conn, sess *smux.Session) {
+	defer appConn.Close()
+
+	if err := socks5.Handshake(appConn); err != nil {
+		log.Printf("socks5 handshake: %v", err)
+		return
+	}
+	target, err := socks5.ReadRequest(appConn)
+	if err != nil {
+		log.Printf("socks5 request: %v", err)
+		return
+	}
+	log.Printf("app requested %s", target)
+
 	stream, err := sess.OpenStream()
 	if err != nil {
-		log.Fatalf("open stream: %v", err)
+		log.Printf("open stream: %v", err)
+		socks5.WriteReply(appConn, false)
+		return
 	}
 	defer stream.Close()
 
-	stream.Write([]byte(msg))
-	buf := make([]byte, 128)
-	n, err := stream.Read(buf)
-	if err != nil {
-		log.Printf("stream %d read: %v", stream.ID(), err)
+	if err := proto.WriteTarget(stream, target); err != nil {
+		log.Printf("send target: %v", err)
+		socks5.WriteReply(appConn, false)
 		return
 	}
-	fmt.Printf("stream %d got back: %q\n", stream.ID(), buf[:n])
+
+	status := make([]byte, 1)
+	if _, err := io.ReadFull(stream, status); err != nil || status[0] != 0 {
+		log.Printf("server could not reach %s: %v", target, err)
+		socks5.WriteReply(appConn, false)
+		return
+	}
+
+	if err := socks5.WriteReply(appConn, true); err != nil {
+		log.Printf("socks5 reply: %v", err)
+		return
+	}
+
+	relay(appConn, stream)
+	log.Printf("%s: closed", target)
+}
+
+func relay(a, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
+	<-done
 }
