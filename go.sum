@@ -1,2 +1,15 @@
+github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/fumiama/wintun v0.0.0-20211229152851-8bc97c8034c0 h1:WfrSFlIlCAtg6Rt2IGna0HhJYSDE45YVHiYqO4wwsEw=
+github.com/fumiama/wintun v0.0.0-20211229152851-8bc97c8034c0/go.mod h1:dPOG7Af/ArO62RgBz2JJTNFByBn/IXWLo/1kZKcLSe8=
+github.com/golang/net v0.15.0 h1:ENWicmYl8qzsgLFls+jn18/uW4l4GS9xVRZd6Sbl4Mc=
+github.com/golang/net v0.15.0/go.mod h1:idbUs1IY1+zTqbi8yxTbhexhEEk5ur9LInksu6HrEpk=
+github.com/golang/sys v0.12.0 h1:3wuZ+3/8gZ9yk11wapEibVF+BNzIK0zCZsHU7hv1h0U=
+github.com/golang/sys v0.12.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/sirupsen/logrus v1.8.1 h1:dJKuHgqk1NNQlqoA6BTlM1Wf9DOH3NBjQyu0h9+AZZE=
+github.com/sirupsen/logrus v1.8.1/go.mod h1:yWOB1SBYBC5VeMP7gHvWumXLIWorT60ONWic61uBYv0=
+github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
+github.com/tailscale/wireguard-go v0.0.0-20231121184858-cc193a0b3272 h1:zwsem4CaamMdC3tFoTpzrsUSMDPV0K6rhnQdF7kXekQ=
+github.com/tailscale/wireguard-go v0.0.0-20231121184858-cc193a0b3272/go.mod h1:BOm5fXUBFM+m9woLNBoxI9TaBXXhGNP50LX/TGIvGb4=
 github.com/xtaci/smux v1.5.57 h1:N72VbGoSYxgcm6mPOYX0QzEZNVD3UI/JlVvAtXF+WrY=
 github.com/xtaci/smux v1.5.57/go.mod h1:IGQ9QYrBphmb/4aTnLEcJby0TNr3NV+OslIOMrX825Q=
