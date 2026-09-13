@@ -7,26 +7,39 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
 
+	"github.com/tailscale/wireguard-go/tun"
+
 	"tcp-dormtun/internal/frame"
+	"tcp-dormtun/internal/glue"
+	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/socks5"
 	"tcp-dormtun/internal/transport"
 )
 
 func main() {
-	mode := flag.String("mode", "socks5", "socks5 (default) or droptest")
+	mode := flag.String("mode", "socks5", "socks5 (default), droptest, or tun")
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverAddr := flag.String("server", "127.0.0.1:8443", "tunnel server address")
 	dropAddr := flag.String("drop-addr", "127.0.0.1:8444", "droppable channel address (droptest mode)")
+	glueAddr := flag.String("glue-addr", "127.0.0.1:8446", "glue channel address (tun mode)")
+	tunName := flag.String("tun-name", "dormtun0", "TUN interface name (tun mode)")
+	tunMTU := flag.Int("tun-mtu", 1420, "TUN interface MTU (tun mode)")
 	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
 	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	dropPaths := flag.Int("drop-paths", 1, "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
 	flag.Parse()
+
+	if *mode == "tun" {
+		runTunMode(*glueAddr, *insecure, *tunName, *tunMTU)
+		return
+	}
 
 	if *mode == "droptest" {
 		switch {
@@ -236,4 +249,112 @@ func runDropMultipath(dropAddr string, insecure bool, count int, interval time.D
 	}
 	log.Printf("done: %d frames sent on all %d paths (check server log for the session summary)", count, paths)
 	time.Sleep(300 * time.Millisecond)
+}
+
+// flowInfo remembers the original 4-tuple of a captured outbound packet
+// so a reply can be turned back into a packet the OS will recognize as
+// belonging to that same local socket.
+type flowInfo struct {
+	origSrc, origDst         [4]byte
+	origSrcPort, origDstPort uint16
+}
+
+// runTunMode is the real integration: captures actual outbound UDP from
+// a TUN interface, tunnels it through the glue channel, and reinjects
+// whatever comes back so the OS (and the game/app that opened the local
+// socket) sees an ordinary reply. IPv4 only — see internal/glue.
+func runTunMode(glueAddr string, insecure bool, tunName string, mtu int) {
+	dev, err := tun.CreateTUN(tunName, mtu)
+	if err != nil {
+		log.Fatalf("create TUN: %v", err)
+	}
+	defer dev.Close()
+	actualName, _ := dev.Name()
+	log.Printf("TUN interface up: %s (requested %q, mtu %d)", actualName, tunName, mtu)
+
+	conn, err := transport.Dial(glueAddr, insecure)
+	if err != nil {
+		log.Fatalf("dial glue: %v", err)
+	}
+	defer conn.Close()
+	if err := sendNewSessionID(conn); err != nil {
+		log.Fatalf("send session id: %v", err)
+	}
+	log.Printf("connected to glue channel %s", glueAddr)
+
+	var flowsMu sync.Mutex
+	flows := make(map[uint16]flowInfo)
+
+	// reader: server -> client. Runs concurrently with the TUN-read loop
+	// below; the two never touch the connection at the same time in a
+	// conflicting way (one only reads, the other only writes), so no
+	// lock is needed on conn itself.
+	go func() {
+		for {
+			f, err := frame.ReadFrame(conn)
+			if err != nil {
+				log.Printf("glue: connection closed: %v", err)
+				return
+			}
+			flowID, payload, err := glue.DecodeInbound(f.Payload)
+			if err != nil {
+				log.Printf("glue: decode inbound: %v", err)
+				continue
+			}
+
+			flowsMu.Lock()
+			fi, known := flows[flowID]
+			flowsMu.Unlock()
+			if !known {
+				log.Printf("glue: reply for unknown flow %d, dropping", flowID)
+				continue
+			}
+
+			pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload)
+			if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
+				log.Printf("TUN write: %v", err)
+			}
+		}
+	}()
+
+	log.Println("waiting for outbound UDP to tunnel — bring the interface up and route real traffic through it")
+
+	batch := dev.BatchSize()
+	bufs := make([][]byte, batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, mtu+32)
+	}
+	sizes := make([]int, batch)
+
+	var seq uint32
+	for {
+		n, err := dev.Read(bufs, sizes, 0)
+		if err != nil {
+			log.Fatalf("TUN read: %v", err)
+		}
+		for i := 0; i < n; i++ {
+			info, ok := pktfilter.Parse(bufs[i][:sizes[i]])
+			if !ok || info.Noise || info.Version != 4 || info.Proto != 17 || info.Payload == nil {
+				continue
+			}
+
+			flowID := info.SrcPort
+			var fi flowInfo
+			copy(fi.origSrc[:], info.Src.To4())
+			copy(fi.origDst[:], info.Dst.To4())
+			fi.origSrcPort = info.SrcPort
+			fi.origDstPort = info.DstPort
+
+			flowsMu.Lock()
+			flows[flowID] = fi
+			flowsMu.Unlock()
+
+			envelope := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+			seq++
+			fr := frame.New(seq, envelope)
+			if _, err := conn.Write(fr.Marshal()); err != nil {
+				log.Printf("glue write: %v", err)
+			}
+		}
+	}
 }

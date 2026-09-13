@@ -19,13 +19,14 @@ import (
 
 // Info describes one parsed packet.
 type Info struct {
-	Version         int
-	Proto           byte
-	Src, Dst        net.IP
+	Version          int
+	Proto            byte
+	Src, Dst         net.IP
 	SrcPort, DstPort uint16 // 0 if not UDP, or ports weren't parseable
-	Len             int
-	Noise           bool
-	Reason          string // why it's noise, or why it's not (both informative)
+	Payload          []byte // UDP payload, if Proto==17 and long enough to have one; aliases the input slice
+	Len              int
+	Noise            bool
+	Reason           string // why it's noise, or why it's not (both informative)
 }
 
 func (i Info) String() string {
@@ -81,6 +82,9 @@ func Parse(pkt []byte) (info Info, ok bool) {
 		if info.Proto == 17 && len(pkt) >= ihl+4 {
 			info.SrcPort = binary.BigEndian.Uint16(pkt[ihl : ihl+2])
 			info.DstPort = binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
+			if len(pkt) >= ihl+8 {
+				info.Payload = pkt[ihl+8:]
+			}
 		}
 
 	case 6:

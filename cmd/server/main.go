@@ -7,11 +7,13 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
 
 	"tcp-dormtun/internal/frame"
+	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/transport"
 )
@@ -48,6 +50,7 @@ func getDropSession(id string) *dropSession {
 func main() {
 	addr := flag.String("addr", ":8443", "reliable channel listen address")
 	dropAddr := flag.String("drop-addr", ":8444", "droppable channel listen address")
+	glueAddr := flag.String("glue-addr", ":8446", "glue channel listen address (real captured UDP traffic)")
 	cert := flag.String("cert", "devcerts/dev.crt", "TLS cert file")
 	key := flag.String("key", "devcerts/dev.key", "TLS key file")
 	flag.Parse()
@@ -64,6 +67,12 @@ func main() {
 	}
 	log.Printf("droppable channel listening on %s", *dropAddr)
 
+	glueLn, err := transport.Listen(*glueAddr, *cert, *key)
+	if err != nil {
+		log.Fatalf("glue listen: %v", err)
+	}
+	log.Printf("glue channel listening on %s", *glueAddr)
+
 	go func() {
 		for {
 			conn, err := dropLn.Accept()
@@ -72,6 +81,17 @@ func main() {
 				continue
 			}
 			go handleDroppableConn(conn)
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := glueLn.Accept()
+			if err != nil {
+				log.Printf("glue accept: %v", err)
+				continue
+			}
+			go handleGlueConn(conn)
 		}
 	}()
 
@@ -192,4 +212,96 @@ func relay(a, b io.ReadWriteCloser) {
 	go func() { io.Copy(a, b); done <- struct{}{} }()
 	go func() { io.Copy(b, a); done <- struct{}{} }()
 	<-done
+}
+
+// handleGlueConn carries real captured UDP traffic (see internal/glue):
+// each distinct flow ID gets its own real net.UDPConn to the requested
+// destination, dialed lazily on first use. A per-flow goroutine reads
+// whatever comes back and ships it to the client as a new frame. Several
+// of those goroutines can be writing to the same underlying connection
+// concurrently, so writes go through writeMu — frame bytes must not
+// interleave.
+func handleGlueConn(conn net.Conn) {
+	defer conn.Close()
+
+	sidBuf := make([]byte, 8)
+	if _, err := io.ReadFull(conn, sidBuf); err != nil {
+		log.Printf("glue: read session id: %v", err)
+		return
+	}
+	sid := hex.EncodeToString(sidBuf)
+	log.Printf("glue client connected: %s (session %s)", conn.RemoteAddr(), sid)
+
+	recv := frame.NewReceiver(150 * time.Millisecond)
+
+	var writeMu sync.Mutex
+	var replySeq uint32
+
+	var flowsMu sync.Mutex
+	flows := make(map[uint16]*net.UDPConn)
+
+	defer func() {
+		flowsMu.Lock()
+		for _, uc := range flows {
+			uc.Close()
+		}
+		flowsMu.Unlock()
+	}()
+
+	for {
+		f, err := frame.ReadFrame(conn)
+		if err != nil {
+			log.Printf("glue: connection closed (session %s): %v", sid, err)
+			return
+		}
+		if ok, reason := recv.Accept(f); !ok {
+			log.Printf("glue: frame dropped (%s)", reason)
+			continue
+		}
+
+		flowID, dst, dstPort, payload, err := glue.DecodeOutbound(f.Payload)
+		if err != nil {
+			log.Printf("glue: decode: %v", err)
+			continue
+		}
+
+		flowsMu.Lock()
+		udpConn, exists := flows[flowID]
+		flowsMu.Unlock()
+
+		if !exists {
+			raddr := &net.UDPAddr{IP: dst, Port: int(dstPort)}
+			udpConn, err = net.DialUDP("udp", nil, raddr)
+			if err != nil {
+				log.Printf("glue: dial UDP %s for flow %d: %v", raddr, flowID, err)
+				continue
+			}
+			flowsMu.Lock()
+			flows[flowID] = udpConn
+			flowsMu.Unlock()
+			log.Printf("glue: new flow %d -> %s", flowID, raddr)
+
+			go func(flowID uint16, uc *net.UDPConn) {
+				buf := make([]byte, 65535)
+				for {
+					n, err := uc.Read(buf)
+					if err != nil {
+						return
+					}
+					seq := atomic.AddUint32(&replySeq, 1)
+					reply := frame.New(seq, glue.EncodeInbound(flowID, buf[:n]))
+					writeMu.Lock()
+					_, werr := conn.Write(reply.Marshal())
+					writeMu.Unlock()
+					if werr != nil {
+						return
+					}
+				}
+			}(flowID, udpConn)
+		}
+
+		if _, err := udpConn.Write(payload); err != nil {
+			log.Printf("glue: write to UDP target for flow %d: %v", flowID, err)
+		}
+	}
 }
