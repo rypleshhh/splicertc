@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -23,13 +24,17 @@ func main() {
 	dropAddr := flag.String("drop-addr", "127.0.0.1:8444", "droppable channel address (droptest mode)")
 	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
 	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
+	dropPaths := flag.Int("drop-paths", 1, "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
 	flag.Parse()
 
 	if *mode == "droptest" {
-		if *dropCount > 0 {
+		switch {
+		case *dropCount > 0 && *dropPaths > 1:
+			runDropMultipath(*dropAddr, *insecure, *dropCount, *dropInterval, *dropPaths)
+		case *dropCount > 0:
 			runDropStress(*dropAddr, *insecure, *dropCount, *dropInterval)
-		} else {
+		default:
 			runDropTest(*dropAddr, *insecure)
 		}
 		return
@@ -167,5 +172,49 @@ func runDropStress(dropAddr string, insecure bool, count int, interval time.Dura
 		time.Sleep(interval)
 	}
 	log.Printf("done: %d/%d frames written to the connection (check server log for accepted/DROPPED)", sent, count)
+	time.Sleep(300 * time.Millisecond)
+}
+
+// runDropMultipath opens `paths` independent TLS connections, all tagged
+// with the same 8-byte session ID so the server can dedupe across them,
+// and writes every frame to all of them — a cheap stand-in for real path
+// diversity (see the ExitLag/multipath discussion): even sharing one
+// physical uplink, each TCP connection draws netem's loss independently,
+// so a frame only truly dies if it's unlucky on *every* path at once.
+func runDropMultipath(dropAddr string, insecure bool, count int, interval time.Duration, paths int) {
+	sid := make([]byte, 8)
+	if _, err := rand.Read(sid); err != nil {
+		log.Fatalf("generate session id: %v", err)
+	}
+	log.Printf("multipath droptest: session %x, %d paths, %d frames every %v", sid, paths, count, interval)
+
+	conns := make([]net.Conn, paths)
+	for i := 0; i < paths; i++ {
+		conn, err := transport.Dial(dropAddr, insecure)
+		if err != nil {
+			log.Fatalf("dial path %d: %v", i, err)
+		}
+		if _, err := conn.Write(sid); err != nil {
+			log.Fatalf("send session id on path %d: %v", i, err)
+		}
+		conns[i] = conn
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	for i := 0; i < count; i++ {
+		f := frame.New(uint32(i), []byte(fmt.Sprintf("frame #%d", i)))
+		wire := f.Marshal()
+		for pathIdx, c := range conns {
+			if _, err := c.Write(wire); err != nil {
+				log.Printf("frame %d: write failed on path %d: %v", i, pathIdx, err)
+			}
+		}
+		time.Sleep(interval)
+	}
+	log.Printf("done: %d frames sent on all %d paths (check server log for the session summary)", count, paths)
 	time.Sleep(300 * time.Millisecond)
 }

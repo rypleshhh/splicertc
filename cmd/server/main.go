@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -13,6 +15,34 @@ import (
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/transport"
 )
+
+// dropSession is shared by every connection that presents the same
+// session ID — that's what lets N parallel "duplicate" connections
+// dedupe against each other instead of each pretending every frame
+// it sees is new.
+type dropSession struct {
+	mu         sync.Mutex
+	recv       *frame.Receiver
+	accepted   int
+	ttlDropped int // genuinely too late everywhere — real loss the mechanism couldn't save
+	duplicates int // arrived after a fresher/earlier copy already won — expected cost of duplication, not loss
+}
+
+var dropSessions = struct {
+	mu sync.Mutex
+	m  map[string]*dropSession
+}{m: make(map[string]*dropSession)}
+
+func getDropSession(id string) *dropSession {
+	dropSessions.mu.Lock()
+	defer dropSessions.mu.Unlock()
+	s, ok := dropSessions.m[id]
+	if !ok {
+		s = &dropSession{recv: frame.NewReceiver(150 * time.Millisecond)}
+		dropSessions.m[id] = s
+	}
+	return s
+}
 
 func main() {
 	addr := flag.String("addr", ":8443", "reliable channel listen address")
@@ -60,34 +90,57 @@ func main() {
 // and vice versa.
 func handleDroppableConn(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("droppable client connected: %s", conn.RemoteAddr())
 
-	recv := frame.NewReceiver(150 * time.Millisecond)
-	var accepted, dropped int
+	sidBuf := make([]byte, 8)
+	if _, err := io.ReadFull(conn, sidBuf); err != nil {
+		log.Printf("droppable: read session id: %v", err)
+		return
+	}
+	sid := hex.EncodeToString(sidBuf)
+	sess := getDropSession(sid)
+	log.Printf("droppable path connected: %s (session %s)", conn.RemoteAddr(), sid)
+
 	for {
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
-			log.Printf("droppable read: %v — summary: %d accepted, %d dropped (%.1f%% drop rate)",
-				err, accepted, dropped, dropRate(accepted, dropped))
+			sess.mu.Lock()
+			a, t, d := sess.accepted, sess.ttlDropped, sess.duplicates
+			sess.mu.Unlock()
+			log.Printf("droppable path closed (session %s): %v — session summary so far: %d accepted, %d TTL-dropped (real loss), %d duplicate-suppressed (%.1f%% real drop rate)",
+				sid, err, a, t, d, dropRate(a, t))
 			return
 		}
 		age := time.Since(time.UnixMilli(f.TimestampMS))
-		if ok, reason := recv.Accept(f); ok {
-			accepted++
-			log.Printf("frame %d accepted (age %v): %q", f.Seq, age, f.Payload)
+
+		sess.mu.Lock()
+		ok, reason := sess.recv.Accept(f)
+		switch {
+		case ok:
+			sess.accepted++
+		case reason == "ttl exceeded":
+			sess.ttlDropped++
+		default:
+			sess.duplicates++
+		}
+		sess.mu.Unlock()
+
+		if ok {
+			log.Printf("[session %s] frame %d accepted (age %v) via %s", sid, f.Seq, age, conn.RemoteAddr())
 		} else {
-			dropped++
-			log.Printf("frame %d DROPPED (%s, age %v)", f.Seq, reason, age)
+			log.Printf("[session %s] frame %d dropped (%s, age %v) via %s", sid, f.Seq, reason, age, conn.RemoteAddr())
 		}
 	}
 }
 
-func dropRate(accepted, dropped int) float64 {
-	total := accepted + dropped
+// dropRate is the real, meaningful loss rate: accepted vs genuinely
+// too-late-everywhere. Duplicate-suppressed frames are excluded on
+// purpose — they're the expected cost of running N paths, not loss.
+func dropRate(accepted, ttlDropped int) float64 {
+	total := accepted + ttlDropped
 	if total == 0 {
 		return 0
 	}
-	return 100 * float64(dropped) / float64(total)
+	return 100 * float64(ttlDropped) / float64(total)
 }
 
 func handleConn(conn net.Conn) {
