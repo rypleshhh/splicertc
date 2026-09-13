@@ -23,8 +23,9 @@ import (
 type dropSession struct {
 	mu         sync.Mutex
 	recv       *frame.Receiver
+	seen       map[uint32]struct{} // distinct frames ever observed, regardless of outcome
 	accepted   int
-	ttlDropped int // genuinely too late everywhere — real loss the mechanism couldn't save
+	ttlDropped int // copy-level count — informative, but NOT the real loss rate under multipath
 	duplicates int // arrived after a fresher/earlier copy already won — expected cost of duplication, not loss
 }
 
@@ -38,7 +39,7 @@ func getDropSession(id string) *dropSession {
 	defer dropSessions.mu.Unlock()
 	s, ok := dropSessions.m[id]
 	if !ok {
-		s = &dropSession{recv: frame.NewReceiver(150 * time.Millisecond)}
+		s = &dropSession{recv: frame.NewReceiver(150 * time.Millisecond), seen: make(map[uint32]struct{})}
 		dropSessions.m[id] = s
 	}
 	return s
@@ -104,15 +105,21 @@ func handleDroppableConn(conn net.Conn) {
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
 			sess.mu.Lock()
-			a, t, d := sess.accepted, sess.ttlDropped, sess.duplicates
+			a, t, d, total := sess.accepted, sess.ttlDropped, sess.duplicates, len(sess.seen)
 			sess.mu.Unlock()
-			log.Printf("droppable path closed (session %s): %v — session summary so far: %d accepted, %d TTL-dropped (real loss), %d duplicate-suppressed (%.1f%% real drop rate)",
-				sid, err, a, t, d, dropRate(a, t))
+			lost := total - a
+			lossPct := 0.0
+			if total > 0 {
+				lossPct = 100 * float64(lost) / float64(total)
+			}
+			log.Printf("droppable path closed (session %s): %v — session summary so far: %d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
+				sid, err, a, total, lost, lossPct, t, d)
 			return
 		}
 		age := time.Since(time.UnixMilli(f.TimestampMS))
 
 		sess.mu.Lock()
+		sess.seen[f.Seq] = struct{}{}
 		ok, reason := sess.recv.Accept(f)
 		switch {
 		case ok:
@@ -130,17 +137,6 @@ func handleDroppableConn(conn net.Conn) {
 			log.Printf("[session %s] frame %d dropped (%s, age %v) via %s", sid, f.Seq, reason, age, conn.RemoteAddr())
 		}
 	}
-}
-
-// dropRate is the real, meaningful loss rate: accepted vs genuinely
-// too-late-everywhere. Duplicate-suppressed frames are excluded on
-// purpose — they're the expected cost of running N paths, not loss.
-func dropRate(accepted, ttlDropped int) float64 {
-	total := accepted + ttlDropped
-	if total == 0 {
-		return 0
-	}
-	return 100 * float64(ttlDropped) / float64(total)
 }
 
 func handleConn(conn net.Conn) {

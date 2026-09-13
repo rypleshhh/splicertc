@@ -128,6 +128,9 @@ func runDropTest(dropAddr string, insecure bool) {
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
+	if err := sendNewSessionID(conn); err != nil {
+		log.Fatalf("send session id: %v", err)
+	}
 	log.Printf("connected to droppable channel %s", dropAddr)
 
 	delays := []time.Duration{0, 0, 300 * time.Millisecond, 0, 400 * time.Millisecond, 0}
@@ -159,6 +162,9 @@ func runDropStress(dropAddr string, insecure bool, count int, interval time.Dura
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
+	if err := sendNewSessionID(conn); err != nil {
+		log.Fatalf("send session id: %v", err)
+	}
 	log.Printf("connected to droppable channel %s, sending %d frames every %v", dropAddr, count, interval)
 
 	sent := 0
@@ -181,6 +187,19 @@ func runDropStress(dropAddr string, insecure bool, count int, interval time.Dura
 // diversity (see the ExitLag/multipath discussion): even sharing one
 // physical uplink, each TCP connection draws netem's loss independently,
 // so a frame only truly dies if it's unlucky on *every* path at once.
+// sendNewSessionID generates a fresh random 8-byte session id and writes
+// it as the header every droppable connection is now expected to send —
+// required so the server's shared-receiver bookkeeping (used for
+// multipath dedup) has a consistent handshake regardless of mode.
+func sendNewSessionID(conn net.Conn) error {
+	sid := make([]byte, 8)
+	if _, err := rand.Read(sid); err != nil {
+		return err
+	}
+	_, err := conn.Write(sid)
+	return err
+}
+
 func runDropMultipath(dropAddr string, insecure bool, count int, interval time.Duration, paths int) {
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
