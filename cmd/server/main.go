@@ -63,19 +63,31 @@ func handleDroppableConn(conn net.Conn) {
 	log.Printf("droppable client connected: %s", conn.RemoteAddr())
 
 	recv := frame.NewReceiver(150 * time.Millisecond)
+	var accepted, dropped int
 	for {
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
-			log.Printf("droppable read: %v", err)
+			log.Printf("droppable read: %v — summary: %d accepted, %d dropped (%.1f%% drop rate)",
+				err, accepted, dropped, dropRate(accepted, dropped))
 			return
 		}
 		age := time.Since(time.UnixMilli(f.TimestampMS))
 		if ok, reason := recv.Accept(f); ok {
+			accepted++
 			log.Printf("frame %d accepted (age %v): %q", f.Seq, age, f.Payload)
 		} else {
+			dropped++
 			log.Printf("frame %d DROPPED (%s, age %v)", f.Seq, reason, age)
 		}
 	}
+}
+
+func dropRate(accepted, dropped int) float64 {
+	total := accepted + dropped
+	if total == 0 {
+		return 0
+	}
+	return 100 * float64(dropped) / float64(total)
 }
 
 func handleConn(conn net.Conn) {

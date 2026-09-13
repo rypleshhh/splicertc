@@ -21,11 +21,17 @@ func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverAddr := flag.String("server", "127.0.0.1:8443", "tunnel server address")
 	dropAddr := flag.String("drop-addr", "127.0.0.1:8444", "droppable channel address (droptest mode)")
+	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
+	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
 	flag.Parse()
 
 	if *mode == "droptest" {
-		runDropTest(*dropAddr, *insecure)
+		if *dropCount > 0 {
+			runDropStress(*dropAddr, *insecure, *dropCount, *dropInterval)
+		} else {
+			runDropTest(*dropAddr, *insecure)
+		}
 		return
 	}
 
@@ -133,5 +139,33 @@ func runDropTest(dropAddr string, insecure bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	log.Println("all frames sent")
+	time.Sleep(300 * time.Millisecond)
+}
+
+// runDropStress sends count frames spaced by interval, with no artificial
+// delay — under a lossy/jittery real connection (tc netem on the server
+// side), some frames will genuinely arrive stale due to real TCP
+// retransmission stalls, not a simulated sleep. Check the server's log
+// for the accepted/DROPPED breakdown; this side just confirms what left
+// the client.
+func runDropStress(dropAddr string, insecure bool, count int, interval time.Duration) {
+	conn, err := transport.Dial(dropAddr, insecure)
+	if err != nil {
+		log.Fatalf("dial droppable: %v", err)
+	}
+	defer conn.Close()
+	log.Printf("connected to droppable channel %s, sending %d frames every %v", dropAddr, count, interval)
+
+	sent := 0
+	for i := 0; i < count; i++ {
+		f := frame.New(uint32(i), []byte(fmt.Sprintf("frame #%d", i)))
+		if _, err := conn.Write(f.Marshal()); err != nil {
+			log.Printf("write frame %d: %v (stopping)", i, err)
+			break
+		}
+		sent++
+		time.Sleep(interval)
+	}
+	log.Printf("done: %d/%d frames written to the connection (check server log for accepted/DROPPED)", sent, count)
 	time.Sleep(300 * time.Millisecond)
 }
