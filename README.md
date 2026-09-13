@@ -1,1 +1,1 @@
-bash go run ./cmd/gencer
+bash go run ./cmd/gencert
