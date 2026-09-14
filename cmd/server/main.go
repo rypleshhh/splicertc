@@ -7,16 +7,35 @@ import (
 	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/transport"
 )
+
+// authKey is nil when auth is disabled (explicitly, via an empty
+// -psk-file) — checkAuth becomes a no-op in that case.
+var authKey []byte
+
+// checkAuth runs the challenge-response handshake if auth is enabled.
+// Call this first thing after Accept, before any protocol-specific
+// logic — an unauthenticated connection shouldn't get far enough to
+// open a SOCKS5 tunnel, occupy a droppable session, or relay UDP.
+func checkAuth(conn net.Conn) bool {
+	if authKey == nil {
+		return true
+	}
+	if err := auth.ServerHandshake(conn, authKey); err != nil {
+		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
+		return false
+	}
+	return true
+}
 
 // dropSession is shared by every connection that presents the same
 // session ID — that's what lets N parallel "duplicate" connections
@@ -47,13 +66,103 @@ func getDropSession(id string) *dropSession {
 	return s
 }
 
+// glueSession is shared by all parallel paths carrying the same session
+// ID. The dedup receiver rejects duplicate copies of a frame that
+// arrived on more than one path; udpFlows are the real sockets out to
+// game servers; paths is the set of currently-connected client
+// connections, any/all of which a reply can be duplicated back over.
+type glueSession struct {
+	mu       sync.Mutex
+	recv     *frame.Receiver
+	udpFlows map[uint16]*net.UDPConn
+	paths    map[net.Conn]struct{}
+	replySeq uint32
+}
+
+var glueSessions = struct {
+	mu sync.Mutex
+	m  map[string]*glueSession
+}{m: make(map[string]*glueSession)}
+
+func getGlueSession(id string) *glueSession {
+	glueSessions.mu.Lock()
+	defer glueSessions.mu.Unlock()
+	s, ok := glueSessions.m[id]
+	if !ok {
+		s = &glueSession{
+			recv:     frame.NewReceiver(150 * time.Millisecond),
+			udpFlows: make(map[uint16]*net.UDPConn),
+			paths:    make(map[net.Conn]struct{}),
+		}
+		glueSessions.m[id] = s
+	}
+	return s
+}
+
+// broadcastPing echoes a measurement ping back over every live path.
+func (s *glueSession) broadcastPing(nonce uint64) {
+	s.mu.Lock()
+	seq := s.replySeq
+	s.replySeq++
+	paths := make([]net.Conn, 0, len(s.paths))
+	for c := range s.paths {
+		paths = append(paths, c)
+	}
+	s.mu.Unlock()
+
+	wire := frame.New(seq, glue.EncodePing(nonce)).Marshal()
+	for _, c := range paths {
+		if _, err := c.Write(wire); err != nil {
+			s.mu.Lock()
+			delete(s.paths, c)
+			s.mu.Unlock()
+		}
+	}
+}
+
+// broadcastReply duplicates one reply frame across every currently
+// connected path for this session. Under multipath that's the same
+// loss-hedging in the server->client direction as the client does
+// client->server. Dead paths are dropped from the set.
+func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
+	s.mu.Lock()
+	seq := s.replySeq
+	s.replySeq++
+	paths := make([]net.Conn, 0, len(s.paths))
+	for c := range s.paths {
+		paths = append(paths, c)
+	}
+	s.mu.Unlock()
+
+	wire := frame.New(seq, glue.EncodeInbound(flowID, payload)).Marshal()
+	for _, c := range paths {
+		if _, err := c.Write(wire); err != nil {
+			s.mu.Lock()
+			delete(s.paths, c)
+			s.mu.Unlock()
+		}
+	}
+}
+
 func main() {
 	addr := flag.String("addr", ":8443", "reliable channel listen address")
 	dropAddr := flag.String("drop-addr", ":8444", "droppable channel listen address")
 	glueAddr := flag.String("glue-addr", ":8446", "glue channel listen address (real captured UDP traffic)")
 	cert := flag.String("cert", "devcerts/dev.crt", "TLS cert file")
 	key := flag.String("key", "devcerts/dev.key", "TLS key file")
+	pskFile := flag.String("psk-file", "", "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
 	flag.Parse()
+
+	if *pskFile != "" {
+		k, err := auth.LoadKey(*pskFile)
+		if err != nil {
+			log.Fatalf("load psk: %v", err)
+		}
+		authKey = k
+		log.Println("client authentication enabled")
+	} else {
+		log.Println("!!! WARNING: no -psk-file given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set -psk-file before exposing this to the internet.")
+	}
 
 	ln, err := transport.Listen(*addr, *cert, *key)
 	if err != nil {
@@ -111,6 +220,9 @@ func main() {
 // and vice versa.
 func handleDroppableConn(conn net.Conn) {
 	defer conn.Close()
+	if !checkAuth(conn) {
+		return
+	}
 
 	sidBuf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, sidBuf); err != nil {
@@ -161,6 +273,9 @@ func handleDroppableConn(conn net.Conn) {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
+	if !checkAuth(conn) {
+		return
+	}
 	log.Printf("client connected: %s", conn.RemoteAddr())
 
 	sess, err := smux.Server(conn, nil)
@@ -214,15 +329,17 @@ func relay(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-// handleGlueConn carries real captured UDP traffic (see internal/glue):
-// each distinct flow ID gets its own real net.UDPConn to the requested
-// destination, dialed lazily on first use. A per-flow goroutine reads
-// whatever comes back and ships it to the client as a new frame. Several
-// of those goroutines can be writing to the same underlying connection
-// concurrently, so writes go through writeMu — frame bytes must not
-// interleave.
+// handleGlueConn carries real captured UDP traffic (see internal/glue).
+// Multiple parallel connections can share one session ID (multipath):
+// they join a common glueSession so a frame duplicated across paths is
+// only acted on once, replies fan back out over every live path, and
+// all paths share one real UDP socket per flow. Single-path use (one
+// connection per session) is just the degenerate case.
 func handleGlueConn(conn net.Conn) {
 	defer conn.Close()
+	if !checkAuth(conn) {
+		return
+	}
 
 	sidBuf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, sidBuf); err != nil {
@@ -230,32 +347,39 @@ func handleGlueConn(conn net.Conn) {
 		return
 	}
 	sid := hex.EncodeToString(sidBuf)
-	log.Printf("glue client connected: %s (session %s)", conn.RemoteAddr(), sid)
+	sess := getGlueSession(sid)
 
-	recv := frame.NewReceiver(150 * time.Millisecond)
-
-	var writeMu sync.Mutex
-	var replySeq uint32
-
-	var flowsMu sync.Mutex
-	flows := make(map[uint16]*net.UDPConn)
+	sess.mu.Lock()
+	sess.paths[conn] = struct{}{}
+	nPaths := len(sess.paths)
+	sess.mu.Unlock()
+	log.Printf("glue path connected: %s (session %s, %d path(s) now)", conn.RemoteAddr(), sid, nPaths)
 
 	defer func() {
-		flowsMu.Lock()
-		for _, uc := range flows {
-			uc.Close()
-		}
-		flowsMu.Unlock()
+		sess.mu.Lock()
+		delete(sess.paths, conn)
+		sess.mu.Unlock()
 	}()
 
 	for {
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
-			log.Printf("glue: connection closed (session %s): %v", sid, err)
+			log.Printf("glue: path closed (session %s): %v", sid, err)
 			return
 		}
-		if ok, reason := recv.Accept(f); !ok {
-			log.Printf("glue: frame dropped (%s)", reason)
+
+		sess.mu.Lock()
+		ok, _ := sess.recv.Accept(f)
+		sess.mu.Unlock()
+		if !ok {
+			continue // duplicate copy from another path, or stale — already handled
+		}
+
+		// Measurement ping: echo it straight back over all paths, don't
+		// treat it as UDP-carrying.
+		if glue.IsPing(f.Payload) {
+			nonce, _ := glue.DecodePing(f.Payload)
+			sess.broadcastPing(nonce)
 			continue
 		}
 
@@ -265,9 +389,14 @@ func handleGlueConn(conn net.Conn) {
 			continue
 		}
 
-		flowsMu.Lock()
-		udpConn, exists := flows[flowID]
-		flowsMu.Unlock()
+		if ok, reason := glue.DestinationAllowed(dst, dstPort); !ok {
+			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
+			continue
+		}
+
+		sess.mu.Lock()
+		udpConn, exists := sess.udpFlows[flowID]
+		sess.mu.Unlock()
 
 		if !exists {
 			raddr := &net.UDPAddr{IP: dst, Port: int(dstPort)}
@@ -276,11 +405,12 @@ func handleGlueConn(conn net.Conn) {
 				log.Printf("glue: dial UDP %s for flow %d: %v", raddr, flowID, err)
 				continue
 			}
-			flowsMu.Lock()
-			flows[flowID] = udpConn
-			flowsMu.Unlock()
-			log.Printf("glue: new flow %d -> %s", flowID, raddr)
+			sess.mu.Lock()
+			sess.udpFlows[flowID] = udpConn
+			sess.mu.Unlock()
+			log.Printf("glue: new flow %d -> %s (session %s)", flowID, raddr, sid)
 
+			// One reader per flow, shipping replies back across all paths.
 			go func(flowID uint16, uc *net.UDPConn) {
 				buf := make([]byte, 65535)
 				for {
@@ -288,14 +418,7 @@ func handleGlueConn(conn net.Conn) {
 					if err != nil {
 						return
 					}
-					seq := atomic.AddUint32(&replySeq, 1)
-					reply := frame.New(seq, glue.EncodeInbound(flowID, buf[:n]))
-					writeMu.Lock()
-					_, werr := conn.Write(reply.Marshal())
-					writeMu.Unlock()
-					if werr != nil {
-						return
-					}
+					sess.broadcastReply(flowID, buf[:n])
 				}
 			}(flowID, udpConn)
 		}

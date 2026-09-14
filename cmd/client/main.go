@@ -14,8 +14,10 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
+	"tcp-dormtun/internal/measure"
 	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/socks5"
@@ -30,25 +32,38 @@ func main() {
 	glueAddr := flag.String("glue-addr", "127.0.0.1:8446", "glue channel address (tun mode)")
 	tunName := flag.String("tun-name", "dormtun0", "TUN interface name (tun mode)")
 	tunMTU := flag.Int("tun-mtu", 1420, "TUN interface MTU (tun mode)")
+	tunPaths := flag.Int("tun-paths", 1, "tun mode: number of parallel duplicated paths (1 = no duplication)")
+	tunMeasure := flag.Bool("tun-measure", false, "tun mode: send measurement pings and print RTT/jitter/loss periodically")
+	tunMeasureInterval := flag.Duration("tun-measure-interval", 33*time.Millisecond, "tun mode: spacing between measurement pings")
 	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
 	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	dropPaths := flag.Int("drop-paths", 1, "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
+	pskFile := flag.String("psk-file", "", "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
 	flag.Parse()
 
+	var key []byte
+	if *pskFile != "" {
+		k, err := auth.LoadKey(*pskFile)
+		if err != nil {
+			log.Fatalf("load psk: %v", err)
+		}
+		key = k
+	}
+
 	if *mode == "tun" {
-		runTunMode(*glueAddr, *insecure, *tunName, *tunMTU)
+		runTunMode(*glueAddr, *insecure, *tunName, *tunMTU, *tunPaths, *tunMeasure, *tunMeasureInterval, key)
 		return
 	}
 
 	if *mode == "droptest" {
 		switch {
 		case *dropCount > 0 && *dropPaths > 1:
-			runDropMultipath(*dropAddr, *insecure, *dropCount, *dropInterval, *dropPaths)
+			runDropMultipath(*dropAddr, *insecure, *dropCount, *dropInterval, *dropPaths, key)
 		case *dropCount > 0:
-			runDropStress(*dropAddr, *insecure, *dropCount, *dropInterval)
+			runDropStress(*dropAddr, *insecure, *dropCount, *dropInterval, key)
 		default:
-			runDropTest(*dropAddr, *insecure)
+			runDropTest(*dropAddr, *insecure, key)
 		}
 		return
 	}
@@ -56,6 +71,11 @@ func main() {
 	conn, err := transport.Dial(*serverAddr, *insecure)
 	if err != nil {
 		log.Fatalf("dial server: %v", err)
+	}
+	if key != nil {
+		if err := auth.ClientHandshake(conn, key); err != nil {
+			log.Fatalf("auth: %v", err)
+		}
 	}
 	sess, err := smux.Client(conn, nil)
 	if err != nil {
@@ -135,12 +155,17 @@ func relay(a, b io.ReadWriteCloser) {
 // in for "this frame got stuck behind a retransmit" without needing real
 // packet loss. The server's TTL is 150ms (see cmd/server), so delays past
 // that should show up there as drops.
-func runDropTest(dropAddr string, insecure bool) {
+func runDropTest(dropAddr string, insecure bool, key []byte) {
 	conn, err := transport.Dial(dropAddr, insecure)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
+	if key != nil {
+		if err := auth.ClientHandshake(conn, key); err != nil {
+			log.Fatalf("auth: %v", err)
+		}
+	}
 	if err := sendNewSessionID(conn); err != nil {
 		log.Fatalf("send session id: %v", err)
 	}
@@ -169,12 +194,17 @@ func runDropTest(dropAddr string, insecure bool) {
 // retransmission stalls, not a simulated sleep. Check the server's log
 // for the accepted/DROPPED breakdown; this side just confirms what left
 // the client.
-func runDropStress(dropAddr string, insecure bool, count int, interval time.Duration) {
+func runDropStress(dropAddr string, insecure bool, count int, interval time.Duration, key []byte) {
 	conn, err := transport.Dial(dropAddr, insecure)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
+	if key != nil {
+		if err := auth.ClientHandshake(conn, key); err != nil {
+			log.Fatalf("auth: %v", err)
+		}
+	}
 	if err := sendNewSessionID(conn); err != nil {
 		log.Fatalf("send session id: %v", err)
 	}
@@ -213,7 +243,7 @@ func sendNewSessionID(conn net.Conn) error {
 	return err
 }
 
-func runDropMultipath(dropAddr string, insecure bool, count int, interval time.Duration, paths int) {
+func runDropMultipath(dropAddr string, insecure bool, count int, interval time.Duration, paths int, key []byte) {
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
 		log.Fatalf("generate session id: %v", err)
@@ -225,6 +255,11 @@ func runDropMultipath(dropAddr string, insecure bool, count int, interval time.D
 		conn, err := transport.Dial(dropAddr, insecure)
 		if err != nil {
 			log.Fatalf("dial path %d: %v", i, err)
+		}
+		if key != nil {
+			if err := auth.ClientHandshake(conn, key); err != nil {
+				log.Fatalf("auth on path %d: %v", i, err)
+			}
 		}
 		if _, err := conn.Write(sid); err != nil {
 			log.Fatalf("send session id on path %d: %v", i, err)
@@ -263,7 +298,10 @@ type flowInfo struct {
 // a TUN interface, tunnels it through the glue channel, and reinjects
 // whatever comes back so the OS (and the game/app that opened the local
 // socket) sees an ordinary reply. IPv4 only — see internal/glue.
-func runTunMode(glueAddr string, insecure bool, tunName string, mtu int) {
+func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
+	if paths < 1 {
+		paths = 1
+	}
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
 		log.Fatalf("create TUN: %v", err)
@@ -272,52 +310,135 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int) {
 	actualName, _ := dev.Name()
 	log.Printf("TUN interface up: %s (requested %q, mtu %d)", actualName, tunName, mtu)
 
-	conn, err := transport.Dial(glueAddr, insecure)
-	if err != nil {
-		log.Fatalf("dial glue: %v", err)
+	var stats *measure.Stats
+	if doMeasure {
+		stats = measure.New()
 	}
-	defer conn.Close()
-	if err := sendNewSessionID(conn); err != nil {
-		log.Fatalf("send session id: %v", err)
+
+	// One shared session id across all paths, so the server dedupes
+	// duplicated copies against each other.
+	sid := make([]byte, 8)
+	if _, err := rand.Read(sid); err != nil {
+		log.Fatalf("generate session id: %v", err)
 	}
-	log.Printf("connected to glue channel %s", glueAddr)
+
+	conns := make([]net.Conn, 0, paths)
+	for i := 0; i < paths; i++ {
+		c, err := transport.Dial(glueAddr, insecure)
+		if err != nil {
+			log.Fatalf("dial glue path %d: %v", i, err)
+		}
+		if key != nil {
+			if err := auth.ClientHandshake(c, key); err != nil {
+				log.Fatalf("auth on path %d: %v", i, err)
+			}
+		}
+		if _, err := c.Write(sid); err != nil {
+			log.Fatalf("send session id on path %d: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	log.Printf("connected to glue channel %s over %d path(s)", glueAddr, paths)
 
 	var flowsMu sync.Mutex
 	flows := make(map[uint16]flowInfo)
 
-	// reader: server -> client. Runs concurrently with the TUN-read loop
-	// below; the two never touch the connection at the same time in a
-	// conflicting way (one only reads, the other only writes), so no
-	// lock is needed on conn itself.
-	go func() {
-		for {
-			f, err := frame.ReadFrame(conn)
-			if err != nil {
-				log.Printf("glue: connection closed: %v", err)
-				return
-			}
-			flowID, payload, err := glue.DecodeInbound(f.Payload)
-			if err != nil {
-				log.Printf("glue: decode inbound: %v", err)
-				continue
-			}
+	// Replies come back duplicated across every path (server-side
+	// broadcast), so a receiver dedupes them here before reinjecting —
+	// otherwise the OS would see each reply N times.
+	replyRecv := frame.NewReceiver(150 * time.Millisecond)
+	var replyMu sync.Mutex
 
-			flowsMu.Lock()
-			fi, known := flows[flowID]
-			flowsMu.Unlock()
-			if !known {
-				log.Printf("glue: reply for unknown flow %d, dropping", flowID)
-				continue
-			}
+	// One reader goroutine per path.
+	for _, c := range conns {
+		go func(c net.Conn) {
+			for {
+				f, err := frame.ReadFrame(c)
+				if err != nil {
+					return
+				}
+				replyMu.Lock()
+				ok, _ := replyRecv.Accept(f)
+				replyMu.Unlock()
+				if !ok {
+					continue // duplicate copy from another path
+				}
 
-			pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload)
-			if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
-				log.Printf("TUN write: %v", err)
+				// Measurement ping echo coming back — record RTT, don't
+				// treat as UDP.
+				if stats != nil {
+					if nonce, isPing := glue.DecodePing(f.Payload); isPing {
+						stats.OnRecv(nonce)
+						continue
+					}
+				}
+
+				flowID, payload, err := glue.DecodeInbound(f.Payload)
+				if err != nil {
+					continue
+				}
+				flowsMu.Lock()
+				fi, known := flows[flowID]
+				flowsMu.Unlock()
+				if !known {
+					continue
+				}
+				pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload)
+				if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
+					log.Printf("TUN write: %v", err)
+				}
 			}
-		}
-	}()
+		}(c)
+	}
 
 	log.Println("waiting for outbound UDP to tunnel — bring the interface up and route real traffic through it")
+
+	var seqMu sync.Mutex
+	var seq uint32
+	nextSeq := func() uint32 {
+		seqMu.Lock()
+		seq++
+		v := seq
+		seqMu.Unlock()
+		return v
+	}
+
+	writeAllPaths := func(wire []byte) {
+		for _, c := range conns {
+			if _, err := c.Write(wire); err != nil {
+				log.Printf("glue write: %v", err)
+			}
+		}
+	}
+
+	if stats != nil {
+		var nonce uint64
+		// ping sender
+		go func() {
+			ticker := time.NewTicker(measureInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				nonce++
+				stats.OnSend(nonce)
+				wire := frame.New(nextSeq(), glue.EncodePing(nonce)).Marshal()
+				writeAllPaths(wire)
+			}
+		}()
+		// periodic summary
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				log.Printf("[measure %d-path] %s", paths, stats.Snapshot(time.Second).String())
+			}
+		}()
+		log.Printf("measurement enabled: pinging every %v across %d path(s)", measureInterval, paths)
+	}
 
 	batch := dev.BatchSize()
 	bufs := make([][]byte, batch)
@@ -326,7 +447,6 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int) {
 	}
 	sizes := make([]int, batch)
 
-	var seq uint32
 	for {
 		n, err := dev.Read(bufs, sizes, 0)
 		if err != nil {
@@ -350,11 +470,8 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int) {
 			flowsMu.Unlock()
 
 			envelope := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
-			seq++
-			fr := frame.New(seq, envelope)
-			if _, err := conn.Write(fr.Marshal()); err != nil {
-				log.Printf("glue write: %v", err)
-			}
+			wire := frame.New(nextSeq(), envelope).Marshal()
+			writeAllPaths(wire)
 		}
 	}
 }

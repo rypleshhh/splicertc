@@ -1,0 +1,13 @@
+services:
+  dormtun-server:
+    build: .
+    container_name: dormtun-server
+    # Host networking so the container sees real client source addresses
+    # and can relay UDP outward without an extra NAT hop. Simplest for a
+    # dedicated test box. Ports in EXPOSE/CMD are used as-is on the host.
+    network_mode: host
+    restart: unless-stopped
+    # To use your own certs instead of the throwaway ones baked into the
+    # image, uncomment and point at a host directory holding dev.crt/dev.key:
+    # volumes:
+    #   - ./mycerts:/app/devcerts:ro

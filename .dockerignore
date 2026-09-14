@@ -1,0 +1,6 @@
+devcerts/
+server
+client
+tunprobe
+*.exe
+.git/
