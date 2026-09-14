@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
 
@@ -11,6 +12,13 @@ import (
 	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/transport"
 )
+
+// vpnKeepaliveInterval is how often an empty frame goes out when there's
+// no real traffic. Some NATs/firewalls (observed on the dorm network
+// this project targets) silently drop an idle TCP connection carrying no
+// data within a couple of minutes; a small periodic write is enough to
+// keep it classified as active.
+const vpnKeepaliveInterval = 20 * time.Second
 
 // runVPNMode is the full-tunnel counterpart to runTunMode: instead of
 // parsing UDP and re-encoding a flow-keyed glue envelope, it forwards
@@ -56,8 +64,30 @@ func runVPNMode(vpnAddr string, insecure bool, tunName string, mtu int, key []by
 			if err != nil {
 				log.Fatalf("vpn: connection closed: %v", err)
 			}
+			if len(f.Payload) == 0 {
+				continue // peer keepalive, not a packet
+			}
 			if _, err := dev.Write([][]byte{f.Payload}, 0); err != nil {
 				log.Printf("TUN write: %v", err)
+			}
+		}
+	}()
+
+	var writeMu sync.Mutex
+	writeFrame := func(payload []byte) error {
+		wire := frame.New(nextSeq(), payload).Marshal()
+		writeMu.Lock()
+		_, err := conn.Write(wire)
+		writeMu.Unlock()
+		return err
+	}
+
+	go func() {
+		ticker := time.NewTicker(vpnKeepaliveInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := writeFrame(nil); err != nil {
+				log.Printf("vpn: keepalive write: %v", err)
 			}
 		}
 	}()
@@ -81,8 +111,7 @@ func runVPNMode(vpnAddr string, insecure bool, tunName string, mtu int, key []by
 			if !ok || info.Noise || info.Version != 4 {
 				continue // local discovery noise, or IPv6 (not forwarded in Phase 1)
 			}
-			wire := frame.New(nextSeq(), bufs[i][:sizes[i]]).Marshal()
-			if _, err := conn.Write(wire); err != nil {
+			if err := writeFrame(bufs[i][:sizes[i]]); err != nil {
 				log.Printf("vpn write: %v", err)
 			}
 		}

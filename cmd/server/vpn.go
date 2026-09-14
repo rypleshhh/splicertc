@@ -267,6 +267,9 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 		if err != nil {
 			return
 		}
+		if len(f.Payload) == 0 {
+			continue // client keepalive, not a packet
+		}
 		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)
 		}
