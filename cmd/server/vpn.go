@@ -132,11 +132,45 @@ type iptablesRule struct {
 // tunnel needs, skipping any that are already present so restarting the
 // server never duplicates rules.
 func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
+	// MASQUERADE is the one rule that's fatal if it can't be applied —
+	// without it there's no NAT and the VPN can't work at all. The rest
+	// (FORWARD/DOCKER-USER accept rules, MSS clamping) are best-effort:
+	// their absence usually just means "the host's default FORWARD
+	// policy already accepts everything" or "no Docker-managed chain
+	// exists here" — worth a loud warning, not worth crash-looping the
+	// entire server (which would also take down the unrelated reliable/
+	// droppable/glue channels).
+	masquerade := iptablesRule{
+		check: []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
+		add:   []string{"-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
+	}
+	if err := run("iptables", masquerade.check...); err != nil {
+		if err := run("iptables", masquerade.add...); err != nil {
+			return fmt.Errorf("iptables %v: %w", masquerade.add, err)
+		}
+	}
+
 	rules := []iptablesRule{
+		// Docker manages the FORWARD chain itself (DOCKER-USER then
+		// DOCKER-FORWARD jumps, ahead of anything we append to FORWARD
+		// directly) and typically defaults FORWARD's policy to DROP —
+		// an ACCEPT rule appended to FORWARD can be dead code if
+		// DOCKER-FORWARD already terminates the packet first. DOCKER-USER
+		// is the chain Docker documents specifically for user rules that
+		// must run before its own logic, so put the real ACCEPT rules
+		// there (inserted at the top, not appended, so nothing already in
+		// that chain can shadow them).
 		{
-			check: []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
-			add:   []string{"-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
+			check: []string{"-C", "DOCKER-USER", "-i", tunIface, "-j", "ACCEPT"},
+			add:   []string{"-I", "DOCKER-USER", "1", "-i", tunIface, "-j", "ACCEPT"},
 		},
+		{
+			check: []string{"-C", "DOCKER-USER", "-o", tunIface, "-j", "ACCEPT"},
+			add:   []string{"-I", "DOCKER-USER", "1", "-o", tunIface, "-j", "ACCEPT"},
+		},
+		// Belt-and-suspenders for non-Docker hosts (no DOCKER-USER chain,
+		// plain FORWARD policy DROP) — harmless no-op where DOCKER-USER
+		// already accepted the packet.
 		{
 			check: []string{"-C", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
 			add:   []string{"-A", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
@@ -155,7 +189,7 @@ func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
 			continue // already present
 		}
 		if err := run("iptables", r.add...); err != nil {
-			return fmt.Errorf("iptables %v: %w", r.add, err)
+			log.Printf("vpn: WARNING: iptables %v failed (%v) — full-tunnel traffic through %s may be dropped by the host's own FORWARD policy; check manually", r.add, err, tunIface)
 		}
 	}
 	return nil
