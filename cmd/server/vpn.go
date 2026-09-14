@@ -66,9 +66,21 @@ func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (dev tun.
 		return nil, nil, nil, "", fmt.Errorf("ip link set up: %w", err)
 	}
 
-	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); err != nil {
+	// Docker remounts /proc/sys read-only inside the container by
+	// default (independent of capabilities — only --privileged lifts
+	// it), and network sysctls aren't settable via `--sysctl` under
+	// network_mode: host anyway. So this is a host-level prerequisite,
+	// not something the container can fix itself: check it, and fail
+	// with an actionable message instead of trying to write it.
+	if cur, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err != nil {
 		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("enable ip_forward (need root/CAP_NET_ADMIN): %w", err)
+		return nil, nil, nil, "", fmt.Errorf("read ip_forward: %w", err)
+	} else if strings.TrimSpace(string(cur)) != "1" {
+		dev.Close()
+		return nil, nil, nil, "", fmt.Errorf(
+			"net.ipv4.ip_forward is not enabled on the host — run this on the VPS host (not in the container) and retry:\n" +
+				"  sudo sysctl -w net.ipv4.ip_forward=1\n" +
+				"  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-dormtun.conf")
 	}
 
 	if egressIface == "" {
