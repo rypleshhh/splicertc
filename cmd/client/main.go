@@ -25,7 +25,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "socks5", "socks5 (default), droptest, or tun")
+	mode := flag.String("mode", "socks5", "socks5 (default), droptest, tun, or vpn")
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
 	serverAddr := flag.String("server", "127.0.0.1:8443", "tunnel server address")
 	dropAddr := flag.String("drop-addr", "127.0.0.1:8444", "droppable channel address (droptest mode)")
@@ -35,6 +35,9 @@ func main() {
 	tunPaths := flag.Int("tun-paths", 1, "tun mode: number of parallel duplicated paths (1 = no duplication)")
 	tunMeasure := flag.Bool("tun-measure", false, "tun mode: send measurement pings and print RTT/jitter/loss periodically")
 	tunMeasureInterval := flag.Duration("tun-measure-interval", 33*time.Millisecond, "tun mode: spacing between measurement pings")
+	vpnAddr := flag.String("vpn-addr", "127.0.0.1:8447", "full-tunnel VPN channel address (vpn mode)")
+	vpnTunName := flag.String("vpn-tun-name", "dormvpn0", "TUN interface name (vpn mode)")
+	vpnTunMTU := flag.Int("vpn-tun-mtu", 1400, "TUN interface MTU (vpn mode)")
 	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
 	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	dropPaths := flag.Int("drop-paths", 1, "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
@@ -53,6 +56,11 @@ func main() {
 
 	if *mode == "tun" {
 		runTunMode(*glueAddr, *insecure, *tunName, *tunMTU, *tunPaths, *tunMeasure, *tunMeasureInterval, key)
+		return
+	}
+
+	if *mode == "vpn" {
+		runVPNMode(*vpnAddr, *insecure, *vpnTunName, *vpnTunMTU, key)
 		return
 	}
 

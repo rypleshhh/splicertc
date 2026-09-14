@@ -267,8 +267,26 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 		if err != nil {
 			return
 		}
-		if _, err := dev.Write([][]byte{f.Payload}, 0); err != nil {
+		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)
 		}
 	}
+}
+
+// virtioHdrLen mirrors the size of wireguard-go's internal (unexported)
+// virtioNetHdr struct — 6 fields, all uint8/uint16, no padding, 10
+// bytes. On Linux, tun.CreateTUN enables IFF_VNET_HDR whenever the
+// kernel's TUN driver supports it, and Write then requires this many
+// bytes of header room before the packet even when no offload is in use
+// (an all-zero header, which is what withVirtioHdr produces, means "no
+// offload" — exactly what a plain passthrough packet needs). Harmless
+// on the rarer kernel that lacks IFF_VNET_HDR support too: Write treats
+// the offset as a plain data-start index in that case, and the packet
+// still begins at bufs[0][virtioHdrLen:] either way.
+const virtioHdrLen = 10
+
+func withVirtioHdr(payload []byte) []byte {
+	buf := make([]byte, virtioHdrLen+len(payload))
+	copy(buf[virtioHdrLen:], payload)
+	return buf
 }
