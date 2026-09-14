@@ -148,6 +148,11 @@ func main() {
 	addr := flag.String("addr", ":8443", "reliable channel listen address")
 	dropAddr := flag.String("drop-addr", ":8444", "droppable channel listen address")
 	glueAddr := flag.String("glue-addr", ":8446", "glue channel listen address (real captured UDP traffic)")
+	vpnAddr := flag.String("vpn-addr", ":8447", "full-tunnel VPN channel listen address (all IP traffic, not just UDP)")
+	vpnTunName := flag.String("vpn-tun-name", "dormvpn0", "server-side TUN interface name for full-tunnel mode")
+	vpnTunMTU := flag.Int("vpn-tun-mtu", 1400, "server-side TUN MTU for full-tunnel mode")
+	vpnSubnet := flag.String("vpn-subnet", "10.66.0.0/24", "private subnet for the full-tunnel VPN (server=.1, client=.2)")
+	egressIface := flag.String("egress-iface", "", "interface to MASQUERADE full-tunnel VPN egress traffic out of (empty = auto-detect via `ip route get`)")
 	cert := flag.String("cert", "devcerts/dev.crt", "TLS cert file")
 	key := flag.String("key", "devcerts/dev.key", "TLS key file")
 	pskFile := flag.String("psk-file", "", "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
@@ -181,6 +186,29 @@ func main() {
 		log.Fatalf("glue listen: %v", err)
 	}
 	log.Printf("glue channel listening on %s", *glueAddr)
+
+	vpnLn, err := transport.Listen(*vpnAddr, *cert, *key)
+	if err != nil {
+		log.Fatalf("vpn listen: %v", err)
+	}
+	log.Printf("vpn channel listening on %s", *vpnAddr)
+
+	vpnDev, _, _, _, err := setupVPNTun(*vpnTunName, *vpnTunMTU, *vpnSubnet, *egressIface)
+	if err != nil {
+		log.Fatalf("vpn tun setup: %v", err)
+	}
+	go vpnTunReader(vpnDev, *vpnTunMTU)
+
+	go func() {
+		for {
+			conn, err := vpnLn.Accept()
+			if err != nil {
+				log.Printf("vpn accept: %v", err)
+				continue
+			}
+			go handleVPNConn(conn, vpnDev)
+		}
+	}()
 
 	go func() {
 		for {

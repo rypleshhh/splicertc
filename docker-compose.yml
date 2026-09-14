@@ -7,6 +7,14 @@ services:
     # dedicated test box. Ports in EXPOSE/CMD are used as-is on the host.
     network_mode: host
     restart: unless-stopped
+    # Needed for the full-tunnel VPN channel: it creates its own TUN
+    # device and runs `ip`/`iptables` to address it and NAT its traffic
+    # out (see cmd/server/vpn.go). Not required for the reliable/
+    # droppable/glue channels alone.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
     # To use your own certs instead of the throwaway ones baked into the
     # image, uncomment and point at a host directory holding dev.crt/dev.key:
     # volumes:

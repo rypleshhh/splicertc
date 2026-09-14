@@ -27,14 +27,19 @@ RUN cd /out && ./gencert
 # ---- runtime stage ----
 FROM alpine:3.20
 
+# iptables/iproute2: the full-tunnel VPN channel creates its own TUN
+# device and needs `ip`/`iptables` on the server to address it, enable
+# forwarding, and set up NAT — see cmd/server/vpn.go.
+RUN apk add --no-cache iptables iproute2
+
 WORKDIR /app
 COPY --from=build /out/server /app/server
 COPY --from=build /out/devcerts /app/devcerts
 
-# reliable, droppable, glue channels
-EXPOSE 8443 8444 8446
+# reliable, droppable, glue, vpn channels
+EXPOSE 8443 8444 8446 8447
 
 # Bind all channels to 0.0.0.0 so they're reachable from outside the
 # container. Override the flags at `docker run` time to change ports.
 ENTRYPOINT ["/app/server"]
-CMD ["-addr", "0.0.0.0:8443", "-drop-addr", "0.0.0.0:8444", "-glue-addr", "0.0.0.0:8446"]
+CMD ["-addr", "0.0.0.0:8443", "-drop-addr", "0.0.0.0:8444", "-glue-addr", "0.0.0.0:8446", "-vpn-addr", "0.0.0.0:8447"]
