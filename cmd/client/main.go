@@ -362,20 +362,22 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths i
 				if err != nil {
 					return
 				}
+				// Measurement ping echo coming back — record RTT
+				// regardless of how stale it looks; duplicate copies
+				// from other multipath paths are already handled by
+				// stats.OnRecv (first arrival wins, nonce removed).
+				if nonce, isPing := glue.DecodePing(f.Payload); isPing {
+					if stats != nil {
+						stats.OnRecv(nonce)
+					}
+					continue
+				}
+
 				replyMu.Lock()
 				ok, _ := replyRecv.Accept(f)
 				replyMu.Unlock()
 				if !ok {
 					continue // duplicate copy from another path
-				}
-
-				// Measurement ping echo coming back — record RTT, don't
-				// treat as UDP.
-				if stats != nil {
-					if nonce, isPing := glue.DecodePing(f.Payload); isPing {
-						stats.OnRecv(nonce)
-						continue
-					}
 				}
 
 				flowID, payload, err := glue.DecodeInbound(f.Payload)

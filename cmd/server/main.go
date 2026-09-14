@@ -368,19 +368,26 @@ func handleGlueConn(conn net.Conn) {
 			return
 		}
 
+		// Measurement ping: dedup by sequence only (a second copy from
+		// another multipath path), but never by staleness — echo it
+		// straight back over all paths regardless of how old it is, so
+		// the client can report the true RTT instead of a silent drop.
+		if glue.IsPing(f.Payload) {
+			sess.mu.Lock()
+			ok, _ := sess.recv.AcceptSeq(f)
+			sess.mu.Unlock()
+			if ok {
+				nonce, _ := glue.DecodePing(f.Payload)
+				sess.broadcastPing(nonce)
+			}
+			continue
+		}
+
 		sess.mu.Lock()
 		ok, _ := sess.recv.Accept(f)
 		sess.mu.Unlock()
 		if !ok {
 			continue // duplicate copy from another path, or stale — already handled
-		}
-
-		// Measurement ping: echo it straight back over all paths, don't
-		// treat it as UDP-carrying.
-		if glue.IsPing(f.Payload) {
-			nonce, _ := glue.DecodePing(f.Payload)
-			sess.broadcastPing(nonce)
-			continue
 		}
 
 		flowID, dst, dstPort, payload, err := glue.DecodeOutbound(f.Payload)

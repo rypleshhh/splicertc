@@ -84,6 +84,15 @@ func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
 	if age > r.maxAge {
 		return false, "ttl exceeded"
 	}
+	return r.AcceptSeq(f)
+}
+
+// AcceptSeq applies only the duplicate/supersession check, ignoring
+// staleness. Used for measurement pings: a late reply is exactly the
+// high-RTT result the measurement exists to report, not something to
+// silently drop — but a duplicate arriving via a second multipath path
+// still shouldn't be double-counted.
+func (r *Receiver) AcceptSeq(f Frame) (deliver bool, reason string) {
 	if r.haveLastSeq && f.Seq <= r.lastSeq {
 		return false, "superseded"
 	}
