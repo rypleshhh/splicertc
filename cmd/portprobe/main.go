@@ -34,6 +34,29 @@ func token(port int, proto string) string {
 	return fmt.Sprintf("PORTPROBE-OK %s/%d\n", proto, port)
 }
 
+// UDP source addresses are trivially spoofed, so a server that answers
+// any datagram with a larger one is an amplification weapon: an
+// attacker sends tiny packets with a victim's address and we blast the
+// replies at the victim. Two rules make that worthless — the request
+// must carry a magic prefix (no answering random scan traffic), and it
+// must be at least as large as our reply (so the "amplification" factor
+// is below 1 and there's nothing to gain). Anything else is dropped in
+// silence.
+const (
+	probeMagic      = "PORTPROBE-REQ"
+	probeRequestLen = 64
+)
+
+func validUDPRequest(b []byte) bool {
+	return len(b) >= probeRequestLen && strings.HasPrefix(string(b), probeMagic)
+}
+
+func udpRequest() []byte {
+	buf := make([]byte, probeRequestLen)
+	copy(buf, probeMagic)
+	return buf
+}
+
 func parsePorts(s string) []int {
 	var out []int
 	for _, f := range strings.Split(s, ",") {
@@ -65,12 +88,23 @@ func runServer(tcpPorts, udpPorts []int) {
 		}
 		bound = append(bound, fmt.Sprintf("tcp/%d", p))
 		go func(ln net.Listener, p int) {
+			// Cap concurrent connections per port so a flood can't turn
+			// this throwaway diagnostic into a memory-exhaustion lever
+			// on a box that's running real services.
+			sem := make(chan struct{}, 32)
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
 					return
 				}
+				select {
+				case sem <- struct{}{}:
+				default:
+					conn.Close()
+					continue
+				}
 				go func(c net.Conn) {
+					defer func() { <-sem }()
 					defer c.Close()
 					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 					if _, err := c.Write([]byte(token(p, "tcp"))); err != nil {
@@ -112,7 +146,9 @@ func runServer(tcpPorts, udpPorts []int) {
 				if err != nil {
 					return
 				}
-				_ = n
+				if !validUDPRequest(buf[:n]) {
+					continue // not ours, or too short to answer safely
+				}
 				pc.WriteTo([]byte(token(p, "udp")), addr)
 			}
 		}(pc, p)
@@ -170,10 +206,11 @@ func probeUDP(host string, port int, timeout time.Duration) result {
 	defer conn.Close()
 
 	buf := make([]byte, 128)
+	req := udpRequest()
 	// UDP has no handshake: a lost probe is indistinguishable from a
 	// blocked one, so retry before calling it blocked.
 	for attempt := 0; attempt < 3; attempt++ {
-		if _, err := conn.Write([]byte("probe")); err != nil {
+		if _, err := conn.Write(req); err != nil {
 			r.status = classify(err)
 			return r
 		}
@@ -219,7 +256,10 @@ func sustain(host string, r result, dur, interval time.Duration) string {
 	start := time.Now()
 	deadline := start.Add(dur)
 	var sent, lost int
+	// Magic-prefixed so the UDP side accepts it (see validUDPRequest);
+	// harmless on TCP, which just echoes whatever it gets.
 	payload := make([]byte, 256)
+	copy(payload, probeMagic)
 
 	for time.Now().Before(deadline) {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
