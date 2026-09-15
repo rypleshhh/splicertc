@@ -73,7 +73,26 @@ func runServer(tcpPorts, udpPorts []int) {
 				go func(c net.Conn) {
 					defer c.Close()
 					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					c.Write([]byte(token(p, "tcp")))
+					if _, err := c.Write([]byte(token(p, "tcp"))); err != nil {
+						return
+					}
+					// Then echo whatever arrives, so the client can hold
+					// the connection open and find out whether the
+					// network lets a long-lived flow survive — the
+					// question that actually decides whether a tunnel
+					// can live on this port.
+					buf := make([]byte, 4096)
+					for {
+						c.SetReadDeadline(time.Now().Add(2 * time.Minute))
+						n, err := c.Read(buf)
+						if err != nil {
+							return
+						}
+						c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+						if _, err := c.Write(buf[:n]); err != nil {
+							return
+						}
+					}
 				}(conn)
 			}
 		}(ln, p)
@@ -175,6 +194,60 @@ func probeUDP(host string, port int, timeout time.Duration) result {
 	return r
 }
 
+// sustain holds one port open and keeps traffic flowing on it, because
+// "a connection can be established" and "a tunnel can live here for
+// hours" are different questions — and this project has already been
+// bitten by the second one (a flow that came up fine and died a minute
+// and a half later).
+func sustain(host string, r result, dur, interval time.Duration) string {
+	addr := net.JoinHostPort(host, strconv.Itoa(r.port))
+	conn, err := net.DialTimeout(r.proto, addr, 5*time.Second)
+	if err != nil {
+		return "died immediately: " + classify(err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 4096)
+	if r.proto == "tcp" {
+		// Drain the greeting token before the echo phase.
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Read(buf); err != nil {
+			return "died reading greeting: " + classify(err)
+		}
+	}
+
+	start := time.Now()
+	deadline := start.Add(dur)
+	var sent, lost int
+	payload := make([]byte, 256)
+
+	for time.Now().Before(deadline) {
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(payload); err != nil {
+			return fmt.Sprintf("DIED after %v (%d msgs): %s", time.Since(start).Round(time.Second), sent, classify(err))
+		}
+		sent++
+
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Read(buf); err != nil {
+			if r.proto == "udp" {
+				// A lost datagram isn't a dead path; only a long run of
+				// them is.
+				lost++
+				if lost > 10 {
+					return fmt.Sprintf("DIED after %v (%d msgs, 10 replies missed in a row)", time.Since(start).Round(time.Second), sent)
+				}
+			} else {
+				return fmt.Sprintf("DIED after %v (%d msgs): %s", time.Since(start).Round(time.Second), sent, classify(err))
+			}
+		} else {
+			lost = 0
+		}
+		time.Sleep(interval)
+	}
+	return fmt.Sprintf("survived %v (%d msgs)", dur, sent)
+}
+
 func classify(err error) string {
 	s := err.Error()
 	switch {
@@ -189,7 +262,7 @@ func classify(err error) string {
 	}
 }
 
-func runClient(host string, tcpPorts, udpPorts []int, timeout time.Duration, parallel int) {
+func runClient(host string, tcpPorts, udpPorts []int, timeout time.Duration, parallel int) []result {
 	var (
 		mu      sync.Mutex
 		results []result
@@ -247,6 +320,45 @@ func runClient(host string, tcpPorts, udpPorts []int, timeout time.Duration, par
 	if len(open) == 0 {
 		fmt.Println("nothing got through — check that the server is running and the VPS firewall allows these ports before concluding the network blocks them")
 	}
+	return results
+}
+
+func runSustain(host string, results []result, dur, interval time.Duration) {
+	var openOnes []result
+	for _, r := range results {
+		if r.status == "open" {
+			openOnes = append(openOnes, r)
+		}
+	}
+	if len(openOnes) == 0 {
+		return
+	}
+
+	fmt.Printf("\nholding %d open port(s) for %v to see which survive a long-lived flow\n\n", len(openOnes), dur)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	lines := make(map[string]string)
+
+	for _, r := range openOnes {
+		wg.Add(1)
+		go func(r result) {
+			defer wg.Done()
+			verdict := sustain(host, r, dur, interval)
+			mu.Lock()
+			lines[fmt.Sprintf("%s/%d", r.proto, r.port)] = verdict
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+
+	keys := make([]string, 0, len(lines))
+	for k := range lines {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("  %-10s %s\n", k, lines[k])
+	}
 }
 
 func main() {
@@ -256,6 +368,8 @@ func main() {
 	udpList := flag.String("udp", defaultUDP, "comma-separated UDP ports to probe")
 	timeout := flag.Duration("timeout", 5*time.Second, "per-port timeout")
 	parallel := flag.Int("parallel", 8, "how many ports to probe at once (client mode)")
+	sustainFor := flag.Duration("sustain", 0, "client mode: after scanning, hold every open port this long with traffic flowing, to see which survive a long-lived flow (e.g. 5m)")
+	sustainEvery := flag.Duration("sustain-interval", time.Second, "client mode: spacing between messages while sustaining")
 	flag.Parse()
 
 	tcpPorts := parsePorts(*tcpList)
@@ -268,7 +382,10 @@ func main() {
 		if *host == "" {
 			log.Fatal("client mode needs -host <server ip>")
 		}
-		runClient(*host, tcpPorts, udpPorts, *timeout, *parallel)
+		results := runClient(*host, tcpPorts, udpPorts, *timeout, *parallel)
+		if *sustainFor > 0 {
+			runSustain(*host, results, *sustainFor, *sustainEvery)
+		}
 	default:
 		log.Fatalf("unknown -mode %q (want server or client)", *mode)
 	}
