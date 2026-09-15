@@ -207,11 +207,21 @@ func run(name string, args ...string) error {
 // packet the kernel routes back onto this interface (real replies from
 // the internet, un-MASQUERADE'd back to the tunnel subnet) goes to
 // whoever is currently the registered VPN client.
-func vpnTunReader(dev tun.Device, mtu int) {
+func vpnTunReader(dev tun.Device) {
+	// Linux enables GRO/offload on the TUN device whenever the kernel
+	// supports it (tun.CreateTUN does this unconditionally — see
+	// setupVPNTun), which means a single Read can hand back a
+	// GRO-coalesced "superpacket" from a real TCP flow well past the
+	// interface MTU — wireguard-go's own internal read buffer reserves
+	// a full 65535 bytes for exactly this. Sizing ours at mtu+32 (fine
+	// on Windows/wintun, which never coalesces) would make Read fail
+	// with "overflows bufs element" on the first sufficiently bulky
+	// download/page load, and that error is currently fatal below.
+	const maxReadSize = 65535 + 64
 	batch := dev.BatchSize()
 	bufs := make([][]byte, batch)
 	for i := range bufs {
-		bufs[i] = make([]byte, mtu+32)
+		bufs[i] = make([]byte, maxReadSize)
 	}
 	sizes := make([]int, batch)
 	for {

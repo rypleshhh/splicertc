@@ -6,17 +6,41 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
 
 	"tcp-dormtun/internal/auth"
+	"tcp-dormtun/internal/config"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/proto"
 	"tcp-dormtun/internal/transport"
 )
+
+// Config mirrors the server's flags — every field optional, JSON tags
+// snake_case to match the convention the client config also uses. A CLI
+// flag, if explicitly passed, always overrides the matching field here.
+type Config struct {
+	Addr        string `json:"addr,omitempty"`
+	DropAddr    string `json:"drop_addr,omitempty"`
+	GlueAddr    string `json:"glue_addr,omitempty"`
+	VPNAddr     string `json:"vpn_addr,omitempty"`
+	VPNTunName  string `json:"vpn_tun_name,omitempty"`
+	VPNTunMTU   int    `json:"vpn_tun_mtu,omitempty"`
+	VPNSubnet   string `json:"vpn_subnet,omitempty"`
+	EgressIface string `json:"egress_iface,omitempty"`
+	Cert        string `json:"cert,omitempty"`
+	Key         string `json:"key,omitempty"`
+	PSKFile     string `json:"psk_file,omitempty"`
+	// PSK is the shared secret written directly into the config file,
+	// as an alternative to -psk-file/PSKFile. Convenient for a personal
+	// single-server setup; keep the config file out of git if it holds
+	// a real secret (see config.example.json vs config.json).
+	PSK string `json:"psk,omitempty"`
+}
 
 // authKey is nil when auth is disabled (explicitly, via an empty
 // -psk-file) — checkAuth becomes a no-op in that case.
@@ -145,28 +169,47 @@ func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
 }
 
 func main() {
-	addr := flag.String("addr", ":8443", "reliable channel listen address")
-	dropAddr := flag.String("drop-addr", ":8444", "droppable channel listen address")
-	glueAddr := flag.String("glue-addr", ":8446", "glue channel listen address (real captured UDP traffic)")
-	vpnAddr := flag.String("vpn-addr", ":8447", "full-tunnel VPN channel listen address (all IP traffic, not just UDP)")
-	vpnTunName := flag.String("vpn-tun-name", "dormvpn0", "server-side TUN interface name for full-tunnel mode")
-	vpnTunMTU := flag.Int("vpn-tun-mtu", 1400, "server-side TUN MTU for full-tunnel mode")
-	vpnSubnet := flag.String("vpn-subnet", "10.66.0.0/24", "private subnet for the full-tunnel VPN (server=.1, client=.2)")
-	egressIface := flag.String("egress-iface", "", "interface to MASQUERADE full-tunnel VPN egress traffic out of (empty = auto-detect via `ip route get`)")
-	cert := flag.String("cert", "devcerts/dev.crt", "TLS cert file")
-	key := flag.String("key", "devcerts/dev.key", "TLS key file")
-	pskFile := flag.String("psk-file", "", "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
+	configPath := config.FindFlag(os.Args[1:], "config")
+	if configPath == "" {
+		configPath = "server.config.json"
+	}
+	var cfg Config
+	foundCfg, err := config.Load(configPath, &cfg)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	addr := flag.String("addr", config.Str(cfg.Addr, ":8443"), "reliable channel listen address")
+	dropAddr := flag.String("drop-addr", config.Str(cfg.DropAddr, ":8444"), "droppable channel listen address")
+	glueAddr := flag.String("glue-addr", config.Str(cfg.GlueAddr, ":8446"), "glue channel listen address (real captured UDP traffic)")
+	vpnAddr := flag.String("vpn-addr", config.Str(cfg.VPNAddr, ":8447"), "full-tunnel VPN channel listen address (all IP traffic, not just UDP)")
+	vpnTunName := flag.String("vpn-tun-name", config.Str(cfg.VPNTunName, "dormvpn0"), "server-side TUN interface name for full-tunnel mode")
+	vpnTunMTU := flag.Int("vpn-tun-mtu", config.Int(cfg.VPNTunMTU, 1400), "server-side TUN MTU for full-tunnel mode")
+	vpnSubnet := flag.String("vpn-subnet", config.Str(cfg.VPNSubnet, "10.66.0.0/24"), "private subnet for the full-tunnel VPN (server=.1, client=.2)")
+	egressIface := flag.String("egress-iface", cfg.EgressIface, "interface to MASQUERADE full-tunnel VPN egress traffic out of (empty = auto-detect via `ip route get`)")
+	cert := flag.String("cert", config.Str(cfg.Cert, "devcerts/dev.crt"), "TLS cert file")
+	key := flag.String("key", config.Str(cfg.Key, "devcerts/dev.key"), "TLS key file")
+	pskFile := flag.String("psk-file", cfg.PSKFile, "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
+	flag.String("config", configPath, "path to a JSON config file (server.config.json by default; explicit flags override its values)")
 	flag.Parse()
 
-	if *pskFile != "" {
+	if foundCfg {
+		log.Printf("loaded config from %s", configPath)
+	}
+
+	switch {
+	case *pskFile != "":
 		k, err := auth.LoadKey(*pskFile)
 		if err != nil {
 			log.Fatalf("load psk: %v", err)
 		}
 		authKey = k
-		log.Println("client authentication enabled")
-	} else {
-		log.Println("!!! WARNING: no -psk-file given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set -psk-file before exposing this to the internet.")
+		log.Println("client authentication enabled (psk file)")
+	case cfg.PSK != "":
+		authKey = auth.DeriveKey(cfg.PSK)
+		log.Println("client authentication enabled (inline psk from config)")
+	default:
+		log.Println("!!! WARNING: no -psk-file/config psk given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set a psk before exposing this to the internet.")
 	}
 
 	ln, err := transport.Listen(*addr, *cert, *key)
@@ -197,7 +240,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("vpn tun setup: %v", err)
 	}
-	go vpnTunReader(vpnDev, *vpnTunMTU)
+	go vpnTunReader(vpnDev)
 
 	go func() {
 		for {

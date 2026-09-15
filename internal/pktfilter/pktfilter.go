@@ -116,7 +116,14 @@ func classify(i Info) (noise bool, reason string) {
 		return true, "multicast destination"
 	}
 	if i.Version == 4 {
-		if d4 := i.Dst.To4(); d4 != nil && d4[3] == 255 {
+		// ".255" only means "subnet broadcast" within a private/
+		// link-local range — on the public internet it's an ordinary
+		// host address. Full-tunnel VPN mode runs this classifier
+		// against every internet-bound packet (not just a hand-picked
+		// local subnet like the original glue/tun modes), so without
+		// this scoping a real server whose public IP happens to end in
+		// .255 would be silently dropped instead of tunneled.
+		if d4 := i.Dst.To4(); d4 != nil && d4[3] == 255 && (i.Dst.IsPrivate() || i.Dst.IsLinkLocalUnicast()) {
 			return true, "broadcast destination"
 		}
 	}

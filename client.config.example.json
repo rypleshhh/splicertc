@@ -1,0 +1,8 @@
+{
+  "mode": "vpn",
+  "vpn_addr": "YOUR_VPS_IP:443",
+  "vpn_tun_name": "dormvpn0",
+  "vpn_tun_mtu": 1400,
+  "insecure": true,
+  "psk": "REPLACE_ME_must_match_the_server's_psk_exactly__never_commit_the_real_one"
+}

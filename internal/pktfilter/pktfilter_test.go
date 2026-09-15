@@ -67,6 +67,21 @@ func TestSubnetBroadcastIsNoise(t *testing.T) {
 	}
 }
 
+func TestPublicAddressEndingIn255IsNotNoise(t *testing.T) {
+	// Full-tunnel VPN mode runs this classifier against every
+	// internet-bound destination, not just a hand-picked local subnet —
+	// a real public server whose IP happens to end in .255 must not be
+	// silently dropped as if it were a subnet broadcast.
+	pkt := buildIPv4UDP([4]byte{10, 66, 0, 2}, [4]byte{203, 0, 113, 255}, 54321, 27015)
+	info, ok := Parse(pkt)
+	if !ok {
+		t.Fatal("expected Parse to succeed")
+	}
+	if info.Noise {
+		t.Errorf("expected public unicast traffic ending in .255 to NOT be noise, got reason=%q", info.Reason)
+	}
+}
+
 func TestShortPacketRejected(t *testing.T) {
 	if _, ok := Parse([]byte{0x45, 0x00}); ok {
 		t.Error("expected Parse to reject a too-short packet")

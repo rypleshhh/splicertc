@@ -49,8 +49,16 @@ func LoadKey(path string) ([]byte, error) {
 	if trimmed == "" {
 		return nil, fmt.Errorf("key file %s is empty", path)
 	}
-	sum := sha256.Sum256([]byte(trimmed))
-	return sum[:], nil
+	return DeriveKey(trimmed), nil
+}
+
+// DeriveKey turns a passphrase (from a key file, a config field,
+// wherever) into a fixed-size key via SHA-256, the same way LoadKey
+// does — so any length or format works and both sides only need to
+// agree on the passphrase text itself.
+func DeriveKey(passphrase string) []byte {
+	sum := sha256.Sum256([]byte(passphrase))
+	return sum[:]
 }
 
 // ServerHandshake challenges the connection and verifies the response.

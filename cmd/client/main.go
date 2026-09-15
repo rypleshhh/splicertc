@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/tailscale/wireguard-go/tun"
 
 	"tcp-dormtun/internal/auth"
+	"tcp-dormtun/internal/config"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/measure"
@@ -24,34 +26,91 @@ import (
 	"tcp-dormtun/internal/transport"
 )
 
+// Config mirrors the client's flags — every field optional. A CLI flag,
+// if explicitly passed, always overrides the matching field here.
+type Config struct {
+	Mode               string `json:"mode,omitempty"`
+	Listen             string `json:"listen,omitempty"`
+	Server             string `json:"server,omitempty"`
+	DropAddr           string `json:"drop_addr,omitempty"`
+	GlueAddr           string `json:"glue_addr,omitempty"`
+	TunName            string `json:"tun_name,omitempty"`
+	TunMTU             int    `json:"tun_mtu,omitempty"`
+	TunPaths           int    `json:"tun_paths,omitempty"`
+	TunMeasure         bool   `json:"tun_measure,omitempty"`
+	TunMeasureInterval string `json:"tun_measure_interval,omitempty"` // e.g. "33ms"
+	VPNAddr            string `json:"vpn_addr,omitempty"`
+	VPNTunName         string `json:"vpn_tun_name,omitempty"`
+	VPNTunMTU          int    `json:"vpn_tun_mtu,omitempty"`
+	DropCount          int    `json:"drop_count,omitempty"`
+	DropInterval       string `json:"drop_interval,omitempty"` // e.g. "33ms"
+	DropPaths          int    `json:"drop_paths,omitempty"`
+	Insecure           bool   `json:"insecure,omitempty"`
+	PSKFile            string `json:"psk_file,omitempty"`
+	// PSK is the shared secret written directly into the config file,
+	// as an alternative to -psk-file/PSKFile. Keep the config file out
+	// of git if it holds a real secret (see config.example.json vs
+	// config.json).
+	PSK string `json:"psk,omitempty"`
+}
+
+func parseDurationOr(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		log.Fatalf("config: invalid duration %q: %v", s, err)
+	}
+	return d
+}
+
 func main() {
-	mode := flag.String("mode", "socks5", "socks5 (default), droptest, tun, or vpn")
-	listenAddr := flag.String("listen", "127.0.0.1:1080", "SOCKS5 listen address")
-	serverAddr := flag.String("server", "127.0.0.1:8443", "tunnel server address")
-	dropAddr := flag.String("drop-addr", "127.0.0.1:8444", "droppable channel address (droptest mode)")
-	glueAddr := flag.String("glue-addr", "127.0.0.1:8446", "glue channel address (tun mode)")
-	tunName := flag.String("tun-name", "dormtun0", "TUN interface name (tun mode)")
-	tunMTU := flag.Int("tun-mtu", 1420, "TUN interface MTU (tun mode)")
-	tunPaths := flag.Int("tun-paths", 1, "tun mode: number of parallel duplicated paths (1 = no duplication)")
-	tunMeasure := flag.Bool("tun-measure", false, "tun mode: send measurement pings and print RTT/jitter/loss periodically")
-	tunMeasureInterval := flag.Duration("tun-measure-interval", 33*time.Millisecond, "tun mode: spacing between measurement pings")
-	vpnAddr := flag.String("vpn-addr", "127.0.0.1:8447", "full-tunnel VPN channel address (vpn mode)")
-	vpnTunName := flag.String("vpn-tun-name", "dormvpn0", "TUN interface name (vpn mode)")
-	vpnTunMTU := flag.Int("vpn-tun-mtu", 1400, "TUN interface MTU (vpn mode)")
-	dropCount := flag.Int("drop-count", 0, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
-	dropInterval := flag.Duration("drop-interval", 33*time.Millisecond, "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
-	dropPaths := flag.Int("drop-paths", 1, "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
-	insecure := flag.Bool("insecure", false, "skip TLS cert verification (dev only)")
-	pskFile := flag.String("psk-file", "", "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
+	configPath := config.FindFlag(os.Args[1:], "config")
+	if configPath == "" {
+		configPath = "client.config.json"
+	}
+	var cfg Config
+	foundCfg, err := config.Load(configPath, &cfg)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	mode := flag.String("mode", config.Str(cfg.Mode, "socks5"), "socks5 (default), droptest, tun, or vpn")
+	listenAddr := flag.String("listen", config.Str(cfg.Listen, "127.0.0.1:1080"), "SOCKS5 listen address")
+	serverAddr := flag.String("server", config.Str(cfg.Server, "127.0.0.1:8443"), "tunnel server address")
+	dropAddr := flag.String("drop-addr", config.Str(cfg.DropAddr, "127.0.0.1:8444"), "droppable channel address (droptest mode)")
+	glueAddr := flag.String("glue-addr", config.Str(cfg.GlueAddr, "127.0.0.1:8446"), "glue channel address (tun mode)")
+	tunName := flag.String("tun-name", config.Str(cfg.TunName, "dormtun0"), "TUN interface name (tun mode)")
+	tunMTU := flag.Int("tun-mtu", config.Int(cfg.TunMTU, 1420), "TUN interface MTU (tun mode)")
+	tunPaths := flag.Int("tun-paths", config.Int(cfg.TunPaths, 1), "tun mode: number of parallel duplicated paths (1 = no duplication)")
+	tunMeasure := flag.Bool("tun-measure", cfg.TunMeasure, "tun mode: send measurement pings and print RTT/jitter/loss periodically")
+	tunMeasureInterval := flag.Duration("tun-measure-interval", parseDurationOr(cfg.TunMeasureInterval, 33*time.Millisecond), "tun mode: spacing between measurement pings")
+	vpnAddr := flag.String("vpn-addr", config.Str(cfg.VPNAddr, "127.0.0.1:8447"), "full-tunnel VPN channel address (vpn mode)")
+	vpnTunName := flag.String("vpn-tun-name", config.Str(cfg.VPNTunName, "dormvpn0"), "TUN interface name (vpn mode)")
+	vpnTunMTU := flag.Int("vpn-tun-mtu", config.Int(cfg.VPNTunMTU, 1400), "TUN interface MTU (vpn mode)")
+	dropCount := flag.Int("drop-count", cfg.DropCount, "droptest: if >0, send this many frames at -drop-interval spacing instead of the fixed delay demo")
+	dropInterval := flag.Duration("drop-interval", parseDurationOr(cfg.DropInterval, 33*time.Millisecond), "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
+	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
+	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
+	pskFile := flag.String("psk-file", cfg.PSKFile, "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
+	flag.String("config", configPath, "path to a JSON config file (client.config.json by default; explicit flags override its values)")
 	flag.Parse()
 
+	if foundCfg {
+		log.Printf("loaded config from %s", configPath)
+	}
+
 	var key []byte
-	if *pskFile != "" {
+	switch {
+	case *pskFile != "":
 		k, err := auth.LoadKey(*pskFile)
 		if err != nil {
 			log.Fatalf("load psk: %v", err)
 		}
 		key = k
+	case cfg.PSK != "":
+		key = auth.DeriveKey(cfg.PSK)
 	}
 
 	if *mode == "tun" {
