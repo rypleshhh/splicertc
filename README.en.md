@@ -1,4 +1,4 @@
-🇷🇺 [Русский](README.md) | 🇬🇧 **English**
+RU [Русский](README.md) | EN **English**
 
 # tcp-dormtun
 
