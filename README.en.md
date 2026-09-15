@@ -2,91 +2,226 @@ RU [Русский](README.md) | EN **English**
 
 # tcp-dormtun
 
-A from-scratch TCP/TLS tunnel that carries UDP (game) traffic through a
-network that blocks non-standard ports, with a droppable channel and
-multipath duplication to minimize the latency/loss cost of running
-datagram traffic over TCP.
+A from-scratch TCP/TLS tunnel that carries traffic through a network
+that blocks non-standard ports. Two ways to use it: a full VPN
+(`vpn` mode, all IP traffic) and a specialized channel for game UDP
+with droppable-frame logic and multipath duplication to minimize the
+latency/loss cost of running datagrams over TCP (`tun` mode).
 
 ## Components
 
-- **server** (`cmd/server`) — runs on the VPS. Three channels: reliable
-  (SOCKS5-style, `:8443`), droppable (framed, TTL-dropped, `:8444`), and
-  glue (real captured UDP from a TUN, `:8446`).
-- **client** (`cmd/client`) — runs on the machine that plays the game.
-  Modes: `socks5`, `droptest` (synthetic loss testing), `tun` (real
-  traffic capture, optionally multipath).
+- **server** (`cmd/server`) — runs on the VPS. Channels: reliable
+  (SOCKS5-style, `:8443`), droppable (framed, TTL-dropped, `:8444`),
+  glue (real captured UDP from a TUN, `:8446`), vpn (full IP tunnel
+  with server-side NAT, `:443`).
+- **client** (`cmd/client`) — runs on the gaming/work machine. Modes:
+  `vpn` (all traffic through the tunnel), `socks5` (local proxy), `tun`
+  (game UDP capture, optionally multipath), `droptest` (synthetic loss
+  testing).
 - **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
 - **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
 
-## Config files (optional, instead of typing every flag)
+Everything is driven by **config files** — `server-config.json` on the
+server, `client-config.json` on the client. Command-line flags exist
+only as a one-off override for a single value, not as the primary way
+to run anything.
 
-Both binaries load `server-config.json` / `client-config.json` from the
-current directory by default (or `-config path/to/file.json`), if
-present. Every field just seeds that flag's default — any flag you pass
-explicitly still overrides it, and a missing config file is fine, it
-just falls back to plain flags like before.
+## Quick start
+
+### 1. Secret
 
 ```
-cp server-config.example.json server-config.json   # then edit it
+openssl rand -base64 32
+```
+
+Copy the output — this string goes into the `"psk"` field **on both
+server and client**, verbatim, identical.
+
+### 2. Server
+
+```
+cp server-config.example.json server-config.json
+```
+
+Open `server-config.json`, fill in `psk`. For normal VPN use the rest
+can stay as-is — the defaults are already set (`vpn_addr` on
+`0.0.0.0:443`, subnet `10.66.0.0/24`). Then:
+
+```
+docker compose up --build -d
+docker compose logs -f
+```
+
+`docker-compose.yml` mounts `server-config.json` into the container and
+runs the binary with zero flags — the whole run is: edit the file, bring
+up the container. The file has to exist BEFORE the first run (otherwise
+Docker creates an empty directory in its place instead of mounting a
+file — the `cp` above is exactly for that).
+
+Needs a Linux host with `net.ipv4.ip_forward` enabled (once, on the
+host itself, not in the container):
+
+```
+sudo sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-dormtun.conf
+```
+
+### 3. Client
+
+```
 cp client-config.example.json client-config.json
 ```
 
-The secret can go straight in the config as `"psk": "..."` instead of a
-separate `-psk-file`. **`server-config.json`/`client-config.json` are
-gitignored — never commit the real ones once they hold a live secret.**
-Only the `*.example.json` files (placeholder values) are checked in.
-
-If the config has everything filled in for the mode you're using, no
-flags are needed at the console at all — just build and run:
-
-- **Server (Docker)**: `docker-compose.yml` mounts `./server-config.json`
-  into the container by default, and the `Dockerfile` runs the binary
-  with zero flags — the whole flow is: fill in `server-config.json`,
-  then `docker compose up --build -d`. The file has to exist before the
-  first run (otherwise Docker creates an empty directory there instead
-  of mounting a file) — that's what the `cp` above is for.
-- **Client**: `go build -o client.exe .\cmd\client`, then just
-  `.\client.exe` — no arguments at all, as long as `client-config.json`
-  sits next to it with `mode`, addresses, `psk`, etc. filled in. An
-  explicit flag still works to override one thing on the fly without
-  editing the file.
-
-## Authentication (do this before exposing the server to the internet)
-
-Without `-psk-file`, the server accepts connections from anyone who
-finds its IP:port — an open SOCKS5 proxy and an open UDP relay (usable
-for amplification DDoS). Generate a shared secret and point both sides
-at it:
+Open `client-config.json`, fill in `vpn_addr` (your server's IP, port
+443) and the same `psk`. Build and run:
 
 ```
-openssl rand -base64 32 > dormtun.key      # or: echo "any passphrase" > dormtun.key
+go build -o client.exe .\cmd\client
+.\client.exe
+```
+
+No arguments — mode, address, secret are already in the file. Needs
+`wintun.dll` next to `client.exe` (https://www.wintun.net/, already in
+the repo) and an **Administrator** shell.
+
+Next — set up routing (see "`vpn` mode: all traffic through the
+tunnel" below).
+
+### One-off flag override
+
+Any config field can be overridden by a flag of the same name for a
+single run, without editing the file:
+
+```
+.\client.exe -mode socks5 -listen 127.0.0.1:1080
+```
+
+Flag names match config field names (see the tables below). A different
+config path: `-config path/to/file.json`.
+
+## Reference: config fields
+
+### `server-config.json`
+
+| Field | Flag | Default | What it does |
+|---|---|---|---|
+| `addr` | `-addr` | `:8443` | reliable channel address (SOCKS5-style) |
+| `drop_addr` | `-drop-addr` | `:8444` | droppable channel address |
+| `glue_addr` | `-glue-addr` | `:8446` | glue channel address (real UDP) |
+| `vpn_addr` | `-vpn-addr` | `:8447` | full-tunnel VPN channel address |
+| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | server-side TUN interface name |
+| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | server-side TUN MTU |
+| `vpn_subnet` | `-vpn-subnet` | `10.66.0.0/24` | private VPN subnet (server = `.1`, client = `.2`) |
+| `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
+| `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
+| `psk_file` | `-psk-file` | empty (auth disabled) | path to a file holding the secret |
+| `psk` | — | empty | the secret written directly into the config (simpler than `psk_file`) |
+
+### `client-config.json`
+
+| Field | Flag | Default | What it does |
+|---|---|---|---|
+| `mode` | `-mode` | `socks5` | `socks5` \| `droptest` \| `tun` \| `vpn` |
+| `listen` | `-listen` | `127.0.0.1:1080` | local SOCKS5 port (`socks5`) |
+| `server` | `-server` | `127.0.0.1:8443` | reliable channel address (`socks5`) |
+| `drop_addr` | `-drop-addr` | `127.0.0.1:8444` | droppable channel address (`droptest`) |
+| `glue_addr` | `-glue-addr` | `127.0.0.1:8446` | glue channel address (`tun`) |
+| `tun_name` | `-tun-name` | `dormtun0` | TUN interface name (`tun`) |
+| `tun_mtu` | `-tun-mtu` | `1420` | TUN MTU (`tun`) |
+| `tun_paths` | `-tun-paths` | `1` | number of parallel duplicated paths / multipath (`tun`) |
+| `tun_measure` | `-tun-measure` | `false` | send measurement pings (`tun`) |
+| `tun_measure_interval` | `-tun-measure-interval` | `33ms` | ping spacing (`tun`) |
+| `vpn_addr` | `-vpn-addr` | `127.0.0.1:8447` | vpn channel address (`vpn`) |
+| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | TUN interface name (`vpn`) |
+| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | TUN MTU (`vpn`) |
+| `drop_count` | `-drop-count` | `0` | number of frames in the stress test (`droptest`) |
+| `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
+| `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
+| `insecure` | `-insecure` | `false` | skip the server's TLS certificate verification |
+| `psk_file` | `-psk-file` | empty | path to a file holding the secret |
+| `psk` | — | empty | the secret written directly into the config |
+
+`server-config.json`/`client-config.json` are gitignored — never commit
+the real files once they hold a live secret; only `*.example.json`
+(placeholder values) live in the repo.
+
+## `vpn` mode: all traffic through the tunnel
+
+A full replacement for your normal internet connection: the client
+creates a TUN, captures ALL IP traffic (not just UDP), the server
+writes it into its own TUN and NATs it out through the Linux kernel
+(iptables MASQUERADE).
+
+`client-config.json`:
+```json
+{
+  "mode": "vpn",
+  "vpn_addr": "<SERVER_IP>:443",
+  "vpn_tun_name": "dormvpn0",
+  "vpn_tun_mtu": 1400,
+  "insecure": true,
+  "psk": "<secret>"
+}
+```
+
+Run: `.\client.exe` (Administrator shell), wait for `connected to vpn
+channel ...`. Then — routing, in a SECOND Administrator shell:
+
+```
+# 1. Find your current gateway (ipconfig, "Default Gateway") and the server's IP.
+
+# 2. Anti-loop route — MANDATORY before overriding the default route,
+#    otherwise the client's own connection to the server loops back
+#    into itself.
+route add <SERVER_IP> mask 255.255.255.255 <GATEWAY_IP> metric 1
+
+# 3. Address the interface + a public DNS (your network's own DNS
+#    becomes unreachable the moment the default route changes).
+netsh interface ip set address name="dormvpn0" static 10.66.0.2 255.255.255.0
+netsh interface ip set dns name="dormvpn0" static 1.1.1.1
+
+# 4. Override the default route.
+route add 0.0.0.0 mask 0.0.0.0 10.66.0.1 metric 1
+```
+
+If `route add 0.0.0.0 ...` bound to the wrong interface (`route print
+-4` shows interface `10.255.164.241` instead of `10.66.0.2`) —
+recreate it with an explicit interface index:
+```
+$idx = (Get-NetAdapter -InterfaceAlias "dormvpn0").ifIndex
+route delete 0.0.0.0 mask 0.0.0.0 10.66.0.1
+route add 0.0.0.0 mask 0.0.0.0 10.66.0.1 metric 1 if $idx
+```
+
+Undo (restore normal internet):
+```
+route delete 0.0.0.0 mask 0.0.0.0 10.66.0.1
+route delete <SERVER_IP> mask 255.255.255.255 <GATEWAY_IP>
+```
+then `Ctrl+C` the client.
+
+Verify: `ping 1.1.1.1`, `curl https://example.com`,
+`curl -UseBasicParsing https://api.ipify.org` (should return the
+server's IP, not your own).
+
+## Authentication
+
+Without `psk` in the config (or `-psk-file`), the server accepts
+connections from anyone who finds its IP:port — an open proxy and an
+open UDP/IP relay. `psk` is the preferred way (see the field tables
+above); `psk_file`/`-psk-file` is the older form, a path to a separate
+file:
+
+```
+openssl rand -base64 32 > dormtun.key
 chmod 600 dormtun.key
 ```
 
-Server: `./server ... -psk-file dormtun.key`
-Client: `.\client.exe ... -psk-file dormtun.key`
-
 Same file's contents on both ends — copy it over, don't retype it (the
 key is SHA-256'd internally, so whitespace differences don't matter,
-but the actual passphrase must match exactly).
-
-Don't pass the secret as a bare flag value like `-psk some-secret` —
-anything on the command line is visible to any local user on the same
-box via `/proc/<pid>/cmdline`. A file with tight permissions is the
-point of `-psk-file`.
-
-With Docker, mount the key file rather than baking it into the image
-(baked-in secrets end up in the image layers, shareable by accident):
-
-```yaml
-# docker-compose.yml
-services:
-  dormtun-server:
-    volumes:
-      - ./dormtun.key:/app/dormtun.key:ro
-    command: ["-addr", "0.0.0.0:8443", "-drop-addr", "0.0.0.0:8444",
-              "-glue-addr", "0.0.0.0:8446", "-psk-file", "/app/dormtun.key"]
-```
+but the actual passphrase must match exactly). Don't pass the secret as
+a bare flag value like `-psk some-secret` — the command line is visible
+to any local user via `/proc/<pid>/cmdline`.
 
 The glue channel additionally refuses to relay to loopback, link-local,
 and multicast destinations, and to a handful of UDP amplification-vector
@@ -100,111 +235,86 @@ go run ./cmd/gencert
 ```
 
 Writes `devcerts/dev.crt`/`dev.key` — a throwaway self-signed pair for
-localhost. The server's default `-cert`/`-key` flags point here. For
-anything beyond loopback testing, `-insecure` on the client skips proper
-verification of whatever cert the server presents — fine for a personal
-tunnel to a server you control by IP, not a substitute for real
-certificate pinning.
+localhost (the server config's default `cert`/`key` point here).
+`insecure: true` on the client skips verification of that certificate —
+fine for a personal tunnel to a server you control by IP, not a
+substitute for real certificate pinning.
 
-## SOCKS5 mode (default)
+## `tun` mode: game UDP, measurement, and multipath
 
-The original mode: the client is a local SOCKS5 proxy, the server
-forwards whatever it's asked to reach.
+Captures only real UDP traffic (not general internet) through the glue
+channel, with optional duplication across multiple paths.
 
-```
-./server -psk-file dormtun.key
-./client -listen 127.0.0.1:1080 -server <SERVER_IP>:8443 -psk-file dormtun.key -insecure
-```
-
-Point any SOCKS5-aware app (browser, curl, etc.) at `127.0.0.1:1080`.
-
-## Measuring latency/jitter/loss (the actual point of this project)
-
-`-tun-measure` sends small measurement pings through the glue channel
-at a fixed interval and prints a rolling summary — RTT (min/mean/p95/max),
-jitter, and loss — every 5 seconds. This measures the client<->server
-leg only (not client<->server<->game-server), so it isolates exactly
-what changes when you add paths.
-
-```
-.\client.exe -mode tun -tun-name dormtun0 -tun-mtu 1420 ^
-    -glue-addr <SERVER_IP>:8446 -psk-file dormtun.key -insecure ^
-    -tun-measure -tun-measure-interval 33ms -tun-paths 1
+`client-config.json`:
+```json
+{
+  "mode": "tun",
+  "glue_addr": "<SERVER_IP>:8446",
+  "tun_name": "dormtun0",
+  "tun_mtu": 1420,
+  "tun_paths": 1,
+  "tun_measure": true,
+  "tun_measure_interval": "33ms",
+  "insecure": true,
+  "psk": "<secret>"
+}
 ```
 
-Let it run 30+ seconds, note the printed summaries, `Ctrl+C`, then rerun
-with `-tun-paths 3` — same network, same server, only the path count
-changed. Comparing the two runs' loss and jitter numbers is the actual
-answer to "does multipath help on my real connection", not a guess.
+`.\client.exe` — prints a rolling summary every 5 seconds: RTT
+(min/mean/p95/max), jitter, loss, for the client<->server leg only.
+Let it run 30+ seconds, `Ctrl+C`, change `tun_paths` to `3` in the
+config, rerun — same network, same server, comparing loss/jitter
+between the two runs is the actual answer to "does multipath help on my
+real connection." No TUN route or running game needed — the pings are
+generated by the client itself.
 
-You don't need a TUN route or a game running for this — the pings are
-generated by the client itself. The TUN interface still comes up (the
-client always creates one in `tun` mode) but nothing needs to be routed
-through it just to measure.
+To actually route a game server through the TUN (not just measure):
+```
+netsh interface ip set address name="dormtun0" static 10.99.0.1 255.255.255.0
+route add <GAME_SERVER_IP> mask 255.255.255.255 10.99.0.1
+```
+
+**Don't route the tunnel server itself through the TUN** (`route add
+<SERVER_IP> ... dormtun0`) — the client's own connection to the server
+would get sent back into the TUN it's serving, a loop. Only route real
+game-server destinations.
 
 ## Diagnosing what a TUN interface sees
 
-`tunprobe` is a standalone diagnostic — no tunnel involved, just shows
-what's flowing and how it's classified (real traffic vs. local discovery
-noise like mDNS/SSDP/NetBIOS):
+`tunprobe` is a standalone binary, no tunnel involved, doesn't use a
+config (a one-off diagnostic — flags make more sense here):
 
 ```
 go build -o tunprobe.exe ./cmd/tunprobe
 .\tunprobe.exe -name dormtun0 -mtu 1420
 ```
 
-Useful for checking what a new interface is actually receiving before
-wiring it into anything.
-
-## Running the server with Docker (on the rented test box)
-
-```
-docker compose up --build -d      # build image + start, backgrounded
-docker compose logs -f            # watch server logs
-docker compose down               # stop
-```
-
-The image binds all three channels to `0.0.0.0`. Open the ports in the
-box's firewall if it has one (e.g. `ufw allow 8446/tcp`). To use your
-own certs instead of the baked-in throwaway ones, see the commented
-`volumes:` block in `docker-compose.yml`.
-
-## Running the client (native, on Windows)
-
-The client's `tun` mode needs a real network adapter and can't run in a
-container — build and run it natively. Requires `wintun.dll` next to the
-binary (https://www.wintun.net/) and an **Administrator** shell.
-
-```
-go build -o client.exe ./cmd/client
-.\client.exe -mode tun -tun-name dormtun0 -tun-mtu 1420 ^
-    -glue-addr <SERVER_IP>:8446 -tun-paths 3 -psk-file dormtun.key -insecure
-```
-
-Then, in a second Administrator shell, give the interface an address and
-route the game server (NOT the tunnel server — see caveat) through it:
-
-```
-netsh interface ip set address name="dormtun0" static 10.99.0.1 255.255.255.0
-route add <GAME_SERVER_IP> mask 255.255.255.255 10.99.0.1
-```
-
-### Caveat: don't route the tunnel server through the tunnel
-
-If you `route add <SERVER_IP> ... dormtun0`, the client's own
-connection to the server gets sent back into the TUN it's serving — a
-loop. Only route the actual game-server destinations through the TUN,
-never the tunnel server's own address.
+Shows what's flowing and how it's classified (real traffic vs. local
+discovery noise like mDNS/SSDP/NetBIOS) — useful to check before wiring
+a new interface into anything.
 
 ## Testing loss behavior (Linux, no game needed)
 
-`droptest` mode sends synthetic frames; pair with `tc netem` on the
-server's loopback to inject real loss:
+`droptest` sends synthetic frames; pair with `tc netem` on the server's
+loopback to inject real loss.
+
+`client-config.json`:
+```json
+{
+  "mode": "droptest",
+  "drop_addr": "<SERVER_IP>:8444",
+  "drop_count": 300,
+  "drop_interval": "33ms",
+  "drop_paths": 3,
+  "insecure": true,
+  "psk": "<secret>"
+}
+```
 
 ```
 sudo tc qdisc add dev lo root netem loss 20% delay 40ms 15ms
-./client -mode droptest -drop-count 300 -drop-interval 33ms -drop-paths 3 -psk-file dormtun.key -insecure
+./client
 sudo tc qdisc del dev lo root
 ```
 
-`-insecure` skips TLS cert verification — dev/testing only.
+`insecure: true` skips TLS cert verification — dev/testing only.
