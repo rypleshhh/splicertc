@@ -1,7 +1,7 @@
 # Real configs hold a live IP and (optionally) the shared secret inline —
 # never commit these. Commit *.example.json instead.
-server.config.json
-client.config.json
+server-config.json
+client-config.json
 
 # Legacy secret-file form, and throwaway dev certs (regenerated via
 # `go run ./cmd/gencert`, or baked fresh into the Docker image).
@@ -11,3 +11,10 @@ devcerts/
 # Build output
 *.exe
 tunprobe.exe
+
+# Reference-project scratch folders (other people's codebases dropped
+# here for study, not part of this project) and the running notes taken
+# on them — local-only, never pushed.
+slorc/
+owenlivkit/
+IDEAS.md

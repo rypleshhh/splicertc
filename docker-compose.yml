@@ -15,7 +15,8 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    # To use your own certs instead of the throwaway ones baked into the
-    # image, uncomment and point at a host directory holding dev.crt/dev.key:
-    # volumes:
-    #   - ./mycerts:/app/devcerts:ro
+    volumes:
+      - ./server-config.json:/app/server-config.json:ro
+      # To use your own certs instead of the throwaway ones baked into
+      # the image, also mount a host directory holding dev.crt/dev.key:
+      # - ./mycerts:/app/devcerts:ro

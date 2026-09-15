@@ -20,21 +20,36 @@ datagram traffic over TCP.
 
 ## Config files (optional, instead of typing every flag)
 
-Both binaries load `server.config.json` / `client.config.json` from the
+Both binaries load `server-config.json` / `client-config.json` from the
 current directory by default (or `-config path/to/file.json`), if
 present. Every field just seeds that flag's default — any flag you pass
 explicitly still overrides it, and a missing config file is fine, it
 just falls back to plain flags like before.
 
 ```
-cp server.config.example.json server.config.json   # then edit it
-cp client.config.example.json client.config.json
+cp server-config.example.json server-config.json   # then edit it
+cp client-config.example.json client-config.json
 ```
 
 The secret can go straight in the config as `"psk": "..."` instead of a
-separate `-psk-file`. **`server.config.json`/`client.config.json` are
+separate `-psk-file`. **`server-config.json`/`client-config.json` are
 gitignored — never commit the real ones once they hold a live secret.**
 Only the `*.example.json` files (placeholder values) are checked in.
+
+If the config has everything filled in for the mode you're using, no
+flags are needed at the console at all — just build and run:
+
+- **Server (Docker)**: `docker-compose.yml` mounts `./server-config.json`
+  into the container by default, and the `Dockerfile` runs the binary
+  with zero flags — the whole flow is: fill in `server-config.json`,
+  then `docker compose up --build -d`. The file has to exist before the
+  first run (otherwise Docker creates an empty directory there instead
+  of mounting a file) — that's what the `cp` above is for.
+- **Client**: `go build -o client.exe .\cmd\client`, then just
+  `.\client.exe` — no arguments at all, as long as `client-config.json`
+  sits next to it with `mode`, addresses, `psk`, etc. filled in. An
+  explicit flag still works to override one thing on the fly without
+  editing the file.
 
 ## Authentication (do this before exposing the server to the internet)
 

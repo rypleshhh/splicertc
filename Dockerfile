@@ -39,7 +39,10 @@ COPY --from=build /out/devcerts /app/devcerts
 # reliable, droppable, glue, vpn channels
 EXPOSE 8443 8444 8446 8447
 
-# Bind all channels to 0.0.0.0 so they're reachable from outside the
-# container. Override the flags at `docker run` time to change ports.
+# No flags baked in — the server reads server-config.json (mounted at
+# /app/server-config.json by docker-compose.yml) for everything: ports,
+# subnet, psk, all of it. Passing flags at `docker run`/in `command:`
+# still works and overrides individual config fields if you ever need
+# that, but the normal path is just editing the config and rebuilding.
 ENTRYPOINT ["/app/server"]
-CMD ["-addr", "0.0.0.0:8443", "-drop-addr", "0.0.0.0:8444", "-glue-addr", "0.0.0.0:8446", "-vpn-addr", "0.0.0.0:8447"]
+CMD []

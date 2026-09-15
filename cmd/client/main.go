@@ -68,7 +68,7 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 func main() {
 	configPath := config.FindFlag(os.Args[1:], "config")
 	if configPath == "" {
-		configPath = "client.config.json"
+		configPath = "client-config.json"
 	}
 	var cfg Config
 	foundCfg, err := config.Load(configPath, &cfg)
@@ -94,7 +94,7 @@ func main() {
 	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
 	pskFile := flag.String("psk-file", cfg.PSKFile, "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
-	flag.String("config", configPath, "path to a JSON config file (client.config.json by default; explicit flags override its values)")
+	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
 	if foundCfg {

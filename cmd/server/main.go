@@ -171,7 +171,7 @@ func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
 func main() {
 	configPath := config.FindFlag(os.Args[1:], "config")
 	if configPath == "" {
-		configPath = "server.config.json"
+		configPath = "server-config.json"
 	}
 	var cfg Config
 	foundCfg, err := config.Load(configPath, &cfg)
@@ -190,7 +190,7 @@ func main() {
 	cert := flag.String("cert", config.Str(cfg.Cert, "devcerts/dev.crt"), "TLS cert file")
 	key := flag.String("key", config.Str(cfg.Key, "devcerts/dev.key"), "TLS key file")
 	pskFile := flag.String("psk-file", cfg.PSKFile, "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
-	flag.String("config", configPath, "path to a JSON config file (server.config.json by default; explicit flags override its values)")
+	flag.String("config", configPath, "path to a JSON config file (server-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
 	if foundCfg {
