@@ -11,6 +11,7 @@ devcerts/
 # Build output
 *.exe
 tunprobe.exe
+portprobe-linux
 
 # Reference-project scratch folders (other people's codebases dropped
 # here for study, not part of this project) and the running notes taken
