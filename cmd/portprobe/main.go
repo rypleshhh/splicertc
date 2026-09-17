@@ -64,17 +64,42 @@ func parsePorts(s string) []int {
 	if t := strings.TrimSpace(s); t == "" || t == "none" || t == "-" {
 		return nil
 	}
+	seen := make(map[int]bool)
 	var out []int
+	add := func(p int) {
+		if p < 1 || p > 65535 {
+			log.Fatalf("bad port %d (must be 1-65535)", p)
+		}
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
 	for _, f := range strings.Split(s, ",") {
 		f = strings.TrimSpace(f)
 		if f == "" {
 			continue
 		}
+		// "a-b" is an inclusive range, e.g. "1-999" for every
+		// privileged/well-known port in one sweep — spelling out a
+		// thousand comma-separated ports by hand isn't practical.
+		if dash := strings.IndexByte(f, '-'); dash > 0 {
+			loStr, hiStr := f[:dash], f[dash+1:]
+			lo, errLo := strconv.Atoi(loStr)
+			hi, errHi := strconv.Atoi(hiStr)
+			if errLo != nil || errHi != nil || lo > hi {
+				log.Fatalf("bad port range %q", f)
+			}
+			for p := lo; p <= hi; p++ {
+				add(p)
+			}
+			continue
+		}
 		p, err := strconv.Atoi(f)
-		if err != nil || p < 1 || p > 65535 {
+		if err != nil {
 			log.Fatalf("bad port %q", f)
 		}
-		out = append(out, p)
+		add(p)
 	}
 	sort.Ints(out)
 	return out
