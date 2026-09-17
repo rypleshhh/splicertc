@@ -134,6 +134,8 @@ config path: `-config path/to/file.json`.
 | `vpn_addr` | `-vpn-addr` | `127.0.0.1:8447` | vpn channel address (`vpn`) |
 | `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | TUN interface name (`vpn`) |
 | `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | TUN MTU (`vpn`) |
+| `game_processes` | `-game-processes` | empty | comma-separated executable names — their UDP traffic rides glue+multipath instead of the single `vpn` stream (`vpn`) |
+| `game_paths` | `-game-paths` | `3` if `game_processes` is set | number of parallel paths for classified game UDP (`vpn`) |
 | `drop_count` | `-drop-count` | `0` | number of frames in the stress test (`droptest`) |
 | `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
 | `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
@@ -178,6 +180,34 @@ writes it into its own TUN and NATs it out through the Linux kernel
 
 Run: `.\client.exe` (Administrator shell), wait for `connected to vpn
 channel ...`. Then — routing, in a SECOND Administrator shell:
+
+### Selective multipath for games (optional)
+
+By default all traffic rides one TCP stream — under a burst of small
+packets (e.g. a rapid sequence of in-game actions) that's exposed to TCP
+head-of-line blocking: one lost packet holds up everything behind it.
+To give specific processes multipath duplication (several parallel
+paths, first one wins — the same mechanism `tun` mode uses), list them
+in `game_processes`:
+
+```json
+{
+  "mode": "vpn",
+  "vpn_addr": "<SERVER_IP>:587",
+  "glue_addr": "<SERVER_IP>:993",
+  "game_processes": ["deadlock.exe"],
+  "game_paths": 3,
+  "psk": "<secret>"
+}
+```
+
+The client figures out which process owns each UDP port itself (via the
+Windows IP Helper API, `GetExtendedUdpTable` — no third-party
+dependency), so there's no need to guess game-server IP ranges. UDP
+only; that process's TCP and everything else still rides the single
+`vpn` stream. The server also needs a working `glue_addr` in
+`server-config.json` for this — no server code changes, just both
+channels listening (two different ports).
 
 ```
 # 1. Find your current gateway (ipconfig, "Default Gateway") and the server's IP.

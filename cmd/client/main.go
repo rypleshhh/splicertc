@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,14 @@ type Config struct {
 	VPNAddr            string `json:"vpn_addr,omitempty"`
 	VPNTunName         string `json:"vpn_tun_name,omitempty"`
 	VPNTunMTU          int    `json:"vpn_tun_mtu,omitempty"`
+	// GameProcesses selectively routes matched processes' UDP traffic
+	// through the glue channel (multipath duplication) instead of vpn
+	// mode's single TCP stream — see runVPNMode. Empty means vpn mode
+	// behaves exactly as before (no glue connections opened at all).
+	GameProcesses []string `json:"game_processes,omitempty"`
+	// GamePaths is the multipath duplication factor for GameProcesses'
+	// UDP traffic; defaults to 3 if GameProcesses is set but this isn't.
+	GamePaths int `json:"game_paths,omitempty"`
 	DropCount          int    `json:"drop_count,omitempty"`
 	DropInterval       string `json:"drop_interval,omitempty"` // e.g. "33ms"
 	DropPaths          int    `json:"drop_paths,omitempty"`
@@ -59,6 +68,20 @@ type Config struct {
 	// of git if it holds a real secret (see config.example.json vs
 	// config.json).
 	PSK string `json:"psk,omitempty"`
+}
+
+// parseGameProcesses turns a comma-separated -game-processes value into
+// a normalized (lowercase, trimmed, empty entries dropped) list, ready
+// to compare directly against procmap's already-lowercase process names.
+func parseGameProcesses(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseDurationOr(s string, fallback time.Duration) time.Duration {
@@ -101,6 +124,8 @@ func main() {
 	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
 	serverPin := flag.String("server-pin", cfg.ServerPin, "SHA-256 (hex) of the server's TLS certificate — when set, the server must present exactly this cert (see -insecure's caveat about MITM otherwise)")
+	gameProcessesFlag := flag.String("game-processes", strings.Join(cfg.GameProcesses, ","), "vpn mode: comma-separated executable names (e.g. deadlock.exe) whose UDP traffic gets routed through the glue channel with multipath duplication instead of the single vpn stream")
+	gamePaths := flag.Int("game-paths", config.Int(cfg.GamePaths, 0), "vpn mode: multipath duplication factor for -game-processes UDP traffic (0 = default of 3 if -game-processes is set)")
 	pskFile := flag.String("psk-file", cfg.PSKFile, "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
 	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
@@ -136,7 +161,12 @@ func main() {
 	}
 
 	if *mode == "vpn" {
-		runVPNMode(*vpnAddr, *insecure, pin, *vpnTunName, *vpnTunMTU, key)
+		gameProcesses := parseGameProcesses(*gameProcessesFlag)
+		paths := *gamePaths
+		if len(gameProcesses) > 0 && paths <= 0 {
+			paths = 3
+		}
+		runVPNMode(*vpnAddr, *insecure, pin, *vpnTunName, *vpnTunMTU, key, *glueAddr, gameProcesses, paths)
 		return
 	}
 
