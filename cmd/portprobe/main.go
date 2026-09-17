@@ -58,6 +58,12 @@ func udpRequest() []byte {
 }
 
 func parsePorts(s string) []int {
+	// "none" spelled out, because Windows PowerShell 5.1 silently drops
+	// an empty-string argument to a native binary — `-udp ""` arrives as
+	// a bare `-udp`, which then swallows the next flag as its value.
+	if t := strings.TrimSpace(s); t == "" || t == "none" || t == "-" {
+		return nil
+	}
 	var out []int
 	for _, f := range strings.Split(s, ",") {
 		f = strings.TrimSpace(f)
@@ -72,6 +78,79 @@ func parsePorts(s string) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// Well-known public endpoints, one per interesting port. Probing these
+// says whether the network lets that port out at all, without opening
+// a single hole in our own VPS firewall — useful for narrowing down
+// which ports are even worth testing against our own box.
+const defaultTargets = "www.google.com:80,www.google.com:443,github.com:22,8.8.8.8:53," +
+	"smtp.gmail.com:25,smtp.gmail.com:465,smtp.gmail.com:587,imap.gmail.com:993," +
+	"pop.gmail.com:995,ftp.gnu.org:21,irc.libera.chat:6667,irc.libera.chat:6697"
+
+// probeTarget just asks whether a TCP connection to somebody else's
+// server completes. No token to compare against — a completed handshake
+// (and any banner the service volunteers) is the whole signal.
+func probeTarget(target string, timeout time.Duration) string {
+	conn, err := net.DialTimeout("tcp", target, timeout)
+	if err != nil {
+		return classify(err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 96)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		// Plenty of services (HTTPS, HTTP) say nothing until spoken to;
+		// the completed handshake already answered the question.
+		return "reachable"
+	}
+	banner := strings.TrimSpace(string(buf[:n]))
+	if len(banner) > 40 {
+		banner = banner[:40] + "..."
+	}
+	return fmt.Sprintf("reachable (%s)", banner)
+}
+
+func runTargets(targets []string, timeout time.Duration, parallel int) {
+	type tres struct {
+		target string
+		status string
+	}
+	var (
+		mu  sync.Mutex
+		out []tres
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, parallel)
+	)
+	for _, t := range targets {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			s := probeTarget(t, timeout)
+			mu.Lock()
+			out = append(out, tres{t, s})
+			mu.Unlock()
+		}(t)
+	}
+	wg.Wait()
+	sort.Slice(out, func(i, j int) bool { return out[i].target < out[j].target })
+
+	fmt.Printf("\nprobing public endpoints (no changes to your own server needed)\n\n")
+	var ok []string
+	for _, r := range out {
+		mark := " "
+		if strings.HasPrefix(r.status, "reachable") {
+			mark = "+"
+			ok = append(ok, r.target)
+		}
+		fmt.Printf(" %s %-24s %s\n", mark, r.target, r.status)
+	}
+	fmt.Printf("\n%d of %d reachable: %s\n", len(ok), len(out), strings.Join(ok, " "))
+	fmt.Println("a port open here is worth re-testing against your own server — a filter can allow a port only toward well-known destinations")
 }
 
 func runServer(tcpPorts, udpPorts []int) {
@@ -410,7 +489,17 @@ func main() {
 	parallel := flag.Int("parallel", 8, "how many ports to probe at once (client mode)")
 	sustainFor := flag.Duration("sustain", 0, "client mode: after scanning, hold every open port this long with traffic flowing, to see which survive a long-lived flow (e.g. 5m)")
 	sustainEvery := flag.Duration("sustain-interval", time.Second, "client mode: spacing between messages while sustaining")
+	targets := flag.String("targets", "", "client mode: instead of probing our own server, TCP-connect to these host:port pairs (comma-separated, or \"default\" for a built-in list of public services) — needs no server and no firewall changes")
 	flag.Parse()
+
+	if *targets != "" {
+		list := *targets
+		if list == "default" {
+			list = defaultTargets
+		}
+		runTargets(strings.Split(list, ","), *timeout, *parallel)
+		return
+	}
 
 	tcpPorts := parsePorts(*tcpList)
 	udpPorts := parsePorts(*udpList)

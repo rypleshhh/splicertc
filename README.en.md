@@ -1,6 +1,6 @@
 RU [Русский](README.md) | EN **English**
 
-# tcp-dormtun
+# splicertc
 
 A from-scratch TCP/TLS tunnel that carries traffic through a network
 that blocks non-standard ports. Two ways to use it: a full VPN
@@ -138,12 +138,24 @@ config path: `-config path/to/file.json`.
 | `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
 | `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
 | `insecure` | `-insecure` | `false` | skip the server's TLS certificate verification |
+| `server_pin` | `-server-pin` | empty | SHA-256 (hex) of the server's certificate — if set, the server must present exactly this certificate |
 | `psk_file` | `-psk-file` | empty | path to a file holding the secret |
 | `psk` | — | empty | the secret written directly into the config |
 
 `server-config.json`/`client-config.json` are gitignored — never commit
 the real files once they hold a live secret; only `*.example.json`
 (placeholder values) live in the repo.
+
+**On `insecure` vs `server_pin`**: without `server_pin`, `insecure: true`
+accepts ANY certificate from anyone — a TLS-intercepting middlebox on
+the network can present its own certificate and read all traffic in the
+clear, and the PSK check won't catch it (it just passes straight
+through to the real server via the interceptor). The server prints its
+fingerprint at startup (`cert fingerprint (put this in the client's
+server_pin to enable pinning): ...`) — copy that line into the client's
+`server_pin`, and `insecure` stops being a hole: the server must present
+exactly that certificate, which can't be forged without its private key
+even under TLS 1.3.
 
 ## `vpn` mode: all traffic through the tunnel
 

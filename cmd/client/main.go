@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -46,7 +47,13 @@ type Config struct {
 	DropInterval       string `json:"drop_interval,omitempty"` // e.g. "33ms"
 	DropPaths          int    `json:"drop_paths,omitempty"`
 	Insecure           bool   `json:"insecure,omitempty"`
-	PSKFile            string `json:"psk_file,omitempty"`
+	// ServerPin is the SHA-256 (hex) of the server's TLS certificate,
+	// printed by the server at startup. When set, the client verifies
+	// the server presents exactly this certificate instead of trusting
+	// insecure's "accept anything" — without a pin, insecure:true is
+	// vulnerable to a TLS-intercepting middlebox reading all traffic.
+	ServerPin string `json:"server_pin,omitempty"`
+	PSKFile   string `json:"psk_file,omitempty"`
 	// PSK is the shared secret written directly into the config file,
 	// as an alternative to -psk-file/PSKFile. Keep the config file out
 	// of git if it holds a real secret (see config.example.json vs
@@ -93,6 +100,7 @@ func main() {
 	dropInterval := flag.Duration("drop-interval", parseDurationOr(cfg.DropInterval, 33*time.Millisecond), "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
+	serverPin := flag.String("server-pin", cfg.ServerPin, "SHA-256 (hex) of the server's TLS certificate — when set, the server must present exactly this cert (see -insecure's caveat about MITM otherwise)")
 	pskFile := flag.String("psk-file", cfg.PSKFile, "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
 	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
@@ -113,29 +121,38 @@ func main() {
 		key = auth.DeriveKey(cfg.PSK)
 	}
 
+	var pin []byte
+	if *serverPin != "" {
+		p, err := hex.DecodeString(*serverPin)
+		if err != nil {
+			log.Fatalf("server-pin: invalid hex: %v", err)
+		}
+		pin = p
+	}
+
 	if *mode == "tun" {
-		runTunMode(*glueAddr, *insecure, *tunName, *tunMTU, *tunPaths, *tunMeasure, *tunMeasureInterval, key)
+		runTunMode(*glueAddr, *insecure, pin, *tunName, *tunMTU, *tunPaths, *tunMeasure, *tunMeasureInterval, key)
 		return
 	}
 
 	if *mode == "vpn" {
-		runVPNMode(*vpnAddr, *insecure, *vpnTunName, *vpnTunMTU, key)
+		runVPNMode(*vpnAddr, *insecure, pin, *vpnTunName, *vpnTunMTU, key)
 		return
 	}
 
 	if *mode == "droptest" {
 		switch {
 		case *dropCount > 0 && *dropPaths > 1:
-			runDropMultipath(*dropAddr, *insecure, *dropCount, *dropInterval, *dropPaths, key)
+			runDropMultipath(*dropAddr, *insecure, pin, *dropCount, *dropInterval, *dropPaths, key)
 		case *dropCount > 0:
-			runDropStress(*dropAddr, *insecure, *dropCount, *dropInterval, key)
+			runDropStress(*dropAddr, *insecure, pin, *dropCount, *dropInterval, key)
 		default:
-			runDropTest(*dropAddr, *insecure, key)
+			runDropTest(*dropAddr, *insecure, pin, key)
 		}
 		return
 	}
 
-	conn, err := transport.Dial(*serverAddr, *insecure)
+	conn, err := transport.Dial(*serverAddr, *insecure, pin)
 	if err != nil {
 		log.Fatalf("dial server: %v", err)
 	}
@@ -222,8 +239,8 @@ func relay(a, b io.ReadWriteCloser) {
 // in for "this frame got stuck behind a retransmit" without needing real
 // packet loss. The server's TTL is 150ms (see cmd/server), so delays past
 // that should show up there as drops.
-func runDropTest(dropAddr string, insecure bool, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure)
+func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
+	conn, err := transport.Dial(dropAddr, insecure, pin)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
@@ -261,8 +278,8 @@ func runDropTest(dropAddr string, insecure bool, key []byte) {
 // retransmission stalls, not a simulated sleep. Check the server's log
 // for the accepted/DROPPED breakdown; this side just confirms what left
 // the client.
-func runDropStress(dropAddr string, insecure bool, count int, interval time.Duration, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure)
+func runDropStress(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, key []byte) {
+	conn, err := transport.Dial(dropAddr, insecure, pin)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
@@ -310,7 +327,7 @@ func sendNewSessionID(conn net.Conn) error {
 	return err
 }
 
-func runDropMultipath(dropAddr string, insecure bool, count int, interval time.Duration, paths int, key []byte) {
+func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, paths int, key []byte) {
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
 		log.Fatalf("generate session id: %v", err)
@@ -319,7 +336,7 @@ func runDropMultipath(dropAddr string, insecure bool, count int, interval time.D
 
 	conns := make([]net.Conn, paths)
 	for i := 0; i < paths; i++ {
-		conn, err := transport.Dial(dropAddr, insecure)
+		conn, err := transport.Dial(dropAddr, insecure, pin)
 		if err != nil {
 			log.Fatalf("dial path %d: %v", i, err)
 		}
@@ -361,11 +378,41 @@ type flowInfo struct {
 	origSrcPort, origDstPort uint16
 }
 
+// flowKey identifies one UDP flow by its full 4-tuple. Keying only by
+// source port (the old scheme) collapses distinct flows whenever one
+// local socket talks to more than one remote destination — routine for
+// Steam Datagram Relay, which pings many relay POPs from a single UDP
+// socket. The server trusts flowID as an opaque handle and never
+// second-guesses it (see cmd/server/main.go handleGlueConn), so once
+// two different destinations shared an ID, later traffic for one
+// destination could get silently written to the other's socket.
+type flowKey struct {
+	srcPort uint16
+	dst     [4]byte
+	dstPort uint16
+}
+
+// allocFlowID returns the flow ID already assigned to key, or allocates
+// the next free one. uint16 gives 65536 concurrent flows — several
+// orders of magnitude more than a real gaming session touches, so IDs
+// are safe to leave unreclaimed here (idle expiry is a separate,
+// already-tracked improvement, not a correctness requirement for this
+// fix: the bug was that two different destinations could collide on
+// the same ID, not that IDs are ever reused today).
+func allocFlowID(ids map[flowKey]uint16, counter *uint16, key flowKey) uint16 {
+	if id, ok := ids[key]; ok {
+		return id
+	}
+	*counter++
+	ids[key] = *counter
+	return *counter
+}
+
 // runTunMode is the real integration: captures actual outbound UDP from
 // a TUN interface, tunnels it through the glue channel, and reinjects
 // whatever comes back so the OS (and the game/app that opened the local
 // socket) sees an ordinary reply. IPv4 only — see internal/glue.
-func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
+func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
 	if paths < 1 {
 		paths = 1
 	}
@@ -391,7 +438,7 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths i
 
 	conns := make([]net.Conn, 0, paths)
 	for i := 0; i < paths; i++ {
-		c, err := transport.Dial(glueAddr, insecure)
+		c, err := transport.Dial(glueAddr, insecure, pin)
 		if err != nil {
 			log.Fatalf("dial glue path %d: %v", i, err)
 		}
@@ -414,6 +461,8 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths i
 
 	var flowsMu sync.Mutex
 	flows := make(map[uint16]flowInfo)
+	flowIDs := make(map[flowKey]uint16)
+	var flowIDCounter uint16
 
 	// Replies come back duplicated across every path (server-side
 	// broadcast), so a receiver dedupes them here before reinjecting —
@@ -527,14 +576,16 @@ func runTunMode(glueAddr string, insecure bool, tunName string, mtu int, paths i
 				continue
 			}
 
-			flowID := info.SrcPort
 			var fi flowInfo
 			copy(fi.origSrc[:], info.Src.To4())
 			copy(fi.origDst[:], info.Dst.To4())
 			fi.origSrcPort = info.SrcPort
 			fi.origDstPort = info.DstPort
 
+			key := flowKey{srcPort: info.SrcPort, dst: fi.origDst, dstPort: info.DstPort}
+
 			flowsMu.Lock()
+			flowID := allocFlowID(flowIDs, &flowIDCounter, key)
 			flows[flowID] = fi
 			flowsMu.Unlock()
 

@@ -27,7 +27,7 @@ const vpnKeepaliveInterval = 20 * time.Second
 // routing+NAT, so there's no flow bookkeeping or packet rebuild here —
 // unlike glue's BuildIPv4UDP, replies from the server are already
 // complete, correctly-addressed IP packets.
-func runVPNMode(vpnAddr string, insecure bool, tunName string, mtu int, key []byte) {
+func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu int, key []byte) {
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
 		log.Fatalf("create TUN: %v", err)
@@ -36,7 +36,7 @@ func runVPNMode(vpnAddr string, insecure bool, tunName string, mtu int, key []by
 	actualName, _ := dev.Name()
 	log.Printf("TUN interface up: %s (requested %q, mtu %d)", actualName, tunName, mtu)
 
-	conn, err := transport.Dial(vpnAddr, insecure)
+	conn, err := transport.Dial(vpnAddr, insecure, pin)
 	if err != nil {
 		log.Fatalf("dial vpn channel: %v", err)
 	}

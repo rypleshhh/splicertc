@@ -68,10 +68,33 @@ type Receiver struct {
 	maxAge      time.Duration
 	lastSeq     uint32
 	haveLastSeq bool
+
+	// Accept's staleness check compares f.TimestampMS (stamped on the
+	// *sender's* clock) against the local clock — a raw difference that
+	// conflates real network delay with whatever clock skew exists
+	// between the two machines. Skew of even 100-200ms (common between
+	// an unsynced client and a VPS) makes every frame look stale and
+	// get dropped regardless of actual network conditions. To cancel
+	// that out, we track the smallest (recv_time - send_time) ever
+	// observed — that floor is network_delay_floor + skew, both
+	// roughly constant — and measure staleness as delay *beyond* that
+	// floor instead of raw age. Two windows (current + previous) so a
+	// single unlucky sample right at a window boundary can't corrupt
+	// the baseline.
+	haveOffset    bool
+	prevMinOffset time.Duration
+	curMinOffset  time.Duration
+	windowStart   time.Time
 }
 
-// NewReceiver creates a receiver that drops any frame older than maxAge
-// by the time it's evaluated.
+// offsetWindow is how often the skew/delay-floor baseline is allowed to
+// adapt — long enough to collect plenty of samples at typical game-tick
+// rates, short enough to track real drift within tens of seconds.
+const offsetWindow = 5 * time.Second
+
+// NewReceiver creates a receiver that drops any frame more than maxAge
+// late relative to the best (recv - send) offset seen so far — not
+// relative to zero, since the two clocks aren't assumed to agree.
 func NewReceiver(maxAge time.Duration) *Receiver {
 	return &Receiver{maxAge: maxAge}
 }
@@ -79,9 +102,37 @@ func NewReceiver(maxAge time.Duration) *Receiver {
 // Accept reports whether f should be delivered to the application, and
 // updates internal state if so. Call this exactly once per frame, in
 // the order frames were read.
+//
+// The very first frame a Receiver ever sees always establishes the
+// baseline against itself (age 0) and is accepted unconditionally —
+// with zero prior samples there's no way to distinguish "this one frame
+// is stale" from "this is just what skew+delay looks like on this
+// link," and accepting one frame at connection start is far cheaper
+// than the alternative (see frame_test.go's clock-skew regression test
+// for what that alternative used to cost).
 func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
-	age := time.Since(time.UnixMilli(f.TimestampMS))
-	if age > r.maxAge {
+	now := time.Now()
+	raw := now.Sub(time.UnixMilli(f.TimestampMS))
+
+	switch {
+	case !r.haveOffset:
+		r.haveOffset = true
+		r.curMinOffset, r.prevMinOffset = raw, raw
+		r.windowStart = now
+	case raw < r.curMinOffset:
+		r.curMinOffset = raw
+	}
+	if now.Sub(r.windowStart) >= offsetWindow {
+		r.prevMinOffset, r.curMinOffset = r.curMinOffset, raw
+		r.windowStart = now
+	}
+
+	baseline := r.prevMinOffset
+	if r.curMinOffset < baseline {
+		baseline = r.curMinOffset
+	}
+
+	if age := raw - baseline; age > r.maxAge {
 		return false, "ttl exceeded"
 	}
 	return r.AcceptSeq(f)

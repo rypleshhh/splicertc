@@ -197,6 +197,12 @@ func main() {
 		log.Printf("loaded config from %s", configPath)
 	}
 
+	if fp, err := transport.LoadCertFingerprint(*cert); err != nil {
+		log.Printf("could not compute cert fingerprint for pinning: %v", err)
+	} else {
+		log.Printf("cert fingerprint (put this in the client's server_pin to enable pinning): %x", fp)
+	}
+
 	switch {
 	case *pskFile != "":
 		k, err := auth.LoadKey(*pskFile)
