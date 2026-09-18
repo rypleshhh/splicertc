@@ -12,14 +12,19 @@ latency/loss cost of running datagrams over TCP (`tun` mode).
 
 - **server** (`cmd/server`) — runs on the VPS. Channels: reliable
   (SOCKS5-style, `:8443`), droppable (framed, TTL-dropped, `:8444`),
-  glue (real captured UDP from a TUN, `:8446`), vpn (full IP tunnel
-  with server-side NAT, `:443`).
+  glue (real captured UDP from a TUN, `:8446`), vpn (full IP tunnel with
+  server-side NAT, `:8447` by default — in practice usually moved to
+  whatever port actually gets through the network's filtering, see
+  "Quick start").
 - **client** (`cmd/client`) — runs on the gaming/work machine. Modes:
-  `vpn` (all traffic through the tunnel), `socks5` (local proxy), `tun`
-  (game UDP capture, optionally multipath), `droptest` (synthetic loss
-  testing).
+  `vpn` (all traffic through the tunnel, optionally with selective
+  multipath for games), `socks5` (local proxy), `tun` (game UDP
+  capture, optionally multipath), `droptest` (synthetic loss testing).
 - **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
 - **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
+- **portprobe** (`cmd/portprobe`) — network diagnostic: which ports
+  actually get through the filtering, before and independent of the
+  tunnel (see "Picking a port" below).
 
 Everything is driven by **config files** — `server-config.json` on the
 server, `client-config.json` on the client. Command-line flags exist
@@ -43,9 +48,13 @@ server and client**, verbatim, identical.
 cp server-config.example.json server-config.json
 ```
 
-Open `server-config.json`, fill in `psk`. For normal VPN use the rest
-can stay as-is — the defaults are already set (`vpn_addr` on
-`0.0.0.0:443`, subnet `10.66.0.0/24`). Then:
+Open `server-config.json`, fill in `psk`. The example is already set to
+port `587` for `vpn_addr` — a port that works for a typical filtered
+network (see the next section if you want to check/pick a different
+one), and it doesn't conflict with 443, which often already has another
+service on it (e.g. Xray). The `10.66.0.0/24` subnet can stay as-is.
+Open the port in the VPS firewall if it has one (`ufw allow 587/tcp`) —
+otherwise the server comes up but is unreachable from outside. Then:
 
 ```
 docker compose up --build -d
@@ -73,19 +82,30 @@ cp client-config.example.json client-config.json
 ```
 
 Open `client-config.json`, fill in `vpn_addr` (your server's IP, port
-443) and the same `psk`. Build and run:
+`587`, matching the server example) and the same `psk`. Needs
+`wintun.dll` next to `client.exe` (https://www.wintun.net/, already in
+the repo) and an **Administrator** shell.
 
+Recommended way to launch — one script that builds the client, starts
+it, and sets up routing, all in a single window:
+
+```powershell
+.\run-vpn.ps1
+```
+
+It builds `client.exe`, stops a stale process from a previous run (if
+any), starts the client in the same window (log output visible right
+away), waits for the TUN interface to come up, and sets up routing
+itself — including verifying via ipify that traffic actually goes
+through the tunnel. `Ctrl+C` stops it. Flags: `-Config path.json`
+(different config), `-NoBuild` (skip rebuilding).
+
+Manual way (two windows, if you need more control — see "`vpn` mode"
+below for exactly what `run-vpn.ps1` does under the hood):
 ```
 go build -o client.exe .\cmd\client
 .\client.exe
 ```
-
-No arguments — mode, address, secret are already in the file. Needs
-`wintun.dll` next to `client.exe` (https://www.wintun.net/, already in
-the repo) and an **Administrator** shell.
-
-Next — set up routing (see "`vpn` mode: all traffic through the
-tunnel" below).
 
 ### One-off flag override
 
@@ -98,6 +118,53 @@ single run, without editing the file:
 
 Flag names match config field names (see the tables below). A different
 config path: `-config path/to/file.json`.
+
+## Picking a port: `cmd/portprobe`
+
+Filtered networks usually let through only a small set of standard
+ports, and that set can change over time — don't assume port 587 (or
+any other) will keep working forever. `portprobe` is a standalone
+diagnostic tool: the server listens on a batch of TCP/UDP ports at once
+and replies with a token containing the port number (to tell "this port
+is genuinely open" apart from "something else answered instead" — e.g.
+a transparent proxy); the client probes the list and prints what got
+through.
+
+Build (cross-compiling for the Linux VPS works right from Windows):
+```powershell
+go build -o portprobe.exe .\cmd\portprobe
+$env:GOOS="linux"; $env:GOARCH="amd64"
+go build -o portprobe-linux .\cmd\portprobe
+$env:GOOS=""; $env:GOARCH=""
+```
+
+**On the VPS** (foreground — don't leave it running in the background on
+a production box, it's a diagnostic, not a service):
+```bash
+scp portprobe-linux root@<SERVER_IP>:~/portprobe   # from Windows
+chmod +x portprobe
+./portprobe -mode server -tcp 1-999 -udp none
+```
+Port ranges are given as `1-999` or a list `80,443,993`. The server
+automatically skips ports already in use (e.g. 22 for sshd, 443 for
+Xray) — it never steals a port from a live service. The firewall for the
+tested ports needs to be opened separately (`ufw allow ...`) — otherwise
+you're measuring your own firewall, not the network.
+
+**From the client** (on the network you're testing):
+```powershell
+.\portprobe.exe -mode client -host <SERVER_IP> -tcp 1-999 -udp none -parallel 200 -timeout 2s
+```
+
+Additionally:
+- `-sustain 5m` — after the scan, hold each port that opened under
+  traffic for 5 minutes: connecting briefly and dropping right away is
+  useless for a tunnel, and `portprobe` checks that separately.
+- `-targets default` (or your own `host:port,host:port` list) — check
+  reachability of known public services (Google, GitHub, Gmail SMTP,
+  etc.) **with no server of your own and no firewall changes needed** —
+  a fast way to see which ports aren't blocked by the network at all,
+  before opening anything on your own VPS.
 
 ## Reference: config fields
 
@@ -170,7 +237,7 @@ writes it into its own TUN and NATs it out through the Linux kernel
 ```json
 {
   "mode": "vpn",
-  "vpn_addr": "<SERVER_IP>:443",
+  "vpn_addr": "<SERVER_IP>:587",
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
   "insecure": true,
@@ -178,36 +245,17 @@ writes it into its own TUN and NATs it out through the Linux kernel
 }
 ```
 
-Run: `.\client.exe` (Administrator shell), wait for `connected to vpn
-channel ...`. Then — routing, in a SECOND Administrator shell:
+### Launching and routing
 
-### Selective multipath for games (optional)
+Easiest: `.\run-vpn.ps1` (Administrator shell) — builds the client,
+starts it, waits for the TUN interface to come up, and sets up the
+routing below itself, all in one window. The rest of this section is
+what the script does automatically — only needed if you want more
+control or something went wrong and you're fixing it by hand.
 
-By default all traffic rides one TCP stream — under a burst of small
-packets (e.g. a rapid sequence of in-game actions) that's exposed to TCP
-head-of-line blocking: one lost packet holds up everything behind it.
-To give specific processes multipath duplication (several parallel
-paths, first one wins — the same mechanism `tun` mode uses), list them
-in `game_processes`:
-
-```json
-{
-  "mode": "vpn",
-  "vpn_addr": "<SERVER_IP>:587",
-  "glue_addr": "<SERVER_IP>:993",
-  "game_processes": ["deadlock.exe"],
-  "game_paths": 3,
-  "psk": "<secret>"
-}
-```
-
-The client figures out which process owns each UDP port itself (via the
-Windows IP Helper API, `GetExtendedUdpTable` — no third-party
-dependency), so there's no need to guess game-server IP ranges. UDP
-only; that process's TCP and everything else still rides the single
-`vpn` stream. The server also needs a working `glue_addr` in
-`server-config.json` for this — no server code changes, just both
-channels listening (two different ports).
+Running the client directly: `.\client.exe` (Administrator shell), wait
+for `connected to vpn channel ...`. Then — routing, in a SECOND
+Administrator shell:
 
 ```
 # 1. Find your current gateway (ipconfig, "Default Gateway") and the server's IP.
@@ -246,6 +294,64 @@ Verify: `ping 1.1.1.1`, `curl https://example.com`,
 `curl -UseBasicParsing https://api.ipify.org` (should return the
 server's IP, not your own).
 
+### Selective multipath for games (optional)
+
+By default all traffic rides one TCP stream — under a burst of small
+packets (e.g. a rapid sequence of in-game actions) that's exposed to TCP
+head-of-line blocking: one lost packet holds up everything behind it.
+To give specific processes multipath duplication (several parallel
+paths, first one wins — the same mechanism `tun` mode uses), list them
+in `game_processes`:
+
+```json
+{
+  "mode": "vpn",
+  "vpn_addr": "<SERVER_IP>:587",
+  "glue_addr": "<SERVER_IP>:993",
+  "game_processes": ["deadlock.exe"],
+  "game_paths": 3,
+  "psk": "<secret>"
+}
+```
+
+The client figures out which process owns each UDP port itself (via the
+Windows IP Helper API, `GetExtendedUdpTable` — no third-party
+dependency), so there's no need to guess game-server IP ranges. UDP
+only; that process's TCP and everything else still rides the single
+`vpn` stream. The server also needs a working `glue_addr` in
+`server-config.json` for this — no server code changes, just both
+channels listening (two different ports).
+
+#### Finding the exact process name
+
+Classification matches the exe filename **with its extension**
+(`deadlock.exe`, not `deadlock`) — the client checks against the actual
+owner of the UDP socket, not a fuzzy name search, so it needs to be
+exact, `.exe` included.
+
+**Task Manager** (`Ctrl+Shift+Esc`) → "Details" tab, while the game is
+running — the exact name is right there in the "Name" column.
+
+**PowerShell**, while the game is running — list every process with a
+visible window (easiest way to spot the game among everything else):
+```powershell
+Get-Process | Where-Object { $_.MainWindowTitle -ne "" } | Select-Object ProcessName, Path
+```
+Or by a substring if you roughly know the name already:
+```powershell
+Get-Process -Name "*deadlock*" | Select-Object ProcessName, Path
+```
+PowerShell's `ProcessName` column has **no** `.exe` (it strips it) —
+add the extension yourself in the config. `Path` shows the full
+executable path, which settles the exact filename unambiguously.
+
+To confirm classification is actually working: with `client.exe`
+running and `game_processes` set, watch `docker compose logs -f` on the
+server — the first packet it sees from the game produces a
+`glue: new flow ... -> ...` line for that destination, which never
+happens for anything else (that traffic rides the `vpn` channel
+silently).
+
 ## Authentication
 
 Without `psk` in the config (or `-psk-file`), the server accepts
@@ -281,6 +387,31 @@ localhost (the server config's default `cert`/`key` point here).
 `insecure: true` on the client skips verification of that certificate —
 fine for a personal tunnel to a server you control by IP, not a
 substitute for real certificate pinning.
+
+## `socks5` mode: local proxy
+
+The project's original mode: the client opens a local SOCKS5 proxy, the
+server forwards whatever gets requested through it. TCP-only (no SOCKS5
+UDP ASSOCIATE) — not suitable for games, but needs no
+Administrator/TUN.
+
+`client-config.json`:
+```json
+{
+  "mode": "socks5",
+  "listen": "127.0.0.1:1080",
+  "server": "<SERVER_IP>:8443",
+  "insecure": true,
+  "psk": "<secret>"
+}
+```
+
+```
+.\client.exe
+```
+
+Point any SOCKS5-compatible application (browser, curl, etc.) at
+`127.0.0.1:1080`.
 
 ## `tun` mode: game UDP, measurement, and multipath
 

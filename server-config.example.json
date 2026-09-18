@@ -2,7 +2,7 @@
   "addr": "0.0.0.0:8443",
   "drop_addr": "0.0.0.0:8444",
   "glue_addr": "0.0.0.0:8446",
-  "vpn_addr": "0.0.0.0:443",
+  "vpn_addr": "0.0.0.0:587",
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
   "vpn_subnet": "10.66.0.0/24",
