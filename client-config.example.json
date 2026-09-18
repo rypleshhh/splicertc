@@ -4,5 +4,6 @@
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
   "insecure": true,
+  "server_pin": "REPLACE_ME_optional__sha256_hex_fingerprint_server_prints_at_startup__see_README",
   "psk": "REPLACE_ME_must_match_the_server's_psk_exactly__never_commit_the_real_one"
 }
