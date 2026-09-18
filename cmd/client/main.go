@@ -62,12 +62,23 @@ type Config struct {
 	// insecure's "accept anything" — without a pin, insecure:true is
 	// vulnerable to a TLS-intercepting middlebox reading all traffic.
 	ServerPin string `json:"server_pin,omitempty"`
-	PSKFile   string `json:"psk_file,omitempty"`
-	// PSK is the shared secret written directly into the config file,
-	// as an alternative to -psk-file/PSKFile. Keep the config file out
-	// of git if it holds a real secret (see config.example.json vs
-	// config.json).
-	PSK string `json:"psk,omitempty"`
+	// PinFile enables trust-on-first-use pinning as an alternative to
+	// manually copying ServerPin out of the server's startup log: the
+	// first connection saves the server's certificate fingerprint here,
+	// every connection after that (including future runs) is pinned to
+	// it automatically. Ignored if ServerPin is also set. See
+	// transport.ResolvePin.
+	PinFile string `json:"pin_file,omitempty"`
+	// ClientKeyFile is a file holding this client's base64 Ed25519
+	// private seed (generate one with `cmd/genkey`), the counterpart to
+	// the server's authorized_keys.json. Keep it as secret as the old
+	// psk — anyone who has it can connect as you.
+	ClientKeyFile string `json:"client_key_file,omitempty"`
+	// ClientKey is the same seed written directly into the config file,
+	// as an alternative to -client-key-file/ClientKeyFile. Keep the
+	// config file out of git if it holds a real key (see
+	// client-config.example.json vs client-config.json).
+	ClientKey string `json:"client_key,omitempty"`
 }
 
 // parseGameProcesses turns a comma-separated -game-processes value into
@@ -124,9 +135,10 @@ func main() {
 	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
 	serverPin := flag.String("server-pin", cfg.ServerPin, "SHA-256 (hex) of the server's TLS certificate — when set, the server must present exactly this cert (see -insecure's caveat about MITM otherwise)")
+	pinFile := flag.String("pin-file", cfg.PinFile, "trust-on-first-use: path to save/read the server's certificate fingerprint automatically, instead of copying -server-pin by hand (ignored if -server-pin is set)")
 	gameProcessesFlag := flag.String("game-processes", strings.Join(cfg.GameProcesses, ","), "vpn mode: comma-separated executable names (e.g. deadlock.exe) whose UDP traffic gets routed through the glue channel with multipath duplication instead of the single vpn stream")
 	gamePaths := flag.Int("game-paths", config.Int(cfg.GamePaths, 0), "vpn mode: multipath duplication factor for -game-processes UDP traffic (0 = default of 3 if -game-processes is set)")
-	pskFile := flag.String("psk-file", cfg.PSKFile, "path to the shared-secret file (must match the server's) — required if the server has auth enabled")
+	clientKeyFile := flag.String("client-key-file", cfg.ClientKeyFile, "path to this client's base64 Ed25519 private key file, generated with cmd/genkey — required if the server has auth enabled")
 	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
@@ -136,23 +148,53 @@ func main() {
 
 	var key []byte
 	switch {
-	case *pskFile != "":
-		k, err := auth.LoadKey(*pskFile)
+	case *clientKeyFile != "":
+		k, err := auth.LoadClientKey(*clientKeyFile)
 		if err != nil {
-			log.Fatalf("load psk: %v", err)
+			log.Fatalf("load client key: %v", err)
 		}
 		key = k
-	case cfg.PSK != "":
-		key = auth.DeriveKey(cfg.PSK)
+	case cfg.ClientKey != "":
+		k, err := auth.DecodeKey(cfg.ClientKey)
+		if err != nil {
+			log.Fatalf("client_key: %v", err)
+		}
+		key = k
 	}
 
 	var pin []byte
-	if *serverPin != "" {
+	switch {
+	case *serverPin != "":
 		p, err := hex.DecodeString(*serverPin)
 		if err != nil {
 			log.Fatalf("server-pin: invalid hex: %v", err)
 		}
 		pin = p
+	case *pinFile != "":
+		// Same server cert is served on every channel (see
+		// transport.Listen calls in cmd/server), so it doesn't matter
+		// which of this mode's addresses the bootstrap probe uses.
+		probeAddr := *serverAddr
+		switch *mode {
+		case "vpn":
+			probeAddr = *vpnAddr
+		case "tun":
+			probeAddr = *glueAddr
+		case "droptest":
+			probeAddr = *dropAddr
+		}
+		_, statErr := os.Stat(*pinFile)
+		existed := statErr == nil
+		p, err := transport.ResolvePin(probeAddr, *pinFile)
+		if err != nil {
+			log.Fatalf("resolve server pin: %v", err)
+		}
+		pin = p
+		if existed {
+			log.Printf("verified server against saved pin in %s", *pinFile)
+		} else {
+			log.Printf("trust-on-first-use: saved server's certificate fingerprint to %s (%x) — future connections verify against it automatically", *pinFile, pin)
+		}
 	}
 
 	if *mode == "tun" {

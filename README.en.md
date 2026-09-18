@@ -21,6 +21,8 @@ latency/loss cost of running datagrams over TCP (`tun` mode).
   multipath for games), `socks5` (local proxy), `tun` (game UDP
   capture, optionally multipath), `droptest` (synthetic loss testing).
 - **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
+- **genkey** (`cmd/genkey`) — generates an Ed25519 key for client
+  authentication (see "Authentication" below).
 - **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
 - **portprobe** (`cmd/portprobe`) — network diagnostic: which ports
   actually get through the filtering, before and independent of the
@@ -33,39 +35,49 @@ to run anything.
 
 ## Quick start
 
-### 1. Secret
+### 1. Key
 
 ```
-openssl rand -base64 32
+go run ./cmd/genkey -name "me"
 ```
 
-Copy the output — this string goes into the `"psk"` field **on both
-server and client**, verbatim, identical.
+Prints two lines: `public_key` (for the server) and `client_key` (for
+the client) — an Ed25519 keypair, not a shared password. The public
+part isn't secret; never show the private one to anyone but the client
+it was generated for. Want to give a friend access? Run the command
+again with their name (`-name friend1`) and you get them their own
+separate pair; revoking one person later is deleting their one line
+from `authorized_keys.json` on the server — nobody else needs to change
+anything. More detail in "Authentication" below.
 
 ### 2. Server
 
 ```
 cp server-config.example.json server-config.json
+cp authorized_keys.example.json authorized_keys.json
 ```
 
-Open `server-config.json`, fill in `psk`. The example is already set to
-port `587` for `vpn_addr` — a port that works for a typical filtered
-network (see the next section if you want to check/pick a different
-one), and it doesn't conflict with 443, which often already has another
-service on it (e.g. Xray). The `10.66.0.0/24` subnet can stay as-is.
-Open the port in the VPS firewall if it has one (`ufw allow 587/tcp`) —
-otherwise the server comes up but is unreachable from outside. Then:
+In `authorized_keys.json`, add the `public_key` from step 1 (one entry
+per person you're granting access to). `server-config.json` can stay
+as-is — the example is already set to port `587` for `vpn_addr` — a
+port that works for a typical filtered network (see the next section if
+you want to check/pick a different one), and it doesn't conflict with
+443, which often already has another service on it (e.g. Xray). The
+`10.66.0.0/24` subnet can stay as-is. Open the port in the VPS firewall
+if it has one (`ufw allow 587/tcp`) — otherwise the server comes up but
+is unreachable from outside. Then:
 
 ```
 docker compose up --build -d
 docker compose logs -f
 ```
 
-`docker-compose.yml` mounts `server-config.json` into the container and
-runs the binary with zero flags — the whole run is: edit the file, bring
-up the container. The file has to exist BEFORE the first run (otherwise
-Docker creates an empty directory in its place instead of mounting a
-file — the `cp` above is exactly for that).
+`docker-compose.yml` mounts `server-config.json` and
+`authorized_keys.json` into the container and runs the binary with zero
+flags — the whole run is: edit the files, bring up the container. Both
+files have to exist BEFORE the first run (otherwise Docker creates an
+empty directory in their place instead of mounting a file — the `cp`
+commands above are exactly for that).
 
 Needs a Linux host with `net.ipv4.ip_forward` enabled (once, on the
 host itself, not in the container):
@@ -82,9 +94,11 @@ cp client-config.example.json client-config.json
 ```
 
 Open `client-config.json`, fill in `vpn_addr` (your server's IP, port
-`587`, matching the server example) and the same `psk`. Needs
-`wintun.dll` next to `client.exe` (https://www.wintun.net/, already in
-the repo) and an **Administrator** shell.
+`587`, matching the server example) and `client_key` from step 1 (the
+same pair whose `public_key` is already in the server's
+`authorized_keys.json`). Needs `wintun.dll` next to `client.exe`
+(https://www.wintun.net/, already in the repo) and an **Administrator**
+shell.
 
 Recommended way to launch — one script that builds the client, starts
 it, and sets up routing, all in a single window:
@@ -181,8 +195,7 @@ Additionally:
 | `vpn_subnet` | `-vpn-subnet` | `10.66.0.0/24` | private VPN subnet (server = `.1`, client = `.2`) |
 | `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
 | `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
-| `psk_file` | `-psk-file` | empty (auth disabled) | path to a file holding the secret |
-| `psk` | — | empty | the secret written directly into the config (simpler than `psk_file`) |
+| `authorized_keys_file` | `-authorized-keys-file` | empty (auth disabled) | path to `authorized_keys.json` — the list of public keys allowed to connect |
 
 ### `client-config.json`
 
@@ -208,23 +221,36 @@ Additionally:
 | `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
 | `insecure` | `-insecure` | `false` | skip the server's TLS certificate verification |
 | `server_pin` | `-server-pin` | empty | SHA-256 (hex) of the server's certificate — if set, the server must present exactly this certificate |
-| `psk_file` | `-psk-file` | empty | path to a file holding the secret |
-| `psk` | — | empty | the secret written directly into the config |
+| `pin_file` | `-pin-file` | empty | path to a file that auto-saves the pin on first connect (trust-on-first-use), an alternative to manually copying `server_pin` — ignored if `server_pin` is set |
+| `client_key_file` | `-client-key-file` | empty | path to a file holding this client's private key (`client_key` from `cmd/genkey`) — required if the server has auth enabled |
+| `client_key` | — | empty | the same private key written directly into the config, instead of `client_key_file` |
 
-`server-config.json`/`client-config.json` are gitignored — never commit
-the real files once they hold a live secret; only `*.example.json`
-(placeholder values) live in the repo.
+`server-config.json`/`client-config.json`/`authorized_keys.json` are
+gitignored — never commit the real files once they hold a live key;
+only `*.example.json` (placeholder values) live in the repo.
 
 **On `insecure` vs `server_pin`**: without `server_pin`, `insecure: true`
 accepts ANY certificate from anyone — a TLS-intercepting middlebox on
 the network can present its own certificate and read all traffic in the
-clear, and the PSK check won't catch it (it just passes straight
+clear, and the client-key check won't catch it (it just passes straight
 through to the real server via the interceptor). The server prints its
 fingerprint at startup (`cert fingerprint (put this in the client's
 server_pin to enable pinning): ...`) — copy that line into the client's
 `server_pin`, and `insecure` stops being a hole: the server must present
 exactly that certificate, which can't be forged without its private key
 even under TLS 1.3.
+
+**Don't want to copy the fingerprint out of the server's log by hand?**
+Set `pin_file` instead of `server_pin` — a file path (e.g.
+`"pin_file": "known_server.pin"`). On the first connection the client
+accepts whatever certificate the server presents (the same exposure as
+having no pin at all, but only for that one bootstrap connection),
+saves its fingerprint to that file, and from then on verifies against
+it automatically on every future run — the same trust model ssh's
+`known_hosts` uses. If the server's certificate ever changes
+(reinstall, rotation), delete the file — the next run trusts the first
+connection again and re-saves. If both `server_pin` and `pin_file` are
+set, `server_pin` wins.
 
 ## `vpn` mode: all traffic through the tunnel
 
@@ -241,7 +267,7 @@ writes it into its own TUN and NATs it out through the Linux kernel
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
   "insecure": true,
-  "psk": "<secret>"
+  "client_key": "<client_key from cmd/genkey>"
 }
 ```
 
@@ -310,7 +336,7 @@ in `game_processes`:
   "glue_addr": "<SERVER_IP>:993",
   "game_processes": ["deadlock.exe"],
   "game_paths": 3,
-  "psk": "<secret>"
+  "client_key": "<client_key from cmd/genkey>"
 }
 ```
 
@@ -354,22 +380,34 @@ silently).
 
 ## Authentication
 
-Without `psk` in the config (or `-psk-file`), the server accepts
+Without `authorized_keys_file` in the config, the server accepts
 connections from anyone who finds its IP:port — an open proxy and an
-open UDP/IP relay. `psk` is the preferred way (see the field tables
-above); `psk_file`/`-psk-file` is the older form, a path to a separate
-file:
+open UDP/IP relay.
 
-```
-openssl rand -base64 32 > dormtun.key
-chmod 600 dormtun.key
-```
+Authentication is Ed25519 keys, not a shared password: the server holds
+a list of public keys (`authorized_keys.json`, one entry per person),
+each client holds its own private key. That means you can tell friends
+apart in the logs and revoke one without touching anyone else's access —
+delete their line from `authorized_keys.json` and restart the server.
 
-Same file's contents on both ends — copy it over, don't retype it (the
-key is SHA-256'd internally, so whitespace differences don't matter,
-but the actual passphrase must match exactly). Don't pass the secret as
-a bare flag value like `-psk some-secret` — the command line is visible
-to any local user via `/proc/<pid>/cmdline`.
+Generate a pair (once per person you're granting access to, including
+yourself):
+```
+go run ./cmd/genkey -name "friend1"
+```
+It prints `public_key` (paste as a line in the server's
+`authorized_keys.json`) and `client_key` (paste into that person's
+`client_key` config field). The public key isn't secret — send it over
+any channel, even a public one. The private one (`client_key`) is a
+secret exactly like the old `psk` was: send it over a channel you
+trust, never commit it to git (`client-config.json` and
+`authorized_keys.json` are already gitignored; only `*.example.json`
+lives in the repo).
+
+There's no dedicated command-line flag for the private key itself
+(only `-client-key-file <path>`) — the command line is visible to any
+local user via `/proc/<pid>/cmdline`, so keep the key in the config
+(`client_key`) or a separate file (`client_key_file`) only.
 
 The glue channel additionally refuses to relay to loopback, link-local,
 and multicast destinations, and to a handful of UDP amplification-vector
@@ -402,7 +440,7 @@ Administrator/TUN.
   "listen": "127.0.0.1:1080",
   "server": "<SERVER_IP>:8443",
   "insecure": true,
-  "psk": "<secret>"
+  "client_key": "<client_key from cmd/genkey>"
 }
 ```
 
@@ -429,7 +467,7 @@ channel, with optional duplication across multiple paths.
   "tun_measure": true,
   "tun_measure_interval": "33ms",
   "insecure": true,
-  "psk": "<secret>"
+  "client_key": "<client_key from cmd/genkey>"
 }
 ```
 
@@ -480,7 +518,7 @@ loopback to inject real loss.
   "drop_interval": "33ms",
   "drop_paths": 3,
   "insecure": true,
-  "psk": "<secret>"
+  "client_key": "<client_key from cmd/genkey>"
 }
 ```
 

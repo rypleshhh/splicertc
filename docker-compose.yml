@@ -17,6 +17,11 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./server-config.json:/app/server-config.json:ro
+      # Must exist before the first `docker compose up`, same reason as
+      # server-config.json above (otherwise Docker mounts an empty
+      # directory here instead of the file) — cp
+      # authorized_keys.example.json authorized_keys.json first.
+      - ./authorized_keys.json:/app/authorized_keys.json:ro
       # To use your own certs instead of the throwaway ones baked into
       # the image, also mount a host directory holding dev.crt/dev.key:
       # - ./mycerts:/app/devcerts:ro

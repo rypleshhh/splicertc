@@ -7,5 +7,5 @@
   "vpn_tun_mtu": 1400,
   "vpn_subnet": "10.66.0.0/24",
   "egress_iface": "",
-  "psk": "REPLACE_ME_generate_with_openssl_rand_-base64_32__never_commit_the_real_one"
+  "authorized_keys_file": "authorized_keys.json"
 }

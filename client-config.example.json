@@ -5,5 +5,5 @@
   "vpn_tun_mtu": 1400,
   "insecure": true,
   "server_pin": "REPLACE_ME_optional__sha256_hex_fingerprint_server_prints_at_startup__see_README",
-  "psk": "REPLACE_ME_must_match_the_server's_psk_exactly__never_commit_the_real_one"
+  "client_key": "REPLACE_ME_the_client_key_value_that_cmd_genkey_printed_for_you__never_commit_the_real_one"
 }

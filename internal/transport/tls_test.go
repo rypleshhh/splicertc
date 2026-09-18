@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,9 +9,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"io"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -134,4 +138,79 @@ func TestDialInsecureWithoutPinAcceptsAnything(t *testing.T) {
 		t.Fatalf("expected insecure Dial with no pin to accept any cert, got: %v", err)
 	}
 	conn.Close()
+}
+
+// TestResolvePinSavesOnFirstUse proves the bootstrap step: with no pin
+// file yet, ResolvePin accepts whatever certificate the server presents
+// and persists its fingerprint to disk in the same hex form Dial's pin
+// parameter expects.
+func TestResolvePinSavesOnFirstUse(t *testing.T) {
+	cert := selfSignedCert(t)
+	addr := listenWith(t, cert)
+	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
+
+	pin, err := ResolvePin(addr, pinFile)
+	if err != nil {
+		t.Fatalf("ResolvePin: %v", err)
+	}
+	if !bytes.Equal(pin, fingerprintOf(cert)) {
+		t.Fatalf("returned pin doesn't match the server's actual cert fingerprint")
+	}
+
+	saved, err := os.ReadFile(pinFile)
+	if err != nil {
+		t.Fatalf("expected pin file to be written: %v", err)
+	}
+	decoded, err := hex.DecodeString(string(saved))
+	if err != nil {
+		t.Fatalf("saved pin file isn't valid hex: %v", err)
+	}
+	if !bytes.Equal(decoded, fingerprintOf(cert)) {
+		t.Fatalf("saved pin file doesn't match the server's actual cert fingerprint")
+	}
+}
+
+// TestResolvePinReadsSavedFileWithoutRedialing proves the second-use
+// path reads the already-saved fingerprint back rather than
+// re-bootstrapping: it points addr at a closed port, so any attempt to
+// actually dial would fail, yet ResolvePin still succeeds because it
+// only needed to read the file.
+func TestResolvePinReadsSavedFileWithoutRedialing(t *testing.T) {
+	cert := selfSignedCert(t)
+	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
+	if err := os.WriteFile(pinFile, []byte(hex.EncodeToString(fingerprintOf(cert))), 0600); err != nil {
+		t.Fatalf("seed pin file: %v", err)
+	}
+
+	unreachable := "127.0.0.1:1" // nothing listens here
+	pin, err := ResolvePin(unreachable, pinFile)
+	if err != nil {
+		t.Fatalf("expected ResolvePin to read the saved file without dialing, got: %v", err)
+	}
+	if !bytes.Equal(pin, fingerprintOf(cert)) {
+		t.Fatalf("pin read back from file doesn't match what was saved")
+	}
+}
+
+// TestResolvePinThenDialDetectsCertChange is the end-to-end TOFU
+// regression: trust a server on first contact, then simulate that
+// server's cert changing later (cert rotation, or a MITM stepping in)
+// and prove the saved pin still rejects it via the normal Dial path —
+// the same guarantee a manually-entered server_pin gives.
+func TestResolvePinThenDialDetectsCertChange(t *testing.T) {
+	certA := selfSignedCert(t)
+	addrA := listenWith(t, certA)
+	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
+
+	pin, err := ResolvePin(addrA, pinFile)
+	if err != nil {
+		t.Fatalf("ResolvePin (first use): %v", err)
+	}
+
+	certB := selfSignedCert(t) // stands in for a rotated cert or a MITM
+	addrB := listenWith(t, certB)
+
+	if _, err := Dial(addrB, false, pin); err == nil {
+		t.Fatal("expected Dial to reject a certificate that changed after trust-on-first-use, but it succeeded")
+	}
 }

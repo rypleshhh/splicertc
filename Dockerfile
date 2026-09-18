@@ -41,7 +41,7 @@ EXPOSE 8443 8444 8446 8447
 
 # No flags baked in — the server reads server-config.json (mounted at
 # /app/server-config.json by docker-compose.yml) for everything: ports,
-# subnet, psk, all of it. Passing flags at `docker run`/in `command:`
+# subnet, authorized_keys_file, all of it. Passing flags at `docker run`/in `command:`
 # still works and overrides individual config fields if you ever need
 # that, but the normal path is just editing the config and rebuilding.
 ENTRYPOINT ["/app/server"]

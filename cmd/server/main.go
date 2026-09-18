@@ -34,31 +34,30 @@ type Config struct {
 	EgressIface string `json:"egress_iface,omitempty"`
 	Cert        string `json:"cert,omitempty"`
 	Key         string `json:"key,omitempty"`
-	PSKFile     string `json:"psk_file,omitempty"`
-	// PSK is the shared secret written directly into the config file,
-	// as an alternative to -psk-file/PSKFile. Convenient for a personal
-	// single-server setup; keep the config file out of git if it holds
-	// a real secret (see config.example.json vs config.json).
-	PSK string `json:"psk,omitempty"`
+	// AuthorizedKeysFile lists the Ed25519 public keys (one per person)
+	// allowed to connect — see internal/auth and authorized_keys.example.json.
+	AuthorizedKeysFile string `json:"authorized_keys_file,omitempty"`
 }
 
-// authKey is nil when auth is disabled (explicitly, via an empty
-// -psk-file) — checkAuth becomes a no-op in that case.
-var authKey []byte
+// authorizedKeys is nil when auth is disabled (no authorized_keys file
+// configured) — checkAuth becomes a no-op in that case.
+var authorizedKeys *auth.AuthorizedKeys
 
-// checkAuth runs the challenge-response handshake if auth is enabled.
-// Call this first thing after Accept, before any protocol-specific
-// logic — an unauthenticated connection shouldn't get far enough to
-// open a SOCKS5 tunnel, occupy a droppable session, or relay UDP.
-func checkAuth(conn net.Conn) bool {
-	if authKey == nil {
-		return true
+// checkAuth runs the challenge-response handshake if auth is enabled,
+// and returns the caller's authorized name for logging. Call this first
+// thing after Accept, before any protocol-specific logic — an
+// unauthenticated connection shouldn't get far enough to open a SOCKS5
+// tunnel, occupy a droppable session, or relay UDP.
+func checkAuth(conn net.Conn) (name string, ok bool) {
+	if authorizedKeys == nil {
+		return "", true
 	}
-	if err := auth.ServerHandshake(conn, authKey); err != nil {
+	name, err := auth.ServerHandshake(conn, authorizedKeys)
+	if err != nil {
 		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
-		return false
+		return "", false
 	}
-	return true
+	return name, true
 }
 
 // dropSession is shared by every connection that presents the same
@@ -189,7 +188,7 @@ func main() {
 	egressIface := flag.String("egress-iface", cfg.EgressIface, "interface to MASQUERADE full-tunnel VPN egress traffic out of (empty = auto-detect via `ip route get`)")
 	cert := flag.String("cert", config.Str(cfg.Cert, "devcerts/dev.crt"), "TLS cert file")
 	key := flag.String("key", config.Str(cfg.Key, "devcerts/dev.key"), "TLS key file")
-	pskFile := flag.String("psk-file", cfg.PSKFile, "path to a shared-secret file clients must know to use this server (leave empty to disable auth — NOT recommended for anything reachable from the internet)")
+	authorizedKeysFile := flag.String("authorized-keys-file", cfg.AuthorizedKeysFile, "path to authorized_keys.json (Ed25519 public keys allowed to connect) — leave empty to disable auth (NOT recommended for anything reachable from the internet)")
 	flag.String("config", configPath, "path to a JSON config file (server-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
@@ -203,19 +202,15 @@ func main() {
 		log.Printf("cert fingerprint (put this in the client's server_pin to enable pinning): %x", fp)
 	}
 
-	switch {
-	case *pskFile != "":
-		k, err := auth.LoadKey(*pskFile)
+	if *authorizedKeysFile != "" {
+		keys, err := auth.LoadAuthorizedKeys(*authorizedKeysFile)
 		if err != nil {
-			log.Fatalf("load psk: %v", err)
+			log.Fatalf("load authorized keys: %v", err)
 		}
-		authKey = k
-		log.Println("client authentication enabled (psk file)")
-	case cfg.PSK != "":
-		authKey = auth.DeriveKey(cfg.PSK)
-		log.Println("client authentication enabled (inline psk from config)")
-	default:
-		log.Println("!!! WARNING: no -psk-file/config psk given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set a psk before exposing this to the internet.")
+		authorizedKeys = keys
+		log.Printf("client authentication enabled (%s)", *authorizedKeysFile)
+	} else {
+		log.Println("!!! WARNING: no -authorized-keys-file/config authorized_keys_file given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set one before exposing this to the internet.")
 	}
 
 	ln, err := transport.Listen(*addr, *cert, *key)
@@ -297,7 +292,8 @@ func main() {
 // and vice versa.
 func handleDroppableConn(conn net.Conn) {
 	defer conn.Close()
-	if !checkAuth(conn) {
+	name, ok := checkAuth(conn)
+	if !ok {
 		return
 	}
 
@@ -308,7 +304,7 @@ func handleDroppableConn(conn net.Conn) {
 	}
 	sid := hex.EncodeToString(sidBuf)
 	sess := getDropSession(sid)
-	log.Printf("droppable path connected: %s (session %s)", conn.RemoteAddr(), sid)
+	log.Printf("droppable path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
 
 	for {
 		f, err := frame.ReadFrame(conn)
@@ -350,10 +346,11 @@ func handleDroppableConn(conn net.Conn) {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
-	if !checkAuth(conn) {
+	name, ok := checkAuth(conn)
+	if !ok {
 		return
 	}
-	log.Printf("client connected: %s", conn.RemoteAddr())
+	log.Printf("client connected: %s (%q)", conn.RemoteAddr(), name)
 
 	sess, err := smux.Server(conn, nil)
 	if err != nil {
@@ -414,7 +411,8 @@ func relay(a, b io.ReadWriteCloser) {
 // connection per session) is just the degenerate case.
 func handleGlueConn(conn net.Conn) {
 	defer conn.Close()
-	if !checkAuth(conn) {
+	name, ok := checkAuth(conn)
+	if !ok {
 		return
 	}
 
@@ -425,6 +423,7 @@ func handleGlueConn(conn net.Conn) {
 	}
 	sid := hex.EncodeToString(sidBuf)
 	sess := getGlueSession(sid)
+	log.Printf("glue path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
 
 	sess.mu.Lock()
 	sess.paths[conn] = struct{}{}

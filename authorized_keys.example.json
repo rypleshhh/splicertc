@@ -1,0 +1,3 @@
+[
+  { "name": "me", "public_key": "REPLACE_ME_the_public_key_value_that_cmd_genkey_printed__safe_to_commit_this_one" }
+]

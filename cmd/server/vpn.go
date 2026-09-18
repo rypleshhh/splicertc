@@ -249,7 +249,8 @@ func vpnTunReader(dev tun.Device) {
 // handleGlueConn) — there's exactly one logical VPN peer.
 func handleVPNConn(conn net.Conn, dev tun.Device) {
 	defer conn.Close()
-	if !checkAuth(conn) {
+	name, ok := checkAuth(conn)
+	if !ok {
 		return
 	}
 
@@ -261,7 +262,7 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 		log.Printf("vpn: new client %s replacing previous peer %s", conn.RemoteAddr(), old.RemoteAddr())
 		old.Close()
 	}
-	log.Printf("vpn: client connected: %s", conn.RemoteAddr())
+	log.Printf("vpn: client connected: %s (%q)", conn.RemoteAddr(), name)
 
 	defer func() {
 		vpnMu.Lock()

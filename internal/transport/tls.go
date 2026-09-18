@@ -8,10 +8,12 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 )
 
 // Listen binds addr and returns a listener that terminates TLS 1.3
@@ -107,6 +109,59 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 		return nil, err
 	}
 	return tlsConn, nil
+}
+
+// ResolvePin implements trust-on-first-use (TOFU) pinning, the same
+// model ssh's known_hosts uses: if pinFile already holds a saved
+// fingerprint, it's read back and returned — from then on this is
+// exactly as strict as a manually-entered pin. If pinFile doesn't exist
+// yet, this dials addr once, accepts whatever certificate the server
+// presents (the same exposure insecureSkipVerify:true has, but only for
+// this one bootstrap connection), saves its fingerprint to pinFile, and
+// returns it. Every connection after this point — including the rest of
+// the caller's current run — is then pinned to that fingerprint.
+//
+// To force re-trusting a server (e.g. after regenerating its cert),
+// delete pinFile; the next call repeats the bootstrap step.
+func ResolvePin(addr, pinFile string) ([]byte, error) {
+	if data, err := os.ReadFile(pinFile); err == nil {
+		pin, err := hex.DecodeString(strings.TrimSpace(string(data)))
+		if err != nil {
+			return nil, fmt.Errorf("pin file %s: invalid hex: %w", pinFile, err)
+		}
+		return pin, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read pin file %s: %w", pinFile, err)
+	}
+
+	rawConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("trust-on-first-use dial %s: %w", addr, err)
+	}
+	defer rawConn.Close()
+
+	var fingerprint []byte
+	cfg := &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificate presented")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			fingerprint = sum[:]
+			return nil
+		},
+	}
+	tlsConn := tls.Client(rawConn, cfg)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("trust-on-first-use handshake with %s: %w", addr, err)
+	}
+
+	if err := os.WriteFile(pinFile, []byte(hex.EncodeToString(fingerprint)), 0600); err != nil {
+		return nil, fmt.Errorf("save pin file %s: %w", pinFile, err)
+	}
+	return fingerprint, nil
 }
 
 // LoadCertFingerprint reads a PEM certificate file and returns the

@@ -1,12 +1,24 @@
-# Real configs hold a live IP and (optionally) the shared secret inline —
-# never commit these. Commit *.example.json instead.
+# Real configs hold a live IP and (optionally) the client's private key
+# inline — never commit these. Commit *.example.json instead.
 server-config.json
 client-config.json
 
-# Legacy secret-file form, and throwaway dev certs (regenerated via
-# `go run ./cmd/gencert`, or baked fresh into the Docker image).
-dormtun.key
+# The server's real list of who's allowed to connect (names + public
+# keys — not secret by themselves, but personal/deployment-specific,
+# same reasoning as the configs above). Commit authorized_keys.example.json
+# instead. Any *.key file holding a raw private key printed by
+# cmd/genkey, if saved to disk instead of pasted into a config.
+authorized_keys.json
+*.key
+
+# Throwaway dev certs (regenerated via `go run ./cmd/gencert`, or baked
+# fresh into the Docker image).
 devcerts/
+
+# Trust-on-first-use pin files (pin_file config field) — not secret (just
+# a public cert fingerprint), but local, machine-generated state, same
+# reason ssh's known_hosts isn't checked into a repo either.
+*.pin
 
 # Build output
 *.exe
