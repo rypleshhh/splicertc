@@ -23,8 +23,8 @@ latency/loss cost of running datagrams over TCP (`tun` mode).
 - **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
 - **genkey** (`cmd/genkey`) — generates an Ed25519 key for client
   authentication (see "Authentication" below).
-- **tray** (`cmd/tray`) — minimal Windows tray-icon app on top of `vpn`
-  mode (see "Windows app" below).
+- **tray** (`cmd/tray`) — minimal Windows app on top of `vpn` mode: a
+  config-editing window + tray icon (see "Windows app" below).
 - **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
 - **portprobe** (`cmd/portprobe`) — network diagnostic: which ports
   actually get through the filtering, before and independent of the
@@ -413,11 +413,12 @@ silently).
 
 ## Windows app: `cmd/tray`
 
-A minimal interface on top of `vpn` mode: a tray icon instead of a
-console, "Connect"/"Disconnect" with the mouse. It doesn't reinvent
-anything — under the hood it's exactly what `run-vpn.ps1` already does
-(starts `client.exe`, waits for the tunnel to come up, calls
-`setup-vpn-route.ps1`), just without any visible windows.
+A minimal interface on top of `vpn` mode: a small window with config
+fields instead of hand-editing JSON, plus a tray icon for
+"Connect"/"Disconnect" with the mouse. It doesn't reinvent anything —
+under the hood it's exactly what `run-vpn.ps1` already does (starts
+`client.exe`, waits for the tunnel to come up, calls
+`setup-vpn-route.ps1`), just through a window instead of a console.
 
 Build:
 ```powershell
@@ -425,25 +426,42 @@ go build -ldflags "-H=windowsgui" -o tray.exe .\cmd\tray
 ```
 `-H=windowsgui` — so a console doesn't flash on launch.
 
-`tray.exe` expects the same files next to it as a manual `vpn` mode
-run needs: `client.exe`, `client-config.json`, `setup-vpn-route.ps1`,
-`wintun.dll`.
+`tray.exe` expects the same files next to it as a manual `vpn` mode run
+needs: `client.exe`, `setup-vpn-route.ps1`, `wintun.dll`.
+`client-config.json` doesn't need to exist beforehand — the window
+creates it on the first "Save" (with the same sensible defaults as
+`client-config.example.json`).
 
 Double-clicking `tray.exe` triggers its own UAC prompt if it isn't
 already elevated (Administrator is needed for the TUN adapter and
-routes). The tray icon shows state: gray — disconnected, green —
-connected, red — error. Right-click for the menu: "Connect",
-"Disconnect", "Open log" (opens `tray.log` next to the exe — it logs
-everything: `client.exe`'s output, the routing script's output,
-status changes), "Quit".
+routes). Then:
+
+- **If there's no working config yet** (`vpn_addr` or `client_key`
+  empty) — the window opens right away with three fields: server
+  address, private key (`client_key` from `cmd/genkey`, masked with
+  dots), and a comma-separated game process list (optional, see
+  "Selective multipath for games"). "Save" writes them into
+  `client-config.json` without touching the file's other fields
+  (`insecure`, `pin_file`, `vpn_tun_name`, etc. stay as they were, or
+  get the same defaults as the example). The window's "Connect" saves
+  first, then connects.
+- **If the config is already set up** — the app starts minimized to the
+  tray, no window on screen.
+- **Tray icon**: gray — disconnected, green — connected, red — error.
+  Right-click for the menu: "Settings" (open/raise the same window any
+  time to change the server address or key), "Connect", "Disconnect",
+  "Open log" (opens `tray.log` next to the exe — it logs everything:
+  `client.exe`'s output, the routing script's output, status changes),
+  "Quit". The window's own close button just hides it back to the tray —
+  only "Quit" actually exits the app.
 
 **Honest about the limits**: this is a thin wrapper, not a rewritten,
 more robust client. If the tunnel drops on its own (`client.exe` still
-crashes on any disconnect — see IDEAS.md P1 #4, not fixed yet), the
-tray notices and shows "client exited unexpectedly," but doesn't
-reconnect automatically — you have to click "Connect" again. Treat it
-as a convenient control panel on top of the existing stack, not a
-guarantee of automatic reconnection.
+crashes on any disconnect — see IDEAS.md P1 #4, not fixed yet), the app
+notices and shows "client exited unexpectedly," but doesn't reconnect
+automatically — you have to click "Connect" again. Treat it as a
+convenient control panel on top of the existing stack, not a guarantee
+of automatic reconnection.
 
 ## Authentication
 
