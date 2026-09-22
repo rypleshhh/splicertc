@@ -8,6 +8,17 @@ that blocks non-standard ports. Two ways to use it: a full VPN
 with droppable-frame logic and multipath duplication to minimize the
 latency/loss cost of running datagrams over TCP (`tun` mode).
 
+## Contents
+
+- [Components](#components)
+- [Quick start](#quick-start)
+- [`vpn` mode: all traffic through the tunnel](#vpn-mode-all-traffic-through-the-tunnel)
+- [Windows app: `cmd/tray`](#windows-app-cmdtray)
+- [Authentication](#authentication)
+- [Other client modes](#other-client-modes)
+- [Diagnostics](#diagnostics)
+- [Reference: config fields](#reference-config-fields)
+
 ## Components
 
 - **server** (`cmd/server`) — runs on the VPS. Channels: reliable
@@ -20,15 +31,15 @@ latency/loss cost of running datagrams over TCP (`tun` mode).
   `vpn` (all traffic through the tunnel, optionally with selective
   multipath for games), `socks5` (local proxy), `tun` (game UDP
   capture, optionally multipath), `droptest` (synthetic loss testing).
-- **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
-- **genkey** (`cmd/genkey`) — generates an Ed25519 key for client
-  authentication (see "Authentication" below).
 - **tray** (`cmd/tray`) — minimal Windows app on top of `vpn` mode: a
-  config-editing window + tray icon (see "Windows app" below).
-- **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
+  config-editing window + tray icon.
+- **genkey** (`cmd/genkey`) — generates an Ed25519 key for client
+  authentication.
+- **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
 - **portprobe** (`cmd/portprobe`) — network diagnostic: which ports
   actually get through the filtering, before and independent of the
-  tunnel (see "Picking a port" below).
+  tunnel.
+- **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
 
 Everything is driven by **config files** — `server-config.json` on the
 server, `client-config.json` on the client. Command-line flags exist
@@ -50,7 +61,7 @@ it was generated for. Want to give a friend access? Run the command
 again with their name (`-name friend1`) and you get them their own
 separate pair; revoking one person later is deleting their one line
 from `authorized_keys.json` on the server — nobody else needs to change
-anything. More detail in "Authentication" below.
+anything. More detail in ["Authentication"](#authentication) below.
 
 ### 2. Server
 
@@ -70,12 +81,13 @@ scp -r devcerts root@<SERVER_IP>:~/splicertc/
 In `authorized_keys.json`, add the `public_key` from step 1 (one entry
 per person you're granting access to). `server-config.json` can stay
 as-is — the example is already set to port `587` for `vpn_addr` — a
-port that works for a typical filtered network (see the next section if
-you want to check/pick a different one), and it doesn't conflict with
-443, which often already has another service on it (e.g. Xray). The
-`10.66.0.0/24` subnet can stay as-is. Open the port in the VPS firewall
-if it has one (`ufw allow 587/tcp`) — otherwise the server comes up but
-is unreachable from outside. Then:
+port that works for a typical filtered network (see
+["Diagnostics"](#diagnostics) if you want to check/pick a different
+one), and it doesn't conflict with 443, which often already has another
+service on it (e.g. Xray). The `10.66.0.0/24` subnet can stay as-is.
+Open the port in the VPS firewall if it has one (`ufw allow
+587/tcp`) — otherwise the server comes up but is unreachable from
+outside. Then:
 
 ```
 docker compose up --build -d
@@ -91,8 +103,8 @@ are exactly for that). Mounting `devcerts/` isn't a formality: without
 it, every image rebuild bakes a fresh certificate, and you'd have to dig
 through `docker compose logs` for a new fingerprint for every client
 again; `go run ./cmd/gencert` is a one-time step and never needs
-touching again (see "Authentication" below on why this matters for
-`pin_file`).
+touching again (see the [`pin_file`](#checking-the-server-is-real-insecure-pin_file-server_pin)
+section for why this matters).
 
 Needs a Linux host with `net.ipv4.ip_forward` enabled (once, on the
 host itself, not in the container):
@@ -114,14 +126,13 @@ same pair whose `public_key` is already in the server's
 `authorized_keys.json`). The example's `pin_file` field is already set
 up — on first connect the client remembers the server's certificate
 itself and checks against it from then on, no need to go digging
-through `docker compose logs` for a fingerprint (more in
-"Authentication"). Needs `wintun.dll` next to `client.exe`
-(https://www.wintun.net/, already in the repo) and an **Administrator**
-shell.
+through `docker compose logs` for a fingerprint. Needs `wintun.dll`
+next to `client.exe` (https://www.wintun.net/, already in the repo) and
+an **Administrator** shell.
 
-The most convenient way to launch is `cmd/tray` (see "Windows app"
-below): a tray icon, "Connect"/"Disconnect" with the mouse, no console
-and no scripts to run by hand.
+The most convenient way to launch is [`cmd/tray`](#windows-app-cmdtray):
+a tray icon, "Connect"/"Disconnect" with the mouse, no console and no
+scripts to run by hand.
 
 A no-GUI but still one-command way — a script that builds the client,
 starts it, and sets up routing, all in a single window:
@@ -137,8 +148,9 @@ itself — including verifying via ipify that traffic actually goes
 through the tunnel. `Ctrl+C` stops it. Flags: `-Config path.json`
 (different config), `-NoBuild` (skip rebuilding).
 
-Manual way (two windows, if you need more control — see "`vpn` mode"
-below for exactly what `run-vpn.ps1` does under the hood):
+Manual way (two windows, if you need more control — see
+["`vpn` mode"](#vpn-mode-all-traffic-through-the-tunnel) below for
+exactly what `run-vpn.ps1` does under the hood):
 ```
 go build -o client.exe .\cmd\client
 .\client.exe
@@ -153,137 +165,9 @@ single run, without editing the file:
 .\client.exe -mode socks5 -listen 127.0.0.1:1080
 ```
 
-Flag names match config field names (see the tables below). A different
+Flag names match config field names (see
+["Reference: config fields"](#reference-config-fields)). A different
 config path: `-config path/to/file.json`.
-
-## Picking a port: `cmd/portprobe`
-
-Filtered networks usually let through only a small set of standard
-ports, and that set can change over time — don't assume port 587 (or
-any other) will keep working forever. `portprobe` is a standalone
-diagnostic tool: the server listens on a batch of TCP/UDP ports at once
-and replies with a token containing the port number (to tell "this port
-is genuinely open" apart from "something else answered instead" — e.g.
-a transparent proxy); the client probes the list and prints what got
-through.
-
-Build (cross-compiling for the Linux VPS works right from Windows):
-```powershell
-go build -o portprobe.exe .\cmd\portprobe
-$env:GOOS="linux"; $env:GOARCH="amd64"
-go build -o portprobe-linux .\cmd\portprobe
-$env:GOOS=""; $env:GOARCH=""
-```
-
-**On the VPS** (foreground — don't leave it running in the background on
-a production box, it's a diagnostic, not a service):
-```bash
-scp portprobe-linux root@<SERVER_IP>:~/portprobe   # from Windows
-chmod +x portprobe
-./portprobe -mode server -tcp 1-999 -udp none
-```
-Port ranges are given as `1-999` or a list `80,443,993`. The server
-automatically skips ports already in use (e.g. 22 for sshd, 443 for
-Xray) — it never steals a port from a live service. The firewall for the
-tested ports needs to be opened separately (`ufw allow ...`) — otherwise
-you're measuring your own firewall, not the network.
-
-**From the client** (on the network you're testing):
-```powershell
-.\portprobe.exe -mode client -host <SERVER_IP> -tcp 1-999 -udp none -parallel 200 -timeout 2s
-```
-
-Additionally:
-- `-sustain 5m` — after the scan, hold each port that opened under
-  traffic for 5 minutes: connecting briefly and dropping right away is
-  useless for a tunnel, and `portprobe` checks that separately.
-- `-targets default` (or your own `host:port,host:port` list) — check
-  reachability of known public services (Google, GitHub, Gmail SMTP,
-  etc.) **with no server of your own and no firewall changes needed** —
-  a fast way to see which ports aren't blocked by the network at all,
-  before opening anything on your own VPS.
-
-## Reference: config fields
-
-### `server-config.json`
-
-| Field | Flag | Default | What it does |
-|---|---|---|---|
-| `addr` | `-addr` | `:8443` | reliable channel address (SOCKS5-style) |
-| `drop_addr` | `-drop-addr` | `:8444` | droppable channel address |
-| `glue_addr` | `-glue-addr` | `:8446` | glue channel address (real UDP) |
-| `vpn_addr` | `-vpn-addr` | `:8447` | full-tunnel VPN channel address |
-| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | server-side TUN interface name |
-| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | server-side TUN MTU |
-| `vpn_subnet` | `-vpn-subnet` | `10.66.0.0/24` | private VPN subnet (server = `.1`, client = `.2`) |
-| `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
-| `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
-| `authorized_keys_file` | `-authorized-keys-file` | empty (auth disabled) | path to `authorized_keys.json` — the list of public keys allowed to connect |
-
-### `client-config.json`
-
-| Field | Flag | Default | What it does |
-|---|---|---|---|
-| `mode` | `-mode` | `socks5` | `socks5` \| `droptest` \| `tun` \| `vpn` |
-| `listen` | `-listen` | `127.0.0.1:1080` | local SOCKS5 port (`socks5`) |
-| `server` | `-server` | `127.0.0.1:8443` | reliable channel address (`socks5`) |
-| `drop_addr` | `-drop-addr` | `127.0.0.1:8444` | droppable channel address (`droptest`) |
-| `glue_addr` | `-glue-addr` | `127.0.0.1:8446` | glue channel address (`tun`) |
-| `tun_name` | `-tun-name` | `dormtun0` | TUN interface name (`tun`) |
-| `tun_mtu` | `-tun-mtu` | `1420` | TUN MTU (`tun`) |
-| `tun_paths` | `-tun-paths` | `1` | number of parallel duplicated paths / multipath (`tun`) |
-| `tun_measure` | `-tun-measure` | `false` | send measurement pings (`tun`) |
-| `tun_measure_interval` | `-tun-measure-interval` | `33ms` | ping spacing (`tun`) |
-| `vpn_addr` | `-vpn-addr` | `127.0.0.1:8447` | vpn channel address (`vpn`) |
-| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | TUN interface name (`vpn`) |
-| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | TUN MTU (`vpn`) |
-| `game_processes` | `-game-processes` | empty | comma-separated executable names — their UDP traffic rides glue+multipath instead of the single `vpn` stream (`vpn`) |
-| `game_paths` | `-game-paths` | `3` if `game_processes` is set | number of parallel paths for classified game UDP (`vpn`) |
-| `drop_count` | `-drop-count` | `0` | number of frames in the stress test (`droptest`) |
-| `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
-| `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
-| `insecure` | `-insecure` | `false` | skip the server's TLS certificate verification |
-| `server_pin` | `-server-pin` | empty | SHA-256 (hex) of the server's certificate — if set, the server must present exactly this certificate |
-| `pin_file` | `-pin-file` | empty | path to a file that auto-saves the pin on first connect (trust-on-first-use), an alternative to manually copying `server_pin` — ignored if `server_pin` is set |
-| `client_key_file` | `-client-key-file` | empty | path to a file holding this client's private key (`client_key` from `cmd/genkey`) — required if the server has auth enabled |
-| `client_key` | — | empty | the same private key written directly into the config, instead of `client_key_file` |
-
-`server-config.json`/`client-config.json`/`authorized_keys.json` are
-gitignored — never commit the real files once they hold a live key;
-only `*.example.json` (placeholder values) live in the repo.
-
-**On `insecure`, `pin_file`, and `server_pin`**: without a pin,
-`insecure: true` accepts ANY certificate from anyone — a
-TLS-intercepting middlebox on the network can present its own
-certificate and read all traffic in the clear, and the client-key check
-won't catch it (it just passes straight through to the real server via
-the interceptor).
-
-**Recommended: `pin_file`** (already set up in the example config). On
-the first connection the client accepts whatever certificate the server
-presents, saves its fingerprint to that file, and from then on verifies
-against it automatically on every future run — the same trust model
-ssh's `known_hosts` uses. No server logs to read, ever — provided the
-server's certificate doesn't change between connections, which needs
-the mounted `devcerts/` from Quick Start step 2 (without it, every
-server image rebuild changes the certificate, and `pin_file` would need
-resetting after every `docker compose up --build`). If the server's
-certificate ever does change (reinstall, manual replacement), delete
-the `pin_file` — the next run trusts the first connection again and
-re-saves.
-
-**Alternative: manual `server_pin`** — if you want full control (never
-auto-trust even the first connection), the server prints its
-fingerprint at startup (`cert fingerprint (put this in the client's
-server_pin to enable pinning): ...`, visible in `docker compose logs`) —
-copy that line into the client's `server_pin` instead of using
-`pin_file`. Just as strong, just requires one manual step per
-certificate change instead of zero. If both fields are set,
-`server_pin` wins.
-
-Either way, the guarantee is the same: the server must present exactly
-the remembered/configured certificate, which can't be forged without
-its private key even under TLS 1.3.
 
 ## `vpn` mode: all traffic through the tunnel
 
@@ -306,11 +190,12 @@ writes it into its own TUN and NATs it out through the Linux kernel
 
 ### Launching and routing
 
-Easiest: `.\run-vpn.ps1` (Administrator shell) — builds the client,
-starts it, waits for the TUN interface to come up, and sets up the
-routing below itself, all in one window. The rest of this section is
-what the script does automatically — only needed if you want more
-control or something went wrong and you're fixing it by hand.
+Easiest: `.\run-vpn.ps1` (Administrator shell) or
+[`cmd/tray`](#windows-app-cmdtray) — both build/start the client, wait
+for the TUN interface to come up, and set up the routing below
+themselves, no manual steps. The rest of this section is what both do
+automatically — only needed if you want more control or something went
+wrong and you're fixing it by hand.
 
 Running the client directly: `.\client.exe` (Administrator shell), wait
 for `connected to vpn channel ...`. Then — routing, in a SECOND
@@ -460,14 +345,15 @@ routes). Then:
   discarding it.
 - **The fields below the list**: name, server address, private key
   (`client_key` from `cmd/genkey`, masked with dots), and a
-  comma-separated game process list (optional, see "Selective multipath
-  for games"). Clicking a row fills the fields from it — edit and
-  re-save as needed, including renaming (change "Name" and hit "Save" —
-  the old name doesn't stick around as a separate leftover entry). "New"
-  clears the fields for a fresh entry. "Save" adds/updates the entry and
-  writes `connections.json`; "Delete" removes the selected one. "Ping"
-  checks right now that the server responds and the key is accepted — a
-  real TLS+auth attempt against `vpn_addr` with the fields' current
+  comma-separated game process list (optional, see
+  ["Selective multipath for games"](#selective-multipath-for-games-optional)).
+  Clicking a row fills the fields from it — edit and re-save as needed,
+  including renaming (change "Name" and hit "Save" — the old name
+  doesn't stick around as a separate leftover entry). "New" clears the
+  fields for a fresh entry. "Save" adds/updates the entry and writes
+  `connections.json`; "Delete" removes the selected one. "Ping" checks
+  right now that the server responds and the key is accepted — a real
+  TLS+auth attempt against `vpn_addr` with the fields' current
   `client_key` (not just "is the port open"), without bringing up the
   full tunnel or routing; useful before "Connect", especially after
   editing the fields. The "Connect" button below the fields saves
@@ -502,7 +388,12 @@ of automatic reconnection.
 
 Without `authorized_keys_file` in the config, the server accepts
 connections from anyone who finds its IP:port — an open proxy and an
-open UDP/IP relay.
+open UDP/IP relay. There are two independent things going on here:
+**who's allowed to connect** (the client proves its identity to the
+server) and **is this actually the right server** (the client checks it
+hasn't connected to an interceptor).
+
+### Who can connect: Ed25519 and `authorized_keys.json`
 
 Authentication is Ed25519 keys, not a shared password: the server holds
 a list of public keys (`authorized_keys.json`, one entry per person),
@@ -519,44 +410,81 @@ It prints `public_key` (paste as a line in the server's
 `authorized_keys.json`) and `client_key` (paste into that person's
 `client_key` config field). The public key isn't secret — send it over
 any channel, even a public one. The private one (`client_key`) is a
-secret exactly like the old `psk` was: send it over a channel you
-trust, never commit it to git (`client-config.json` and
-`authorized_keys.json` are already gitignored; only `*.example.json`
-lives in the repo).
+secret: send it over a channel you trust, never commit it to git
+(`client-config.json` and `authorized_keys.json` are already
+gitignored; only `*.example.json` lives in the repo).
 
 There's no dedicated command-line flag for the private key itself
 (only `-client-key-file <path>`) — the command line is visible to any
 local user via `/proc/<pid>/cmdline`, so keep the key in the config
 (`client_key`) or a separate file (`client_key_file`) only.
 
-**Brute-force/scan defense**: after 3 failed authentication attempts
-(wrong public key, bad signature, etc.) from the same IP, the server
-bans that IP for 10 minutes — new connections from it are refused
-immediately, without attempting a handshake. A successful
-authentication resets the counter. The ban can't tell a scanner apart
-from a legitimate client that just mistyped its own `client_key`, so it
-stays short and every ban is logged loudly (`auth: banning <IP>
-until ...`) — if your own client suddenly can't connect, the reason is
-right there in `docker compose logs`.
+### Checking the server is real: `insecure`, `pin_file`, `server_pin`
+
+Without a pin, `insecure: true` accepts ANY certificate from anyone — a
+TLS-intercepting middlebox on the network can present its own
+certificate and read all traffic in the clear, and the client-key check
+won't catch it (it just passes straight through to the real server via
+the interceptor).
+
+**Recommended: `pin_file`** (already set up in the example config). On
+the first connection the client accepts whatever certificate the server
+presents, saves its fingerprint to that file, and from then on verifies
+against it automatically on every future run — the same trust model
+ssh's `known_hosts` uses. No server logs to read, ever — provided the
+server's certificate doesn't change between connections, which needs
+the mounted `devcerts/` from Quick Start step 2 (without it, every
+server image rebuild changes the certificate, and `pin_file` would need
+resetting after every `docker compose up --build`). If the server's
+certificate ever does change (reinstall, manual replacement), delete
+the `pin_file` — the next run trusts the first connection again and
+re-saves.
+
+**Alternative: manual `server_pin`** — if you want full control (never
+auto-trust even the first connection), the server prints its
+fingerprint at startup (`cert fingerprint (put this in the client's
+server_pin to enable pinning): ...`, visible in `docker compose logs`) —
+copy that line into the client's `server_pin` instead of using
+`pin_file`. Just as strong, just requires one manual step per
+certificate change instead of zero. If both fields are set,
+`server_pin` wins.
+
+Either way, the guarantee is the same: the server must present exactly
+the remembered/configured certificate, which can't be forged without
+its private key even under TLS 1.3.
+
+The certificate itself is a throwaway self-signed pair — `go run
+./cmd/gencert` writes `devcerts/dev.crt`/`dev.key` for localhost (the
+server config's default `cert`/`key` point here). No certificate
+authority signed it, so without pinning it means nothing at all — the
+trust comes entirely from pinning above, not from the mere presence of
+TLS.
+
+### Brute-force/scan defense
+
+After 3 failed authentication attempts (wrong public key, bad
+signature, etc.) from the same IP, the server bans that IP for 10
+minutes — new connections from it are refused immediately, without
+attempting a handshake. A successful authentication resets the counter.
+The ban can't tell a scanner apart from a legitimate client that just
+mistyped its own `client_key`, so it stays short and every ban is
+logged loudly (`auth: banning <IP> until ...`) — if your own client
+suddenly can't connect, the reason is right there in
+`docker compose logs`.
+
+### Amplification-attack defense in the glue channel
 
 The glue channel additionally refuses to relay to loopback, link-local,
 and multicast destinations, and to a handful of UDP amplification-vector
 ports (DNS, NTP, memcached, SSDP, etc.) regardless of who's asking —
 defense in depth even for an authenticated client's mistakes.
 
-## First-time setup: dev certs
+## Other client modes
 
-```
-go run ./cmd/gencert
-```
+Besides the main `vpn` mode, the client has three specialized modes —
+for when a full VPN isn't needed, and for testing.
 
-Writes `devcerts/dev.crt`/`dev.key` — a throwaway self-signed pair for
-localhost (the server config's default `cert`/`key` point here).
-`insecure: true` on the client skips verification of that certificate —
-fine for a personal tunnel to a server you control by IP, not a
-substitute for real certificate pinning.
-
-## `socks5` mode: local proxy
+### `socks5`: local proxy
 
 The project's original mode: the client opens a local SOCKS5 proxy, the
 server forwards whatever gets requested through it. TCP-only (no SOCKS5
@@ -581,7 +509,7 @@ Administrator/TUN.
 Point any SOCKS5-compatible application (browser, curl, etc.) at
 `127.0.0.1:1080`.
 
-## `tun` mode: game UDP, measurement, and multipath
+### `tun`: game UDP, measurement, and multipath
 
 Captures only real UDP traffic (not general internet) through the glue
 channel, with optional duplication across multiple paths.
@@ -620,21 +548,7 @@ route add <GAME_SERVER_IP> mask 255.255.255.255 10.99.0.1
 would get sent back into the TUN it's serving, a loop. Only route real
 game-server destinations.
 
-## Diagnosing what a TUN interface sees
-
-`tunprobe` is a standalone binary, no tunnel involved, doesn't use a
-config (a one-off diagnostic — flags make more sense here):
-
-```
-go build -o tunprobe.exe ./cmd/tunprobe
-.\tunprobe.exe -name dormtun0 -mtu 1420
-```
-
-Shows what's flowing and how it's classified (real traffic vs. local
-discovery noise like mDNS/SSDP/NetBIOS) — useful to check before wiring
-a new interface into anything.
-
-## Testing loss behavior (Linux, no game needed)
+### `droptest`: testing loss behavior (Linux, no game needed)
 
 `droptest` sends synthetic frames; pair with `tc netem` on the server's
 loopback to inject real loss.
@@ -659,3 +573,120 @@ sudo tc qdisc del dev lo root
 ```
 
 `insecure: true` skips TLS cert verification — dev/testing only.
+
+## Diagnostics
+
+Two standalone tools, not part of the tunnel itself — both work on
+their own, without this project's client-server protocol.
+
+### `portprobe`: picking a port
+
+Filtered networks usually let through only a small set of standard
+ports, and that set can change over time — don't assume port 587 (or
+any other) will keep working forever. `portprobe` is a standalone
+diagnostic tool: the server listens on a batch of TCP/UDP ports at once
+and replies with a token containing the port number (to tell "this port
+is genuinely open" apart from "something else answered instead" — e.g.
+a transparent proxy); the client probes the list and prints what got
+through.
+
+Build (cross-compiling for the Linux VPS works right from Windows):
+```powershell
+go build -o portprobe.exe .\cmd\portprobe
+$env:GOOS="linux"; $env:GOARCH="amd64"
+go build -o portprobe-linux .\cmd\portprobe
+$env:GOOS=""; $env:GOARCH=""
+```
+
+**On the VPS** (foreground — don't leave it running in the background on
+a production box, it's a diagnostic, not a service):
+```bash
+scp portprobe-linux root@<SERVER_IP>:~/portprobe   # from Windows
+chmod +x portprobe
+./portprobe -mode server -tcp 1-999 -udp none
+```
+Port ranges are given as `1-999` or a list `80,443,993`. The server
+automatically skips ports already in use (e.g. 22 for sshd, 443 for
+Xray) — it never steals a port from a live service. The firewall for the
+tested ports needs to be opened separately (`ufw allow ...`) — otherwise
+you're measuring your own firewall, not the network.
+
+**From the client** (on the network you're testing):
+```powershell
+.\portprobe.exe -mode client -host <SERVER_IP> -tcp 1-999 -udp none -parallel 200 -timeout 2s
+```
+
+Additionally:
+- `-sustain 5m` — after the scan, hold each port that opened under
+  traffic for 5 minutes: connecting briefly and dropping right away is
+  useless for a tunnel, and `portprobe` checks that separately.
+- `-targets default` (or your own `host:port,host:port` list) — check
+  reachability of known public services (Google, GitHub, Gmail SMTP,
+  etc.) **with no server of your own and no firewall changes needed** —
+  a fast way to see which ports aren't blocked by the network at all,
+  before opening anything on your own VPS.
+
+### `tunprobe`: what a TUN interface sees
+
+A standalone binary, no tunnel involved, doesn't use a config (a
+one-off diagnostic — flags make more sense here):
+
+```
+go build -o tunprobe.exe ./cmd/tunprobe
+.\tunprobe.exe -name dormtun0 -mtu 1420
+```
+
+Shows what's flowing and how it's classified (real traffic vs. local
+discovery noise like mDNS/SSDP/NetBIOS) — useful to check before wiring
+a new interface into anything.
+
+## Reference: config fields
+
+### `server-config.json`
+
+| Field | Flag | Default | What it does |
+|---|---|---|---|
+| `addr` | `-addr` | `:8443` | reliable channel address (SOCKS5-style) |
+| `drop_addr` | `-drop-addr` | `:8444` | droppable channel address |
+| `glue_addr` | `-glue-addr` | `:8446` | glue channel address (real UDP) |
+| `vpn_addr` | `-vpn-addr` | `:8447` | full-tunnel VPN channel address |
+| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | server-side TUN interface name |
+| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | server-side TUN MTU |
+| `vpn_subnet` | `-vpn-subnet` | `10.66.0.0/24` | private VPN subnet (server = `.1`, client = `.2`) |
+| `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
+| `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
+| `authorized_keys_file` | `-authorized-keys-file` | empty (auth disabled) | path to `authorized_keys.json` — the list of public keys allowed to connect |
+
+### `client-config.json`
+
+| Field | Flag | Default | What it does |
+|---|---|---|---|
+| `mode` | `-mode` | `socks5` | `socks5` \| `droptest` \| `tun` \| `vpn` |
+| `listen` | `-listen` | `127.0.0.1:1080` | local SOCKS5 port (`socks5`) |
+| `server` | `-server` | `127.0.0.1:8443` | reliable channel address (`socks5`) |
+| `drop_addr` | `-drop-addr` | `127.0.0.1:8444` | droppable channel address (`droptest`) |
+| `glue_addr` | `-glue-addr` | `127.0.0.1:8446` | glue channel address (`tun`) |
+| `tun_name` | `-tun-name` | `dormtun0` | TUN interface name (`tun`) |
+| `tun_mtu` | `-tun-mtu` | `1420` | TUN MTU (`tun`) |
+| `tun_paths` | `-tun-paths` | `1` | number of parallel duplicated paths / multipath (`tun`) |
+| `tun_measure` | `-tun-measure` | `false` | send measurement pings (`tun`) |
+| `tun_measure_interval` | `-tun-measure-interval` | `33ms` | ping spacing (`tun`) |
+| `vpn_addr` | `-vpn-addr` | `127.0.0.1:8447` | vpn channel address (`vpn`) |
+| `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | TUN interface name (`vpn`) |
+| `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | TUN MTU (`vpn`) |
+| `game_processes` | `-game-processes` | empty | comma-separated executable names — their UDP traffic rides glue+multipath instead of the single `vpn` stream (`vpn`) |
+| `game_paths` | `-game-paths` | `3` if `game_processes` is set | number of parallel paths for classified game UDP (`vpn`) |
+| `drop_count` | `-drop-count` | `0` | number of frames in the stress test (`droptest`) |
+| `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
+| `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
+| `insecure` | `-insecure` | `false` | skip the server's TLS certificate verification |
+| `server_pin` | `-server-pin` | empty | SHA-256 (hex) of the server's certificate — if set, the server must present exactly this certificate |
+| `pin_file` | `-pin-file` | empty | path to a file that auto-saves the pin on first connect (trust-on-first-use), an alternative to manually copying `server_pin` — ignored if `server_pin` is set |
+| `client_key_file` | `-client-key-file` | empty | path to a file holding this client's private key (`client_key` from `cmd/genkey`) — required if the server has auth enabled |
+| `client_key` | — | empty | the same private key written directly into the config, instead of `client_key_file` |
+
+`server-config.json`/`client-config.json`/`authorized_keys.json` are
+gitignored — never commit the real files once they hold a live key;
+only `*.example.json` (placeholder values) live in the repo. See
+["Authentication"](#authentication) above for what
+`insecure`/`pin_file`/`server_pin`/`authorized_keys_file` actually do.
