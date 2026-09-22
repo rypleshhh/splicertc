@@ -1,0 +1,8 @@
+[
+  {
+    "name": "Мой сервер",
+    "vpn_addr": "YOUR_VPS_IP:587",
+    "client_key": "REPLACE_ME_the_client_key_value_that_cmd_genkey_printed_for_you__never_commit_the_real_one",
+    "game_processes": []
+  }
+]
