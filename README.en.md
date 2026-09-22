@@ -23,6 +23,8 @@ latency/loss cost of running datagrams over TCP (`tun` mode).
 - **gencert** (`cmd/gencert`) — throwaway self-signed dev certs.
 - **genkey** (`cmd/genkey`) — generates an Ed25519 key for client
   authentication (see "Authentication" below).
+- **tray** (`cmd/tray`) — minimal Windows tray-icon app on top of `vpn`
+  mode (see "Windows app" below).
 - **tunprobe** (`cmd/tunprobe`) — diagnostic: shows what a TUN sees.
 - **portprobe** (`cmd/portprobe`) — network diagnostic: which ports
   actually get through the filtering, before and independent of the
@@ -117,8 +119,12 @@ through `docker compose logs` for a fingerprint (more in
 (https://www.wintun.net/, already in the repo) and an **Administrator**
 shell.
 
-Recommended way to launch — one script that builds the client, starts
-it, and sets up routing, all in a single window:
+The most convenient way to launch is `cmd/tray` (see "Windows app"
+below): a tray icon, "Connect"/"Disconnect" with the mouse, no console
+and no scripts to run by hand.
+
+A no-GUI but still one-command way — a script that builds the client,
+starts it, and sets up routing, all in a single window:
 
 ```powershell
 .\run-vpn.ps1
@@ -404,6 +410,40 @@ server — the first packet it sees from the game produces a
 `glue: new flow ... -> ...` line for that destination, which never
 happens for anything else (that traffic rides the `vpn` channel
 silently).
+
+## Windows app: `cmd/tray`
+
+A minimal interface on top of `vpn` mode: a tray icon instead of a
+console, "Connect"/"Disconnect" with the mouse. It doesn't reinvent
+anything — under the hood it's exactly what `run-vpn.ps1` already does
+(starts `client.exe`, waits for the tunnel to come up, calls
+`setup-vpn-route.ps1`), just without any visible windows.
+
+Build:
+```powershell
+go build -ldflags "-H=windowsgui" -o tray.exe .\cmd\tray
+```
+`-H=windowsgui` — so a console doesn't flash on launch.
+
+`tray.exe` expects the same files next to it as a manual `vpn` mode
+run needs: `client.exe`, `client-config.json`, `setup-vpn-route.ps1`,
+`wintun.dll`.
+
+Double-clicking `tray.exe` triggers its own UAC prompt if it isn't
+already elevated (Administrator is needed for the TUN adapter and
+routes). The tray icon shows state: gray — disconnected, green —
+connected, red — error. Right-click for the menu: "Connect",
+"Disconnect", "Open log" (opens `tray.log` next to the exe — it logs
+everything: `client.exe`'s output, the routing script's output,
+status changes), "Quit".
+
+**Honest about the limits**: this is a thin wrapper, not a rewritten,
+more robust client. If the tunnel drops on its own (`client.exe` still
+crashes on any disconnect — see IDEAS.md P1 #4, not fixed yet), the
+tray notices and shows "client exited unexpectedly," but doesn't
+reconnect automatically — you have to click "Connect" again. Treat it
+as a convenient control panel on top of the existing stack, not a
+guarantee of automatic reconnection.
 
 ## Authentication
 

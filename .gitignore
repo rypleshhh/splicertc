@@ -25,6 +25,10 @@ devcerts/
 tunprobe.exe
 portprobe-linux
 
+# cmd/tray's runtime log (see its own -config/tray.log, next to the exe
+# — this repo-root one only shows up if someone runs it from here).
+tray.log
+
 # Reference-project scratch folders (other people's codebases dropped
 # here for study, not part of this project) and the running notes taken
 # on them — local-only, never pushed.
