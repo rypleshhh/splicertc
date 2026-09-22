@@ -3,6 +3,11 @@
 server-config.json
 client-config.json
 
+# cmd/tray's saved connection list — same reasoning as client-config.json
+# above, one or more client_key values inline. Commit
+# connections.example.json instead.
+connections.json
+
 # The server's real list of who's allowed to connect (names + public
 # keys — not secret by themselves, but personal/deployment-specific,
 # same reasoning as the configs above). Commit authorized_keys.example.json

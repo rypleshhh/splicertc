@@ -413,12 +413,13 @@ silently).
 
 ## Windows app: `cmd/tray`
 
-A minimal interface on top of `vpn` mode: a small window with config
-fields instead of hand-editing JSON, plus a tray icon for
-"Connect"/"Disconnect" with the mouse. It doesn't reinvent anything —
-under the hood it's exactly what `run-vpn.ps1` already does (starts
-`client.exe`, waits for the tunnel to come up, calls
-`setup-vpn-route.ps1`), just through a window instead of a console.
+A minimal, dark-themed interface on top of `vpn` mode: a miniature
+window listing named connections (a server + key per name) instead of
+hand-editing JSON, plus a tray icon for "Connect"/"Disconnect" with the
+mouse. It doesn't reinvent anything — under the hood it's exactly what
+`run-vpn.ps1` already does (starts `client.exe`, waits for the tunnel
+to come up, calls `setup-vpn-route.ps1`), just through a window instead
+of a console.
 
 Build:
 ```powershell
@@ -426,34 +427,68 @@ go build -ldflags "-H=windowsgui" -o tray.exe .\cmd\tray
 ```
 `-H=windowsgui` — so a console doesn't flash on launch.
 
+`cmd/tray/resource.syso` is already checked into the repo and gets
+picked up by the build automatically (standard `go build` behavior,
+nothing extra to pass) — it embeds a Windows manifest
+(`cmd/tray/tray.manifest`), without which the app crashes on startup
+with `create window: TTM_ADDTOOL failed` (needs Common Controls v6,
+which the `lxn/walk` GUI library doesn't get without a manifest). No
+need to touch `resource.syso` by hand; if it ever needs regenerating
+from `tray.manifest`, that's `goversioninfo` (`go install
+github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest`, then
+`goversioninfo -manifest tray.manifest -skip-versioninfo -o
+resource.syso <any-versioninfo.json>` from `cmd/tray`).
+
 `tray.exe` expects the same files next to it as a manual `vpn` mode run
-needs: `client.exe`, `setup-vpn-route.ps1`, `wintun.dll`.
-`client-config.json` doesn't need to exist beforehand — the window
-creates it on the first "Save" (with the same sensible defaults as
-`client-config.example.json`).
+needs: `client.exe`, `setup-vpn-route.ps1`, `wintun.dll`. Neither
+`connections.json` nor `client-config.json` needs to exist beforehand —
+the window creates both on the first "Save"/"Connect".
 
 Double-clicking `tray.exe` triggers its own UAC prompt if it isn't
 already elevated (Administrator is needed for the TUN adapter and
 routes). Then:
 
-- **If there's no working config yet** (`vpn_addr` or `client_key`
-  empty) — the window opens right away with three fields: server
-  address, private key (`client_key` from `cmd/genkey`, masked with
-  dots), and a comma-separated game process list (optional, see
-  "Selective multipath for games"). "Save" writes them into
-  `client-config.json` without touching the file's other fields
-  (`insecure`, `pin_file`, `vpn_tun_name`, etc. stay as they were, or
-  get the same defaults as the example). The window's "Connect" saves
-  first, then connects.
-- **If the config is already set up** — the app starts minimized to the
-  tray, no window on screen.
+- **The connection list** — at the top of the window: one row per saved
+  name (server), font a bit larger than the rest of the window so rows
+  are easier to click and read. Stored in `connections.json` next to
+  the exe (see `connections.example.json` — a plain array of `{name,
+  vpn_addr, client_key, game_processes}` objects). Double-click a row to
+  connect to that server right away. If `connections.json` doesn't
+  exist yet but a manually-configured `client-config.json` does (from an
+  earlier version of this app, or from "Quick start") — the first run
+  turns it into one entry named "По умолчанию" ("Default") instead of
+  discarding it.
+- **The fields below the list**: name, server address, private key
+  (`client_key` from `cmd/genkey`, masked with dots), and a
+  comma-separated game process list (optional, see "Selective multipath
+  for games"). Clicking a row fills the fields from it — edit and
+  re-save as needed, including renaming (change "Name" and hit "Save" —
+  the old name doesn't stick around as a separate leftover entry). "New"
+  clears the fields for a fresh entry. "Save" adds/updates the entry and
+  writes `connections.json`; "Delete" removes the selected one. "Ping"
+  checks right now that the server responds and the key is accepted — a
+  real TLS+auth attempt against `vpn_addr` with the fields' current
+  `client_key` (not just "is the port open"), without bringing up the
+  full tunnel or routing; useful before "Connect", especially after
+  editing the fields. The "Connect" button below the fields saves
+  first, then connects — same as double-clicking a row, but with
+  whatever unsaved edits are currently in the fields.
+- **If there are no saved connections yet** — the window opens right
+  away; once at least one is saved, the app starts minimized straight
+  to the tray, no window on screen.
 - **Tray icon**: gray — disconnected, green — connected, red — error.
   Right-click for the menu: "Settings" (open/raise the same window any
-  time to change the server address or key), "Connect", "Disconnect",
-  "Open log" (opens `tray.log` next to the exe — it logs everything:
-  `client.exe`'s output, the routing script's output, status changes),
-  "Quit". The window's own close button just hides it back to the tray —
-  only "Quit" actually exits the app.
+  time), "Connect" (reuses whatever `client-config.json` currently has
+  from the last connection), "Disconnect", "Open log" (opens `tray.log`
+  next to the exe — it logs everything: `client.exe`'s output, the
+  routing script's output, status changes), "Quit". The window's own
+  close button just hides it back to the tray — only "Quit" actually
+  exits the app.
+- **Dark theme** — the title bar and every field/button/list are dark
+  (via `DwmSetWindowAttribute`/`SetWindowTheme`, the same trick many
+  Win32 apps use to look dark on Windows 10/11 without fully custom-
+  drawing every control). Not configurable and doesn't follow the
+  system theme — just always dark.
 
 **Honest about the limits**: this is a thin wrapper, not a rewritten,
 more robust client. If the tunnel drops on its own (`client.exe` still

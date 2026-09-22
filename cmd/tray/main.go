@@ -1,18 +1,21 @@
 // Command tray is a minimal Windows GUI wrapper around the existing
 // client.exe + setup-vpn-route.ps1 flow (see README.md's "vpn" mode
-// section): a small settings window for vpn_addr/client_key/
-// game_processes plus a tray icon for Connect/Disconnect, instead of
-// hand-editing client-config.json and juggling Administrator PowerShell
-// windows. It does not reimplement any tunnel or routing logic itself —
-// it spawns the same binaries run-vpn.ps1 already spawns and reuses the
-// same, already-debugged setup-vpn-route.ps1 (invoked with
-// -ExecutionPolicy Bypass so a friend's default execution policy can't
-// block it), just from a GUI instead of a console.
+// section): a small, dark-themed window listing named connections
+// (server address + client key + optional game process list per name)
+// plus a tray icon for Connect/Disconnect, instead of hand-editing
+// client-config.json and juggling Administrator PowerShell windows. It
+// does not reimplement any tunnel or routing logic itself — it spawns
+// the same binaries run-vpn.ps1 already spawns and reuses the same,
+// already-debugged setup-vpn-route.ps1 (invoked with -ExecutionPolicy
+// Bypass so a friend's default execution policy can't block it), just
+// from a GUI instead of a console.
 //
-// Expects client.exe, client-config.json, setup-vpn-route.ps1, and
-// wintun.dll to sit next to this exe — the same layout as a manual
-// checkout, so no separate packaging step is required yet (see
-// IDEAS.md Track B for the eventual installer).
+// Named connections live in connections.json next to the exe; the
+// selected one gets compiled into client-config.json (the file
+// client.exe actually reads) right before Connect. Expects client.exe,
+// setup-vpn-route.ps1, and wintun.dll to sit next to this exe too — the
+// same layout as a manual checkout, so no separate packaging step is
+// required yet (see IDEAS.md Track B for the eventual installer).
 package main
 
 import (
@@ -33,7 +36,11 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
+
+	"tcp-dormtun/internal/auth"
+	"tcp-dormtun/internal/transport"
 )
 
 const (
@@ -42,12 +49,28 @@ const (
 )
 
 var (
-	colorGray  = color.RGBA{R: 0x9a, G: 0x9a, B: 0x9a, A: 0xff}
-	colorGreen = color.RGBA{R: 0x2e, G: 0xa0, B: 0x4e, A: 0xff}
-	colorRed   = color.RGBA{R: 0xc0, G: 0x39, B: 0x2b, A: 0xff}
+	colorIconGray  = color.RGBA{R: 0x9a, G: 0x9a, B: 0x9a, A: 0xff}
+	colorIconGreen = color.RGBA{R: 0x2e, G: 0xa0, B: 0x4e, A: 0xff}
+	colorIconRed   = color.RGBA{R: 0xc0, G: 0x39, B: 0x2b, A: 0xff}
 
 	iconGray, iconGreen, iconRed *walk.Icon
+
+	// Dark theme palette — deliberately simple (three flat colors), since
+	// walk's classic Win32 controls don't support much beyond
+	// background/text color short of full owner-drawing.
+	darkWindowBg = walk.RGB(0x1e, 0x1e, 0x1e)
+	darkPanelBg  = walk.RGB(0x25, 0x25, 0x26)
+	darkText     = walk.RGB(0xe0, 0xe0, 0xe0)
 )
+
+// connection is one named, saved server+key pair — connections.json is
+// just a JSON array of these.
+type connection struct {
+	Name          string   `json:"name"`
+	VPNAddr       string   `json:"vpn_addr"`
+	ClientKey     string   `json:"client_key"`
+	GameProcesses []string `json:"game_processes,omitempty"`
+}
 
 var (
 	exeDir string
@@ -56,9 +79,20 @@ var (
 	mu        sync.Mutex
 	clientCmd *exec.Cmd
 
+	connections []connection
+	// loadedConnectionName is which saved connection (by its name at
+	// load time) the fields currently reflect — "" means the fields are
+	// a fresh/unsaved entry (after "Новое", or nothing selected yet).
+	// Save uses this to update that entry in place even if the Name
+	// field itself was just changed, instead of leaving the old name
+	// behind as an orphaned duplicate.
+	loadedConnectionName string
+
 	mainWin       *walk.MainWindow
 	notifyIcon    *walk.NotifyIcon
 	statusLabel   *walk.TextLabel
+	connList      *walk.ListBox
+	nameEdit      *walk.LineEdit
 	vpnAddrEdit   *walk.LineEdit
 	clientKeyEdit *walk.LineEdit
 	gameProcEdit  *walk.LineEdit
@@ -67,6 +101,7 @@ var (
 	disconnectAction *walk.Action
 	connectBtn       *walk.PushButton
 	disconnectBtn    *walk.PushButton
+	pingBtn          *walk.PushButton
 )
 
 func main() {
@@ -91,50 +126,83 @@ func main() {
 
 func runApp() error {
 	var err error
-	if iconGray, err = solidIcon(colorGray); err != nil {
+	if iconGray, err = solidIcon(colorIconGray); err != nil {
 		return fmt.Errorf("icon: %w", err)
 	}
-	if iconGreen, err = solidIcon(colorGreen); err != nil {
+	if iconGreen, err = solidIcon(colorIconGreen); err != nil {
 		return fmt.Errorf("icon: %w", err)
 	}
-	if iconRed, err = solidIcon(colorRed); err != nil {
+	if iconRed, err = solidIcon(colorIconRed); err != nil {
 		return fmt.Errorf("icon: %w", err)
 	}
+
+	panelBrush := SolidColorBrush{Color: darkPanelBg}
 
 	if err := (MainWindow{
-		AssignTo: &mainWin,
-		Title:    "splicertc",
-		MinSize:  Size{Width: 440, Height: 260},
-		Visible:  false,
-		Layout:   VBox{},
+		AssignTo:   &mainWin,
+		Title:      "splicertc",
+		Size:       Size{Width: 300, Height: 410},
+		MinSize:    Size{Width: 280, Height: 390},
+		Visible:    false,
+		Background: SolidColorBrush{Color: darkWindowBg},
+		Layout:     VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
 		Children: []Widget{
+			ListBox{
+				AssignTo: &connList,
+				MinSize:  Size{Height: 100},
+				// Slightly larger than the rest of the UI — this is the
+				// one place users pick a saved server by name, worth
+				// making the rows a bit easier to read/click. A classic
+				// (non-owner-drawn) ListBox sizes its row height from
+				// the font automatically, so bumping PointSize alone is
+				// enough — no per-item drawing code needed.
+				Font:                  Font{PointSize: 11},
+				Background:            panelBrush,
+				OnCurrentIndexChanged: onListSelectionChanged,
+				OnItemActivated:       onListActivated,
+			},
 			Composite{
-				Layout: Grid{Columns: 2},
+				Background: panelBrush,
+				Layout:     Grid{Columns: 2, Spacing: 4},
 				Children: []Widget{
-					TextLabel{Text: "Адрес сервера (vpn_addr):"},
-					LineEdit{AssignTo: &vpnAddrEdit, CueBanner: "1.2.3.4:587"},
+					TextLabel{Text: "Название:", TextColor: darkText, Background: panelBrush},
+					LineEdit{AssignTo: &nameEdit, TextColor: darkText, Background: panelBrush},
 
-					TextLabel{Text: "Приватный ключ (client_key):"},
-					LineEdit{AssignTo: &clientKeyEdit, PasswordMode: true},
+					TextLabel{Text: "Сервер:", ToolTipText: "vpn_addr", TextColor: darkText, Background: panelBrush},
+					LineEdit{AssignTo: &vpnAddrEdit, CueBanner: "1.2.3.4:587", TextColor: darkText, Background: panelBrush},
 
-					TextLabel{Text: "Игровые процессы, через запятую:"},
-					LineEdit{AssignTo: &gameProcEdit, CueBanner: "deadlock.exe (необязательно)"},
+					TextLabel{Text: "Ключ:", ToolTipText: "client_key", TextColor: darkText, Background: panelBrush},
+					LineEdit{AssignTo: &clientKeyEdit, PasswordMode: true, TextColor: darkText, Background: panelBrush},
+
+					TextLabel{Text: "Игры:", ToolTipText: "game_processes, через запятую", TextColor: darkText, Background: panelBrush},
+					LineEdit{AssignTo: &gameProcEdit, CueBanner: "необязательно", TextColor: darkText, Background: panelBrush},
 				},
 			},
 			Composite{
-				Layout: HBox{},
+				Background: SolidColorBrush{Color: darkWindowBg},
+				Layout:     HBox{MarginsZero: true, SpacingZero: false},
 				Children: []Widget{
-					PushButton{Text: "Сохранить", OnClicked: onSave},
-					HSpacer{},
+					PushButton{Text: "Новое", OnClicked: onNew},
+					PushButton{Text: "Сохранить", OnClicked: onSaveConnection},
+					PushButton{Text: "Удалить", OnClicked: onDeleteConnection},
+				},
+			},
+			Composite{
+				Background: SolidColorBrush{Color: darkWindowBg},
+				Layout:     HBox{MarginsZero: true},
+				Children: []Widget{
+					PushButton{AssignTo: &pingBtn, Text: "Пинг", OnClicked: func() { go onPingCheck() }},
 					PushButton{AssignTo: &connectBtn, Text: "Подключиться", OnClicked: onWindowConnect},
 					PushButton{AssignTo: &disconnectBtn, Text: "Отключиться", Enabled: false, OnClicked: func() { go disconnect() }},
 				},
 			},
-			TextLabel{AssignTo: &statusLabel, Text: "Статус: отключено"},
+			TextLabel{AssignTo: &statusLabel, Text: "Статус: отключено", TextColor: darkText, Background: SolidColorBrush{Color: darkWindowBg}},
 		},
 	}.Create()); err != nil {
 		return fmt.Errorf("create window: %w", err)
 	}
+
+	applyDarkTheme()
 
 	mainWin.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		// Closing the window (the [X] button) just hides it — the app
@@ -195,15 +263,56 @@ func runApp() error {
 		return fmt.Errorf("show notify icon: %w", err)
 	}
 
-	loadConfigFields()
-	if vpnAddrEdit.Text() == "" || clientKeyEdit.Text() == "" {
-		// Nothing usable saved yet — open the window instead of hiding
-		// behind a tray icon nobody knows to click yet.
+	loadConnections()
+	refreshConnList()
+	if len(connections) == 0 {
+		// Nothing saved yet — open the window instead of hiding behind a
+		// tray icon nobody knows to click yet.
 		mainWin.Show()
+	} else {
+		selectConnectionByName(connections[0].Name)
 	}
 
 	mainWin.Run()
 	return nil
+}
+
+// applyDarkTheme darkens the title bar (DWM) and asks the classic
+// Win32 controls to use their dark visual style (uxtheme's
+// "DarkMode_Explorer", available since Windows 10 1809) — both are
+// long-standing undocumented-but-widely-used APIs (the same technique
+// tools like Windows Terminal/Notepad++ use for non-UWP dark mode).
+// Background/TextColor on the widgets themselves (set declaratively
+// above) covers what these two calls don't reach — classic controls
+// have no single "give me a real dark theme" switch the way modern
+// WinUI controls do.
+func applyDarkTheme() {
+	setDarkTitleBar(mainWin.Handle())
+	for _, h := range []win.HWND{
+		connList.Handle(), nameEdit.Handle(), vpnAddrEdit.Handle(),
+		clientKeyEdit.Handle(), gameProcEdit.Handle(),
+		connectBtn.Handle(), disconnectBtn.Handle(), pingBtn.Handle(),
+	} {
+		setDarkControlTheme(h)
+	}
+}
+
+func setDarkTitleBar(hwnd win.HWND) {
+	dwmapi := syscall.NewLazyDLL("dwmapi.dll")
+	proc := dwmapi.NewProc("DwmSetWindowAttribute")
+	const dwmwaUseImmersiveDarkMode = 20 // Windows 10 1903+ / 11
+	v := int32(1)
+	_, _, _ = proc.Call(uintptr(hwnd), dwmwaUseImmersiveDarkMode, uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+}
+
+func setDarkControlTheme(hwnd win.HWND) {
+	uxtheme := syscall.NewLazyDLL("uxtheme.dll")
+	proc := uxtheme.NewProc("SetWindowTheme")
+	name, err := syscall.UTF16PtrFromString("DarkMode_Explorer")
+	if err != nil {
+		return
+	}
+	_, _, _ = proc.Call(uintptr(hwnd), uintptr(unsafe.Pointer(name)), 0)
 }
 
 // solidIcon draws a filled circle of c on a transparent 32x32 canvas —
@@ -236,46 +345,195 @@ func setupLogger() {
 	logger = log.New(f, "", log.LstdFlags)
 }
 
-func configPath() string { return filepath.Join(exeDir, "client-config.json") }
+func configPath() string      { return filepath.Join(exeDir, "client-config.json") }
+func connectionsPath() string { return filepath.Join(exeDir, "connections.json") }
 
-// loadConfigFields prefills the window's fields from an existing
-// client-config.json, if there is one. Missing file or unparseable
-// content just leaves the fields empty — not fatal, the user can still
-// fill them in and Save.
-func loadConfigFields() {
+// loadConnections reads connections.json. If it doesn't exist yet but
+// an already-configured client-config.json does (from before this
+// feature existed, or from the single-connection v2 of this app),
+// imports it as one named connection instead of just discarding
+// whatever was already set up.
+func loadConnections() {
+	if data, err := os.ReadFile(connectionsPath()); err == nil {
+		if err := json.Unmarshal(data, &connections); err != nil {
+			logger.Println("connections.json: parse error:", err)
+		}
+		return
+	}
+
 	data, err := os.ReadFile(configPath())
 	if err != nil {
 		return
 	}
 	var m map[string]interface{}
 	if err := json.Unmarshal(data, &m); err != nil {
-		logger.Println("client-config.json: parse error:", err)
 		return
 	}
-	if v, ok := m["vpn_addr"].(string); ok {
-		_ = vpnAddrEdit.SetText(v)
+	addr, _ := m["vpn_addr"].(string)
+	key, _ := m["client_key"].(string)
+	if addr == "" || key == "" {
+		return
 	}
-	if v, ok := m["client_key"].(string); ok {
-		_ = clientKeyEdit.SetText(v)
-	}
-	if v, ok := m["game_processes"].([]interface{}); ok {
-		parts := make([]string, 0, len(v))
-		for _, p := range v {
+	c := connection{Name: "По умолчанию", VPNAddr: addr, ClientKey: key}
+	if procs, ok := m["game_processes"].([]interface{}); ok {
+		for _, p := range procs {
 			if s, ok := p.(string); ok {
-				parts = append(parts, s)
+				c.GameProcesses = append(c.GameProcesses, s)
 			}
 		}
-		_ = gameProcEdit.SetText(strings.Join(parts, ", "))
+	}
+	connections = []connection{c}
+	if err := saveConnections(); err != nil {
+		logger.Println("import client-config.json into connections.json:", err)
 	}
 }
 
-// saveConfigFields writes vpn_addr/client_key/game_processes into
-// client-config.json, preserving every other field already in the file
-// untouched (reads the existing JSON as a generic map first) — so
-// fields this window doesn't expose (insecure, pin_file, vpn_tun_name,
-// ...) survive a Save unchanged. If the file doesn't exist yet, seeds
-// the same defaults client-config.example.json ships for vpn mode.
-func saveConfigFields() error {
+func saveConnections() error {
+	out, err := json.MarshalIndent(connections, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(connectionsPath(), out, 0644)
+}
+
+func refreshConnList() {
+	names := make([]string, len(connections))
+	for i, c := range connections {
+		names[i] = c.Name
+	}
+	_ = connList.SetModel(names)
+}
+
+func selectConnectionByName(name string) {
+	for i, c := range connections {
+		if c.Name == name {
+			_ = connList.SetCurrentIndex(i)
+			return
+		}
+	}
+}
+
+func fillFieldsFrom(c connection) {
+	_ = nameEdit.SetText(c.Name)
+	_ = vpnAddrEdit.SetText(c.VPNAddr)
+	_ = clientKeyEdit.SetText(c.ClientKey)
+	_ = gameProcEdit.SetText(strings.Join(c.GameProcesses, ", "))
+	loadedConnectionName = c.Name
+}
+
+func currentFieldsAsConnection() connection {
+	c := connection{
+		Name:      strings.TrimSpace(nameEdit.Text()),
+		VPNAddr:   strings.TrimSpace(vpnAddrEdit.Text()),
+		ClientKey: strings.TrimSpace(clientKeyEdit.Text()),
+	}
+	procsText := strings.TrimSpace(gameProcEdit.Text())
+	if procsText != "" {
+		for _, p := range strings.Split(procsText, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.GameProcesses = append(c.GameProcesses, p)
+			}
+		}
+	}
+	return c
+}
+
+// upsertConnection adds c as a new entry, or replaces an existing one
+// in place. originalName (loadedConnectionName at save time) is the
+// name the fields were loaded under, if any — matching on that first
+// is what makes a rename (Name field changed, then Save) update the
+// same entry instead of leaving the old name behind as an orphaned
+// duplicate. Falls back to matching by c.Name (the pre-rename
+// behavior) so typing a brand new entry's name over an existing one
+// still overwrites that one, same as before.
+func upsertConnection(c connection, originalName string) {
+	if originalName != "" {
+		for i := range connections {
+			if connections[i].Name == originalName {
+				connections[i] = c
+				return
+			}
+		}
+	}
+	for i := range connections {
+		if connections[i].Name == c.Name {
+			connections[i] = c
+			return
+		}
+	}
+	connections = append(connections, c)
+}
+
+func onListSelectionChanged() {
+	i := connList.CurrentIndex()
+	if i < 0 || i >= len(connections) {
+		return
+	}
+	fillFieldsFrom(connections[i])
+}
+
+func onListActivated() {
+	i := connList.CurrentIndex()
+	if i < 0 || i >= len(connections) {
+		return
+	}
+	c := connections[i]
+	fillFieldsFrom(c)
+	if err := writeClientConfigFromConnection(c); err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось записать конфиг: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	go connect()
+}
+
+func onNew() {
+	_ = connList.SetCurrentIndex(-1)
+	_ = nameEdit.SetText("")
+	_ = vpnAddrEdit.SetText("")
+	_ = clientKeyEdit.SetText("")
+	_ = gameProcEdit.SetText("")
+	loadedConnectionName = ""
+}
+
+func onSaveConnection() {
+	c := currentFieldsAsConnection()
+	if c.Name == "" {
+		walk.MsgBox(mainWin, "splicertc", "Название подключения не может быть пустым.", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	upsertConnection(c, loadedConnectionName)
+	if err := saveConnections(); err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось сохранить: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	refreshConnList()
+	selectConnectionByName(c.Name)
+	setStatus("сохранено: " + c.Name)
+}
+
+func onDeleteConnection() {
+	i := connList.CurrentIndex()
+	if i < 0 || i >= len(connections) {
+		return
+	}
+	name := connections[i].Name
+	connections = append(connections[:i], connections[i+1:]...)
+	if err := saveConnections(); err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось сохранить: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	refreshConnList()
+	onNew()
+	setStatus("удалено: " + name)
+}
+
+// writeClientConfigFromConnection compiles a saved connection into
+// client-config.json — the file client.exe actually reads. Preserves
+// every field this app doesn't expose (insecure, pin_file,
+// vpn_tun_name, ...) by reading the existing file as a generic map
+// first; seeds the same defaults client-config.example.json ships for
+// vpn mode if the file doesn't exist yet.
+func writeClientConfigFromConnection(c connection) error {
 	m := map[string]interface{}{}
 	if data, err := os.ReadFile(configPath()); err == nil {
 		_ = json.Unmarshal(data, &m)
@@ -290,21 +548,12 @@ func saveConfigFields() error {
 		}
 	}
 
-	m["vpn_addr"] = vpnAddrEdit.Text()
-	m["client_key"] = clientKeyEdit.Text()
-
-	procsText := strings.TrimSpace(gameProcEdit.Text())
-	if procsText == "" {
+	m["vpn_addr"] = c.VPNAddr
+	m["client_key"] = c.ClientKey
+	if len(c.GameProcesses) == 0 {
 		delete(m, "game_processes")
 	} else {
-		var procs []string
-		for _, p := range strings.Split(procsText, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				procs = append(procs, p)
-			}
-		}
-		m["game_processes"] = procs
+		m["game_processes"] = c.GameProcesses
 	}
 
 	out, err := json.MarshalIndent(m, "", "  ")
@@ -314,20 +563,88 @@ func saveConfigFields() error {
 	return os.WriteFile(configPath(), out, 0644)
 }
 
-func onSave() {
-	if err := saveConfigFields(); err != nil {
-		walk.MsgBox(mainWin, "splicertc", "Не удалось сохранить конфиг: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+func onWindowConnect() {
+	c := currentFieldsAsConnection()
+	if c.Name == "" || c.VPNAddr == "" || c.ClientKey == "" {
+		walk.MsgBox(mainWin, "splicertc", "Заполни название, адрес сервера и ключ.", walk.MsgBoxOK|walk.MsgBoxIconWarning)
 		return
 	}
-	setStatus("настройки сохранены")
-}
-
-func onWindowConnect() {
-	if err := saveConfigFields(); err != nil {
-		walk.MsgBox(mainWin, "splicertc", "Не удалось сохранить конфиг: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+	upsertConnection(c, loadedConnectionName)
+	if err := saveConnections(); err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось сохранить: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	refreshConnList()
+	selectConnectionByName(c.Name)
+	if err := writeClientConfigFromConnection(c); err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось записать конфиг: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
 	go connect()
+}
+
+// onPingCheck does a real, protocol-level reachability check against
+// whatever's currently typed in the Server/Key fields — dials the vpn
+// channel and runs the actual auth handshake (internal/transport +
+// internal/auth, the same packages cmd/client uses), rather than a
+// bare ICMP/TCP ping. That's deliberate: a plain port-open check
+// wouldn't catch a wrong or not-yet-authorized client_key, and this
+// project's own network findings (IDEAS.md §2) show ICMP/port
+// reachability alone doesn't reliably predict whether the actual
+// tunnel protocol gets through anyway. Doesn't touch server_pin/
+// pin_file verification (dials with insecure:true, no pin) — this is a
+// "can I reach the server and is this key authorized" check, not a
+// substitute for the real pinned connection Connect performs.
+func onPingCheck() {
+	addr := strings.TrimSpace(vpnAddrEdit.Text())
+	keyStr := strings.TrimSpace(clientKeyEdit.Text())
+	if addr == "" || keyStr == "" {
+		walk.MsgBox(mainWin, "splicertc", "Впиши адрес сервера и ключ.", walk.MsgBoxOK|walk.MsgBoxIconWarning)
+		return
+	}
+	seed, err := auth.DecodeKey(keyStr)
+	if err != nil {
+		walk.MsgBox(mainWin, "splicertc", "Не удалось разобрать ключ: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+
+	setStatus("проверка пинга...")
+
+	type pingResult struct {
+		ms  int64
+		err error
+	}
+	resCh := make(chan pingResult, 1)
+	start := time.Now()
+	go func() {
+		conn, err := transport.Dial(addr, true, nil)
+		if err != nil {
+			resCh <- pingResult{err: err}
+			return
+		}
+		defer conn.Close()
+		if err := auth.ClientHandshake(conn, seed); err != nil {
+			resCh <- pingResult{err: fmt.Errorf("сервер ответил, но ключ не подошёл: %w", err)}
+			return
+		}
+		resCh <- pingResult{ms: time.Since(start).Milliseconds()}
+	}()
+
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			setStatus("пинг не прошёл: " + r.err.Error())
+		} else {
+			setStatus(fmt.Sprintf("пинг: %d мс, ключ принят", r.ms))
+		}
+	case <-time.After(6 * time.Second):
+		// The dial goroutine above is left running — it'll finish on its
+		// own (success or the OS's own TCP timeout) and just write into
+		// resCh, which nothing reads after this point; harmless, no
+		// explicit cancellation plumbed through for what's meant to be a
+		// quick manual check, not a long-running operation.
+		setStatus("пинг: сервер не ответил за 6 секунд")
+	}
 }
 
 func setStatus(text string) {
@@ -367,7 +684,11 @@ func fail(text string) {
 // connect spawns client.exe, waits for it to report the vpn channel is
 // up, then runs the existing routing script — the exact two steps
 // run-vpn.ps1 already performs, just driven from Go instead of a second
-// PowerShell window.
+// PowerShell window. Uses whatever is currently in client-config.json —
+// callers that want a specific saved connection must call
+// writeClientConfigFromConnection first (see onWindowConnect/
+// onListActivated); the tray menu's plain "Подключиться" intentionally
+// just reuses whatever was compiled in last.
 func connect() {
 	setConnected(false)
 	setStatus("подключение...")
@@ -413,7 +734,7 @@ func connect() {
 	go func() {
 		// If client.exe exits later (crash, kicked by another peer,
 		// network drop — see IDEAS.md P1 #4, this isn't fixed yet), the
-		// tray shouldn't keep claiming to be connected.
+		// app shouldn't keep claiming to be connected.
 		err := c.Wait()
 		mu.Lock()
 		stillOurs := clientCmd == c
