@@ -57,6 +57,14 @@ cp server-config.example.json server-config.json
 cp authorized_keys.example.json authorized_keys.json
 ```
 
+The certificate — generate it once (locally, where Go is already needed
+to build `client.exe`) and copy it to the server, into the same
+directory as `docker-compose.yml`:
+```
+go run ./cmd/gencert
+scp -r devcerts root@<SERVER_IP>:~/splicertc/
+```
+
 In `authorized_keys.json`, add the `public_key` from step 1 (one entry
 per person you're granting access to). `server-config.json` can stay
 as-is — the example is already set to port `587` for `vpn_addr` — a
@@ -72,12 +80,17 @@ docker compose up --build -d
 docker compose logs -f
 ```
 
-`docker-compose.yml` mounts `server-config.json` and
-`authorized_keys.json` into the container and runs the binary with zero
-flags — the whole run is: edit the files, bring up the container. Both
-files have to exist BEFORE the first run (otherwise Docker creates an
-empty directory in their place instead of mounting a file — the `cp`
-commands above are exactly for that).
+`docker-compose.yml` mounts `server-config.json`, `authorized_keys.json`,
+and `devcerts/` into the container and runs the binary with zero flags —
+the whole run is: edit the files, bring up the container. All three have
+to exist BEFORE the first run (otherwise Docker creates an empty
+directory in their place instead of mounting a file — the commands above
+are exactly for that). Mounting `devcerts/` isn't a formality: without
+it, every image rebuild bakes a fresh certificate, and you'd have to dig
+through `docker compose logs` for a new fingerprint for every client
+again; `go run ./cmd/gencert` is a one-time step and never needs
+touching again (see "Authentication" below on why this matters for
+`pin_file`).
 
 Needs a Linux host with `net.ipv4.ip_forward` enabled (once, on the
 host itself, not in the container):
@@ -96,7 +109,11 @@ cp client-config.example.json client-config.json
 Open `client-config.json`, fill in `vpn_addr` (your server's IP, port
 `587`, matching the server example) and `client_key` from step 1 (the
 same pair whose `public_key` is already in the server's
-`authorized_keys.json`). Needs `wintun.dll` next to `client.exe`
+`authorized_keys.json`). The example's `pin_file` field is already set
+up — on first connect the client remembers the server's certificate
+itself and checks against it from then on, no need to go digging
+through `docker compose logs` for a fingerprint (more in
+"Authentication"). Needs `wintun.dll` next to `client.exe`
 (https://www.wintun.net/, already in the repo) and an **Administrator**
 shell.
 
@@ -229,28 +246,38 @@ Additionally:
 gitignored — never commit the real files once they hold a live key;
 only `*.example.json` (placeholder values) live in the repo.
 
-**On `insecure` vs `server_pin`**: without `server_pin`, `insecure: true`
-accepts ANY certificate from anyone — a TLS-intercepting middlebox on
-the network can present its own certificate and read all traffic in the
-clear, and the client-key check won't catch it (it just passes straight
-through to the real server via the interceptor). The server prints its
-fingerprint at startup (`cert fingerprint (put this in the client's
-server_pin to enable pinning): ...`) — copy that line into the client's
-`server_pin`, and `insecure` stops being a hole: the server must present
-exactly that certificate, which can't be forged without its private key
-even under TLS 1.3.
+**On `insecure`, `pin_file`, and `server_pin`**: without a pin,
+`insecure: true` accepts ANY certificate from anyone — a
+TLS-intercepting middlebox on the network can present its own
+certificate and read all traffic in the clear, and the client-key check
+won't catch it (it just passes straight through to the real server via
+the interceptor).
 
-**Don't want to copy the fingerprint out of the server's log by hand?**
-Set `pin_file` instead of `server_pin` — a file path (e.g.
-`"pin_file": "known_server.pin"`). On the first connection the client
-accepts whatever certificate the server presents (the same exposure as
-having no pin at all, but only for that one bootstrap connection),
-saves its fingerprint to that file, and from then on verifies against
-it automatically on every future run — the same trust model ssh's
-`known_hosts` uses. If the server's certificate ever changes
-(reinstall, rotation), delete the file — the next run trusts the first
-connection again and re-saves. If both `server_pin` and `pin_file` are
-set, `server_pin` wins.
+**Recommended: `pin_file`** (already set up in the example config). On
+the first connection the client accepts whatever certificate the server
+presents, saves its fingerprint to that file, and from then on verifies
+against it automatically on every future run — the same trust model
+ssh's `known_hosts` uses. No server logs to read, ever — provided the
+server's certificate doesn't change between connections, which needs
+the mounted `devcerts/` from Quick Start step 2 (without it, every
+server image rebuild changes the certificate, and `pin_file` would need
+resetting after every `docker compose up --build`). If the server's
+certificate ever does change (reinstall, manual replacement), delete
+the `pin_file` — the next run trusts the first connection again and
+re-saves.
+
+**Alternative: manual `server_pin`** — if you want full control (never
+auto-trust even the first connection), the server prints its
+fingerprint at startup (`cert fingerprint (put this in the client's
+server_pin to enable pinning): ...`, visible in `docker compose logs`) —
+copy that line into the client's `server_pin` instead of using
+`pin_file`. Just as strong, just requires one manual step per
+certificate change instead of zero. If both fields are set,
+`server_pin` wins.
+
+Either way, the guarantee is the same: the server must present exactly
+the remembered/configured certificate, which can't be forged without
+its private key even under TLS 1.3.
 
 ## `vpn` mode: all traffic through the tunnel
 
@@ -408,6 +435,16 @@ There's no dedicated command-line flag for the private key itself
 (only `-client-key-file <path>`) — the command line is visible to any
 local user via `/proc/<pid>/cmdline`, so keep the key in the config
 (`client_key`) or a separate file (`client_key_file`) only.
+
+**Brute-force/scan defense**: after 3 failed authentication attempts
+(wrong public key, bad signature, etc.) from the same IP, the server
+bans that IP for 10 minutes — new connections from it are refused
+immediately, without attempting a handshake. A successful
+authentication resets the counter. The ban can't tell a scanner apart
+from a legitimate client that just mistyped its own `client_key`, so it
+stays short and every ban is logged loudly (`auth: banning <IP>
+until ...`) — if your own client suddenly can't connect, the reason is
+right there in `docker compose logs`.
 
 The glue channel additionally refuses to relay to loopback, link-local,
 and multicast destinations, and to a handful of UDP amplification-vector

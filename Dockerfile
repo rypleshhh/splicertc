@@ -17,9 +17,12 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
     go build -o /out/server ./cmd/server
 
-# Generate dev certs at build time so the image is self-contained for
-# testing. For anything real, mount your own certs over /app/devcerts
-# instead (see the compose file / run command in the README).
+# Generate a fallback cert at build time so the image still works
+# standalone (e.g. `docker run` without docker-compose.yml's volumes).
+# docker-compose.yml mounts a persistent ./devcerts over this by default —
+# that mount is what real deployments should rely on, since baking a
+# fresh cert into the image on every rebuild changes its fingerprint
+# every time, breaking every client's server_pin/pin_file until updated.
 RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
     go build -o /out/gencert ./cmd/gencert
 RUN cd /out && ./gencert

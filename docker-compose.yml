@@ -22,6 +22,13 @@ services:
       # directory here instead of the file) — cp
       # authorized_keys.example.json authorized_keys.json first.
       - ./authorized_keys.json:/app/authorized_keys.json:ro
-      # To use your own certs instead of the throwaway ones baked into
-      # the image, also mount a host directory holding dev.crt/dev.key:
-      # - ./mycerts:/app/devcerts:ro
+      # Persists the TLS cert across rebuilds. Without this mount, every
+      # `docker compose up --build` bakes a FRESH self-signed cert into
+      # the image (see Dockerfile), changing its fingerprint every time —
+      # meaning every client's server_pin/pin_file would need updating
+      # after every rebuild. Generate this once with `go run
+      # ./cmd/gencert` (must exist before the first `docker compose up`,
+      # same reason as the mounts above) and it never needs touching
+      # again; the fingerprint stays stable for the container's whole
+      # lifetime, across any number of rebuilds/restarts.
+      - ./devcerts:/app/devcerts:ro

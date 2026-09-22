@@ -43,6 +43,74 @@ type Config struct {
 // configured) — checkAuth becomes a no-op in that case.
 var authorizedKeys *auth.AuthorizedKeys
 
+// Blunt, IP-scoped brute-force/scan defense: after maxAuthFailures
+// failed handshakes (wrong public key, bad signature, garbage instead
+// of a response — anything ServerHandshake rejects) from the same
+// source IP, that IP is refused outright — no handshake attempted at
+// all — for authBanDuration. A successful auth clears the count.
+// This can't tell a scanner apart from a legitimate client that just
+// mistyped its own client_key, so the ban is kept short and always
+// logged loudly (`docker compose logs` shows "auth: banning ..." /
+// "auth: rejected ...: banned until ..." if a real client suddenly
+// can't connect).
+const (
+	maxAuthFailures = 3
+	authBanDuration = 10 * time.Minute
+)
+
+var authFailures = struct {
+	mu          sync.Mutex
+	count       map[string]int
+	bannedUntil map[string]time.Time
+}{count: make(map[string]int), bannedUntil: make(map[string]time.Time)}
+
+// authIP extracts just the host part of conn.RemoteAddr() — failures
+// are tracked per source IP, not per source port, so opening many
+// connections from the same machine doesn't reset the count.
+func authIP(conn net.Conn) string {
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return conn.RemoteAddr().String()
+	}
+	return host
+}
+
+// checkAuthBan reports whether ip is currently banned. An expired ban
+// is cleared here (lazily, on the next attempt) rather than by a
+// background sweep — simplest correct option at personal-server scale.
+func checkAuthBan(ip string) (until time.Time, banned bool) {
+	authFailures.mu.Lock()
+	defer authFailures.mu.Unlock()
+	until, banned = authFailures.bannedUntil[ip]
+	if !banned {
+		return time.Time{}, false
+	}
+	if time.Now().After(until) {
+		delete(authFailures.bannedUntil, ip)
+		delete(authFailures.count, ip)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func recordAuthFailure(ip string) {
+	authFailures.mu.Lock()
+	defer authFailures.mu.Unlock()
+	authFailures.count[ip]++
+	if authFailures.count[ip] >= maxAuthFailures {
+		until := time.Now().Add(authBanDuration)
+		authFailures.bannedUntil[ip] = until
+		log.Printf("auth: banning %s until %s after %d failed attempts", ip, until.Format(time.RFC3339), authFailures.count[ip])
+	}
+}
+
+func recordAuthSuccess(ip string) {
+	authFailures.mu.Lock()
+	defer authFailures.mu.Unlock()
+	delete(authFailures.count, ip)
+	delete(authFailures.bannedUntil, ip)
+}
+
 // checkAuth runs the challenge-response handshake if auth is enabled,
 // and returns the caller's authorized name for logging. Call this first
 // thing after Accept, before any protocol-specific logic — an
@@ -52,11 +120,20 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 	if authorizedKeys == nil {
 		return "", true
 	}
+
+	ip := authIP(conn)
+	if until, banned := checkAuthBan(ip); banned {
+		log.Printf("auth: rejected %s: banned until %s (too many failed attempts)", conn.RemoteAddr(), until.Format(time.RFC3339))
+		return "", false
+	}
+
 	name, err := auth.ServerHandshake(conn, authorizedKeys)
 	if err != nil {
 		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
+		recordAuthFailure(ip)
 		return "", false
 	}
+	recordAuthSuccess(ip)
 	return name, true
 }
 
