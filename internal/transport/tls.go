@@ -51,6 +51,7 @@ func (l noDelayListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	_ = conn.SetNoDelay(true)
+	tuneSocket(conn)
 	return conn, nil
 }
 
@@ -82,6 +83,7 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 	}
 	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
+		tuneSocket(tcpConn)
 	}
 
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13}

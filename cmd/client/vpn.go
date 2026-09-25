@@ -15,6 +15,7 @@ import (
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/procmap"
+	"tcp-dormtun/internal/sched"
 	"tcp-dormtun/internal/transport"
 )
 
@@ -33,6 +34,19 @@ const vpnKeepaliveInterval = 20 * time.Second
 // adds.)
 const gameFlowIdleTimeout = 60 * time.Second
 
+// keepaliveFlow is the scheduler flow keepalive frames travel in — its
+// own tiny flow, so one always goes out promptly even behind a download.
+var keepaliveFlow = sched.FlowKey{Proto: 255}
+
+// Per-path writer sizing for multipath glue connections: gluePathDepth
+// frames of backlog is ~half a second of typical game traffic, and a
+// frame older than glueStaleAfter would be discarded by the server's
+// receiver anyway (same 150ms TTL), so it isn't sent at all.
+const (
+	gluePathDepth  = 32
+	glueStaleAfter = 150 * time.Millisecond
+)
+
 // runVPNMode is the full-tunnel counterpart to runTunMode: it forwards
 // every non-noise IPv4 packet whole, byte-for-byte, over one vpn TLS
 // connection — the server writes each one into its own TUN device and
@@ -49,7 +63,13 @@ const gameFlowIdleTimeout = 60 * time.Second
 // blocking scenario this project's glue channel exists to avoid). With
 // gameProcesses empty, none of this runs and behavior is identical to
 // before — zero cost, fully backward compatible.
-func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu int, key []byte, glueAddr string, gameProcesses []string, gamePaths int) {
+//
+// Nothing in the TUN read loop below ever waits on the network: vpn
+// packets go into a fair queue (internal/sched) drained by their own
+// writer goroutine, and game packets go to per-path writers. Before, one
+// loop wrote synchronously to the vpn socket, so an upload filling that
+// socket stalled game packets that weren't even headed for it.
+func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu int, key []byte, glueAddr string, gameProcesses []string, gamePaths int, upMbps float64) {
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
 		log.Fatalf("create TUN: %v", err)
@@ -107,22 +127,31 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		}
 	}()
 
-	var writeMu sync.Mutex
-	writeFrame := func(payload []byte) error {
-		wire := frame.New(nextSeq(), payload).Marshal()
-		writeMu.Lock()
-		_, err := conn.Write(wire)
-		writeMu.Unlock()
-		return err
+	vq := sched.New(sched.Config{})
+	defer vq.Close()
+	if upMbps > 0 {
+		log.Printf("vpn: shaping client->server to %.1f Mbit/s", upMbps)
 	}
+	go func() {
+		shaper := sched.NewShaper(upMbps)
+		for {
+			wire, ok := vq.Dequeue()
+			if !ok {
+				return
+			}
+			shaper.Wait(len(wire))
+			if _, err := conn.Write(wire); err != nil {
+				log.Printf("vpn write: %v", err)
+				return
+			}
+		}
+	}()
 
 	go func() {
 		ticker := time.NewTicker(vpnKeepaliveInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			if err := writeFrame(nil); err != nil {
-				log.Printf("vpn: keepalive write: %v", err)
-			}
+			vq.Enqueue(keepaliveFlow, frame.New(nextSeq(), nil).Marshal())
 		}
 	}()
 
@@ -131,6 +160,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 	gameTraffic := len(gameProcesses) > 0
 	var (
 		glueConns     []net.Conn
+		glueWriters   []*sched.PathWriter
 		procTable     *procmap.Table
 		flowsMu       sync.Mutex
 		flows         = make(map[uint16]flowInfo)
@@ -147,11 +177,11 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		glueSeqMu.Unlock()
 		return v
 	}
+	// Each path has its own writer, so a path stuck in a retransmit
+	// can't delay the copy going out on the others.
 	writeAllGluePaths := func(wire []byte) {
-		for _, c := range glueConns {
-			if _, err := c.Write(wire); err != nil {
-				log.Printf("glue write: %v", err)
-			}
+		for _, w := range glueWriters {
+			w.Send(wire)
 		}
 	}
 	isGameProcess := func(name string) bool {
@@ -182,10 +212,11 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 				log.Fatalf("send glue session id on path %d: %v", i, err)
 			}
 			glueConns = append(glueConns, c)
+			glueWriters = append(glueWriters, sched.NewPathWriter(c, gluePathDepth, glueStaleAfter))
 		}
 		defer func() {
-			for _, c := range glueConns {
-				c.Close()
+			for _, w := range glueWriters {
+				w.Close() // also closes the connection
 			}
 		}()
 		log.Printf("connected to glue channel %s over %d path(s) for: %s", glueAddr, gamePaths, strings.Join(gameProcesses, ", "))
@@ -318,9 +349,9 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 				}
 			}
 
-			if err := writeFrame(bufs[i][:sizes[i]]); err != nil {
-				log.Printf("vpn write: %v", err)
-			}
+			pkt := bufs[i][:sizes[i]]
+			// Marshal copies pkt, so bufs can be reused on the next Read.
+			vq.Enqueue(sched.FlowOf(pkt), frame.New(nextSeq(), pkt).Marshal())
 		}
 	}
 }

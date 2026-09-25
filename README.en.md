@@ -238,6 +238,54 @@ Verify: `ping 1.1.1.1`, `curl https://example.com`,
 `curl -UseBasicParsing https://api.ipify.org` (should return the
 server's IP, not your own).
 
+### Latency under load
+
+All non-game traffic rides inside one TCP connection, and TCP has one
+queue for everything. Left alone, a download (Steam, a browser, Windows
+Update) fills the socket buffer and the router buffer on the slowest
+hop (the dorm network) with megabytes of data — and every game, voice
+or DNS packet waits behind it; that's where ping spikes come from. What
+the tunnel does about it (all on by default, nothing to configure):
+
+- **Fair queueing inside the tunnel (FQ-CoDel)** — packets are sorted
+  per flow; a flow that just woke up (a game tick, a voice frame, a DNS
+  query, a TCP ACK) goes out ahead of one that's been downloading for a
+  while, and a flow that keeps a queue standing for more than a few
+  milliseconds gets a packet dropped — the signal for its TCP to slow
+  down. The same algorithm OpenWrt/Linux use against bufferbloat,
+  running in both directions (client and server).
+- **A cap on unsent data in the kernel** (server, `TCP_NOTSENT_LOWAT`
+  16 KB) — so "what goes next" is decided by that queue, not by a
+  multi-megabyte kernel FIFO. Doesn't affect throughput.
+- **BBR on the server** instead of CUBIC — CUBIC speeds up until it
+  overflows the router buffer on the path; BBR paces at the real
+  bottleneck rate and keeps that buffer nearly empty. Set only on the
+  tunnel's own sockets, nothing else on the server (e.g. Xray) is
+  affected. If the server log says `transport: BBR unavailable`, run
+  `sudo modprobe tcp_bbr` on the host (and add `tcp_bbr` to
+  `/etc/modules-load.d/` so it survives a reboot); normally the log
+  shows `transport: tunnel sockets use BBR + 16 KB unsent-data cap`.
+- **Multipath paths don't wait for each other** — each has its own
+  writer; a path stuck in a retransmit no longer delays the copies on
+  the others, and stale (>150ms) copies on it just aren't sent. And the
+  client no longer waits on the vpn socket before sending a game packet
+  into glue.
+
+When the queue is actually cutting something, the server logs
+`vpn: queue dropped N packets ...` every 30 seconds — normal during
+downloads; that's how it keeps them from inflating latency.
+
+**If ping still spikes during downloads**, the queue is building in the
+network's router instead (the tunnel sends faster than the link can
+carry). Then turn on a rate cap slightly below the real link speed:
+measure it (a speedtest without the tunnel) and set ~85–90% of it —
+`vpn_down_mbps` in `server-config.json` (downloads) and, if uploads
+hurt too, `vpn_up_mbps` in `client-config.json`. E.g. a 50/20 Mbit/s
+link → `"vpn_down_mbps": 44` and `"vpn_up_mbps": 17`. The queue then
+forms inside the tunnel, where FQ-CoDel manages it, instead of in the
+router, which the tunnel can't reach. Off by default — without knowing
+the real link speed it could cut throughput for nothing.
+
 ### Selective multipath for games (optional)
 
 By default all traffic rides one TCP stream — under a burst of small
@@ -656,6 +704,7 @@ a new interface into anything.
 | `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
 | `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
 | `authorized_keys_file` | `-authorized-keys-file` | empty (auth disabled) | path to `authorized_keys.json` — the list of public keys allowed to connect |
+| `vpn_down_mbps` | `-vpn-down-mbps` | `0` (no cap) | cap the server→client rate in Mbit/s, slightly below the real download speed (see "Latency under load") |
 
 ### `client-config.json`
 
@@ -676,6 +725,7 @@ a new interface into anything.
 | `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | TUN MTU (`vpn`) |
 | `game_processes` | `-game-processes` | empty | comma-separated executable names — their UDP traffic rides glue+multipath instead of the single `vpn` stream (`vpn`) |
 | `game_paths` | `-game-paths` | `3` if `game_processes` is set | number of parallel paths for classified game UDP (`vpn`) |
+| `vpn_up_mbps` | `-vpn-up-mbps` | `0` (no cap) | cap the client→server rate in Mbit/s, slightly below the real upload speed (`vpn`, see "Latency under load") |
 | `drop_count` | `-drop-count` | `0` | number of frames in the stress test (`droptest`) |
 | `drop_interval` | `-drop-interval` | `33ms` | spacing between frames (`droptest`) |
 | `drop_paths` | `-drop-paths` | `1` | number of parallel paths (`droptest`) |
