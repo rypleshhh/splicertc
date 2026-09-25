@@ -17,6 +17,7 @@ import (
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/proto"
+	"tcp-dormtun/internal/sched"
 	"tcp-dormtun/internal/transport"
 )
 
@@ -37,6 +38,11 @@ type Config struct {
 	// AuthorizedKeysFile lists the Ed25519 public keys (one per person)
 	// allowed to connect — see internal/auth and authorized_keys.example.json.
 	AuthorizedKeysFile string `json:"authorized_keys_file,omitempty"`
+	// VPNDownMbps caps the vpn channel's server→client rate (0 = no cap).
+	// Set it a little below the client's real download speed so the
+	// queue forms here, where it's fair-queued, instead of in the
+	// client-side network's router — see sched.Shaper.
+	VPNDownMbps float64 `json:"vpn_down_mbps,omitempty"`
 }
 
 // authorizedKeys is nil when auth is disabled (no authorized_keys file
@@ -175,9 +181,20 @@ type glueSession struct {
 	mu       sync.Mutex
 	recv     *frame.Receiver
 	udpFlows map[uint16]*net.UDPConn
-	paths    map[net.Conn]struct{}
+	paths    map[net.Conn]*sched.PathWriter
 	replySeq uint32
 }
+
+// Each glue path gets its own writer (sched.PathWriter) so one path
+// stuck in a retransmit can't hold up the copies going out on the
+// others. gluePathDepth frames of backlog is ~half a second of typical
+// game traffic; anything older than glueStaleAfter would be discarded
+// as stale by the client's receiver anyway (same 150ms TTL), so it
+// isn't sent at all.
+const (
+	gluePathDepth  = 32
+	glueStaleAfter = 150 * time.Millisecond
+)
 
 var glueSessions = struct {
 	mu sync.Mutex
@@ -192,7 +209,7 @@ func getGlueSession(id string) *glueSession {
 		s = &glueSession{
 			recv:     frame.NewReceiver(150 * time.Millisecond),
 			udpFlows: make(map[uint16]*net.UDPConn),
-			paths:    make(map[net.Conn]struct{}),
+			paths:    make(map[net.Conn]*sched.PathWriter),
 		}
 		glueSessions.m[id] = s
 	}
@@ -201,46 +218,33 @@ func getGlueSession(id string) *glueSession {
 
 // broadcastPing echoes a measurement ping back over every live path.
 func (s *glueSession) broadcastPing(nonce uint64) {
-	s.mu.Lock()
-	seq := s.replySeq
-	s.replySeq++
-	paths := make([]net.Conn, 0, len(s.paths))
-	for c := range s.paths {
-		paths = append(paths, c)
-	}
-	s.mu.Unlock()
-
-	wire := frame.New(seq, glue.EncodePing(nonce)).Marshal()
-	for _, c := range paths {
-		if _, err := c.Write(wire); err != nil {
-			s.mu.Lock()
-			delete(s.paths, c)
-			s.mu.Unlock()
-		}
-	}
+	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodePing(nonce)).Marshal() })
 }
 
 // broadcastReply duplicates one reply frame across every currently
 // connected path for this session. Under multipath that's the same
 // loss-hedging in the server->client direction as the client does
-// client->server. Dead paths are dropped from the set.
+// client->server.
 func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
+	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodeInbound(flowID, payload)).Marshal() })
+}
+
+// broadcast hands one frame to every path's writer without waiting on
+// any of them. A path whose connection died removes itself: its writer
+// closes the connection, and handleGlueConn's reader exits and cleans up.
+func (s *glueSession) broadcast(build func(seq uint32) []byte) {
 	s.mu.Lock()
 	seq := s.replySeq
 	s.replySeq++
-	paths := make([]net.Conn, 0, len(s.paths))
-	for c := range s.paths {
-		paths = append(paths, c)
+	writers := make([]*sched.PathWriter, 0, len(s.paths))
+	for _, w := range s.paths {
+		writers = append(writers, w)
 	}
 	s.mu.Unlock()
 
-	wire := frame.New(seq, glue.EncodeInbound(flowID, payload)).Marshal()
-	for _, c := range paths {
-		if _, err := c.Write(wire); err != nil {
-			s.mu.Lock()
-			delete(s.paths, c)
-			s.mu.Unlock()
-		}
+	wire := build(seq)
+	for _, w := range writers {
+		w.Send(wire)
 	}
 }
 
@@ -266,11 +270,16 @@ func main() {
 	cert := flag.String("cert", config.Str(cfg.Cert, "devcerts/dev.crt"), "TLS cert file")
 	key := flag.String("key", config.Str(cfg.Key, "devcerts/dev.key"), "TLS key file")
 	authorizedKeysFile := flag.String("authorized-keys-file", cfg.AuthorizedKeysFile, "path to authorized_keys.json (Ed25519 public keys allowed to connect) — leave empty to disable auth (NOT recommended for anything reachable from the internet)")
+	vpnDownMbps := flag.Float64("vpn-down-mbps", cfg.VPNDownMbps, "cap the vpn channel's server->client rate in Mbit/s, a bit below the client's real download speed (0 = no cap)")
 	flag.String("config", configPath, "path to a JSON config file (server-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
 	if foundCfg {
 		log.Printf("loaded config from %s", configPath)
+	}
+	vpnDownRate = *vpnDownMbps
+	if vpnDownRate > 0 {
+		log.Printf("vpn: shaping server->client to %.1f Mbit/s", vpnDownRate)
 	}
 
 	if fp, err := transport.LoadCertFingerprint(*cert); err != nil {
@@ -502,8 +511,9 @@ func handleGlueConn(conn net.Conn) {
 	sess := getGlueSession(sid)
 	log.Printf("glue path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
 
+	writer := sched.NewPathWriter(conn, gluePathDepth, glueStaleAfter)
 	sess.mu.Lock()
-	sess.paths[conn] = struct{}{}
+	sess.paths[conn] = writer
 	nPaths := len(sess.paths)
 	sess.mu.Unlock()
 	log.Printf("glue path connected: %s (session %s, %d path(s) now)", conn.RemoteAddr(), sid, nPaths)
@@ -512,6 +522,10 @@ func handleGlueConn(conn net.Conn) {
 		sess.mu.Lock()
 		delete(sess.paths, conn)
 		sess.mu.Unlock()
+		writer.Close()
+		if d := writer.Drops(); d > 0 {
+			log.Printf("glue path %s: %d reply frame(s) dropped while this path was backed up (the other paths carried them)", conn.RemoteAddr(), d)
+		}
 	}()
 
 	for {

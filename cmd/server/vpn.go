@@ -8,21 +8,77 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
 
 	"tcp-dormtun/internal/frame"
+	"tcp-dormtun/internal/sched"
 )
 
-// currentVPNConn is the single registered full-tunnel peer. This is a
+// currentVPN is the single registered full-tunnel peer. This is a
 // personal VPN, not multi-tenant — a new connection simply evicts
 // whatever was previously registered, matching how a personal
 // WireGuard-style endpoint behaves.
 var (
-	vpnMu          sync.Mutex
-	currentVPNConn net.Conn
-	vpnSeq         uint32
+	vpnMu      sync.Mutex
+	currentVPN *vpnPeer
+	vpnSeq     uint32
+
+	// vpnDownRate is the server->client shaping rate in Mbit/s (0 = off),
+	// set once from config at startup.
+	vpnDownRate float64
 )
+
+// vpnPeer pairs a client connection with the queue feeding it. The TUN
+// reader only ever enqueues (never blocks on the network), and one
+// writer goroutine drains the queue into the connection — so the order
+// packets leave in is decided by sched's fair queueing, not by whatever
+// happened to be written first into a socket buffer.
+type vpnPeer struct {
+	conn net.Conn
+	q    *sched.Scheduler
+}
+
+func (p *vpnPeer) writeLoop() {
+	shaper := sched.NewShaper(vpnDownRate)
+	for {
+		wire, ok := p.q.Dequeue()
+		if !ok {
+			return
+		}
+		shaper.Wait(len(wire))
+		if _, err := p.conn.Write(wire); err != nil {
+			log.Printf("vpn: write to client failed: %v", err)
+			p.conn.Close() // unblocks handleVPNConn's reader, which cleans up
+			return
+		}
+	}
+}
+
+// logQueueDrops reports, every 30s and only when something happened,
+// how many packets the queue dropped — the visible sign that a bulk
+// transfer was outrunning the link and got slowed down instead of
+// building a queue everything else would have to wait behind.
+func logQueueDrops(name string, q *sched.Scheduler, done <-chan struct{}) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	var last sched.Stats
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			st := q.Stats()
+			codel, overflow := st.CodelDrops-last.CodelDrops, st.OverflowDrops-last.OverflowDrops
+			if codel+overflow > 0 {
+				log.Printf("%s: queue dropped %d packets in 30s (CoDel %d, overflow %d), %d KB queued across %d flows",
+					name, codel+overflow, codel, overflow, st.QueuedBytes/1024, st.ActiveFlows)
+			}
+			last = st
+		}
+	}
+}
 
 func nextVPNSeq() uint32 {
 	vpnMu.Lock()
@@ -230,16 +286,15 @@ func vpnTunReader(dev tun.Device) {
 			log.Fatalf("vpn TUN read: %v", err)
 		}
 		vpnMu.Lock()
-		conn := currentVPNConn
+		peer := currentVPN
 		vpnMu.Unlock()
-		if conn == nil {
+		if peer == nil {
 			continue
 		}
 		for i := 0; i < n; i++ {
-			wire := frame.New(nextVPNSeq(), bufs[i][:sizes[i]]).Marshal()
-			if _, err := conn.Write(wire); err != nil {
-				log.Printf("vpn: write to client failed: %v", err)
-			}
+			pkt := bufs[i][:sizes[i]]
+			// Marshal copies pkt, so bufs can be reused on the next Read.
+			peer.q.Enqueue(sched.FlowOf(pkt), frame.New(nextVPNSeq(), pkt).Marshal())
 		}
 	}
 }
@@ -254,22 +309,29 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 		return
 	}
 
+	peer := &vpnPeer{conn: conn, q: sched.New(sched.Config{})}
+	done := make(chan struct{})
+	go peer.writeLoop()
+	go logQueueDrops("vpn", peer.q, done)
+
 	vpnMu.Lock()
-	old := currentVPNConn
-	currentVPNConn = conn
+	old := currentVPN
+	currentVPN = peer
 	vpnMu.Unlock()
 	if old != nil {
-		log.Printf("vpn: new client %s replacing previous peer %s", conn.RemoteAddr(), old.RemoteAddr())
-		old.Close()
+		log.Printf("vpn: new client %s replacing previous peer %s", conn.RemoteAddr(), old.conn.RemoteAddr())
+		old.conn.Close()
 	}
 	log.Printf("vpn: client connected: %s (%q)", conn.RemoteAddr(), name)
 
 	defer func() {
 		vpnMu.Lock()
-		if currentVPNConn == conn {
-			currentVPNConn = nil
+		if currentVPN == peer {
+			currentVPN = nil
 		}
 		vpnMu.Unlock()
+		peer.q.Close()
+		close(done)
 		log.Printf("vpn: client disconnected: %s", conn.RemoteAddr())
 	}()
 

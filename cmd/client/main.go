@@ -24,6 +24,7 @@ import (
 	"tcp-dormtun/internal/measure"
 	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/proto"
+	"tcp-dormtun/internal/sched"
 	"tcp-dormtun/internal/socks5"
 	"tcp-dormtun/internal/transport"
 )
@@ -52,10 +53,13 @@ type Config struct {
 	// GamePaths is the multipath duplication factor for GameProcesses'
 	// UDP traffic; defaults to 3 if GameProcesses is set but this isn't.
 	GamePaths int `json:"game_paths,omitempty"`
-	DropCount          int    `json:"drop_count,omitempty"`
-	DropInterval       string `json:"drop_interval,omitempty"` // e.g. "33ms"
-	DropPaths          int    `json:"drop_paths,omitempty"`
-	Insecure           bool   `json:"insecure,omitempty"`
+	// VPNUpMbps caps the vpn channel's client→server rate (0 = no cap);
+	// the upload-direction counterpart of the server's vpn_down_mbps.
+	VPNUpMbps    float64 `json:"vpn_up_mbps,omitempty"`
+	DropCount    int     `json:"drop_count,omitempty"`
+	DropInterval string  `json:"drop_interval,omitempty"` // e.g. "33ms"
+	DropPaths    int     `json:"drop_paths,omitempty"`
+	Insecure     bool    `json:"insecure,omitempty"`
 	// ServerPin is the SHA-256 (hex) of the server's TLS certificate,
 	// printed by the server at startup. When set, the client verifies
 	// the server presents exactly this certificate instead of trusting
@@ -138,6 +142,7 @@ func main() {
 	pinFile := flag.String("pin-file", cfg.PinFile, "trust-on-first-use: path to save/read the server's certificate fingerprint automatically, instead of copying -server-pin by hand (ignored if -server-pin is set)")
 	gameProcessesFlag := flag.String("game-processes", strings.Join(cfg.GameProcesses, ","), "vpn mode: comma-separated executable names (e.g. deadlock.exe) whose UDP traffic gets routed through the glue channel with multipath duplication instead of the single vpn stream")
 	gamePaths := flag.Int("game-paths", config.Int(cfg.GamePaths, 0), "vpn mode: multipath duplication factor for -game-processes UDP traffic (0 = default of 3 if -game-processes is set)")
+	vpnUpMbps := flag.Float64("vpn-up-mbps", cfg.VPNUpMbps, "vpn mode: cap the client->server rate in Mbit/s, a bit below the real upload speed (0 = no cap)")
 	clientKeyFile := flag.String("client-key-file", cfg.ClientKeyFile, "path to this client's base64 Ed25519 private key file, generated with cmd/genkey — required if the server has auth enabled")
 	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
@@ -208,7 +213,7 @@ func main() {
 		if len(gameProcesses) > 0 && paths <= 0 {
 			paths = 3
 		}
-		runVPNMode(*vpnAddr, *insecure, pin, *vpnTunName, *vpnTunMTU, key, *glueAddr, gameProcesses, paths)
+		runVPNMode(*vpnAddr, *insecure, pin, *vpnTunName, *vpnTunMTU, key, *glueAddr, gameProcesses, paths, *vpnUpMbps)
 		return
 	}
 
@@ -598,11 +603,20 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		return v
 	}
 
+	// Each path has its own writer, so a path stuck in a retransmit
+	// can't delay the copy going out on the others.
+	writers := make([]*sched.PathWriter, len(conns))
+	for i, c := range conns {
+		writers[i] = sched.NewPathWriter(c, gluePathDepth, glueStaleAfter)
+	}
+	defer func() {
+		for _, w := range writers {
+			w.Close()
+		}
+	}()
 	writeAllPaths := func(wire []byte) {
-		for _, c := range conns {
-			if _, err := c.Write(wire); err != nil {
-				log.Printf("glue write: %v", err)
-			}
+		for _, w := range writers {
+			w.Send(wire)
 		}
 	}
 
