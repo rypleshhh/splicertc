@@ -1,21 +1,10 @@
-// Command tray is a minimal Windows GUI wrapper around the existing
-// client.exe + setup-vpn-route.ps1 flow (see README.md's "vpn" mode
-// section): a small, dark-themed window listing named connections
-// (server address + client key + optional game process list per name)
-// plus a tray icon for Connect/Disconnect, instead of hand-editing
-// client-config.json and juggling Administrator PowerShell windows. It
-// does not reimplement any tunnel or routing logic itself — it spawns
-// the same binaries run-vpn.ps1 already spawns and reuses the same,
-// already-debugged setup-vpn-route.ps1 (invoked with -ExecutionPolicy
-// Bypass so a friend's default execution policy can't block it), just
-// from a GUI instead of a console.
+// Command tray is a small GUI for vpn mode: a list of saved connections
+// and a tray icon to connect/disconnect. It just runs client.exe and
+// setup-vpn-route.ps1, same as run-vpn.ps1.
 //
-// Named connections live in connections.json next to the exe; the
-// selected one gets compiled into client-config.json (the file
-// client.exe actually reads) right before Connect. Expects client.exe,
-// setup-vpn-route.ps1, and wintun.dll to sit next to this exe too — the
-// same layout as a manual checkout, so no separate packaging step is
-// required yet (see IDEAS.md Track B for the eventual installer).
+// Connections are saved in connections.json. Before connecting, the
+// selected one is written to client-config.json. client.exe,
+// setup-vpn-route.ps1 and wintun.dll must be next to tray.exe.
 package main
 
 import (
@@ -55,16 +44,13 @@ var (
 
 	iconGray, iconGreen, iconRed *walk.Icon
 
-	// Dark theme palette — deliberately simple (three flat colors), since
-	// walk's classic Win32 controls don't support much beyond
-	// background/text color short of full owner-drawing.
+	// dark theme colors
 	darkWindowBg = walk.RGB(0x1e, 0x1e, 0x1e)
 	darkPanelBg  = walk.RGB(0x25, 0x25, 0x26)
 	darkText     = walk.RGB(0xe0, 0xe0, 0xe0)
 )
 
-// connection is one named, saved server+key pair — connections.json is
-// just a JSON array of these.
+// connection is one entry in connections.json.
 type connection struct {
 	Name          string   `json:"name"`
 	VPNAddr       string   `json:"vpn_addr"`
@@ -80,12 +66,8 @@ var (
 	clientCmd *exec.Cmd
 
 	connections []connection
-	// loadedConnectionName is which saved connection (by its name at
-	// load time) the fields currently reflect — "" means the fields are
-	// a fresh/unsaved entry (after "Новое", or nothing selected yet).
-	// Save uses this to update that entry in place even if the Name
-	// field itself was just changed, instead of leaving the old name
-	// behind as an orphaned duplicate.
+	// name of the connection shown in the fields ("" = new one),
+	// needed so renaming doesn't create a second entry
 	loadedConnectionName string
 
 	mainWin       *walk.MainWindow
@@ -150,12 +132,7 @@ func runApp() error {
 			ListBox{
 				AssignTo: &connList,
 				MinSize:  Size{Height: 100},
-				// Slightly larger than the rest of the UI — this is the
-				// one place users pick a saved server by name, worth
-				// making the rows a bit easier to read/click. A classic
-				// (non-owner-drawn) ListBox sizes its row height from
-				// the font automatically, so bumping PointSize alone is
-				// enough — no per-item drawing code needed.
+				// bigger font = taller rows
 				Font:                  Font{PointSize: 11},
 				Background:            panelBrush,
 				OnCurrentIndexChanged: onListSelectionChanged,
@@ -205,9 +182,7 @@ func runApp() error {
 	applyDarkTheme()
 
 	mainWin.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		// Closing the window (the [X] button) just hides it — the app
-		// keeps running in the tray. Only "Выход" in the tray menu
-		// actually exits.
+		// [X] only hides the window, the app stays in the tray
 		*canceled = true
 		mainWin.Hide()
 	})
@@ -220,7 +195,7 @@ func runApp() error {
 	if err := ni.SetIcon(iconGray); err != nil {
 		return fmt.Errorf("set icon: %w", err)
 	}
-	_ = ni.SetToolTip("splicertc — отключено")
+	_ = ni.SetToolTip("splicertc - отключено")
 
 	openAction := walk.NewAction()
 	_ = openAction.SetText("Настройки")
@@ -266,8 +241,7 @@ func runApp() error {
 	loadConnections()
 	refreshConnList()
 	if len(connections) == 0 {
-		// Nothing saved yet — open the window instead of hiding behind a
-		// tray icon nobody knows to click yet.
+		// nothing saved yet, show the window
 		mainWin.Show()
 	} else {
 		selectConnectionByName(connections[0].Name)
@@ -277,15 +251,8 @@ func runApp() error {
 	return nil
 }
 
-// applyDarkTheme darkens the title bar (DWM) and asks the classic
-// Win32 controls to use their dark visual style (uxtheme's
-// "DarkMode_Explorer", available since Windows 10 1809) — both are
-// long-standing undocumented-but-widely-used APIs (the same technique
-// tools like Windows Terminal/Notepad++ use for non-UWP dark mode).
-// Background/TextColor on the widgets themselves (set declaratively
-// above) covers what these two calls don't reach — classic controls
-// have no single "give me a real dark theme" switch the way modern
-// WinUI controls do.
+// applyDarkTheme makes the title bar and controls dark. These APIs are
+// undocumented but Notepad++ and others use them too.
 func applyDarkTheme() {
 	setDarkTitleBar(mainWin.Handle())
 	for _, h := range []win.HWND{
@@ -315,9 +282,7 @@ func setDarkControlTheme(hwnd win.HWND) {
 	_, _, _ = proc.Call(uintptr(hwnd), uintptr(unsafe.Pointer(name)), 0)
 }
 
-// solidIcon draws a filled circle of c on a transparent 32x32 canvas —
-// generated at runtime instead of shipping .ico assets, since
-// walk.NewIconFromImage accepts a plain image.Image directly.
+// solidIcon draws a colored circle, so we don't need .ico files.
 func solidIcon(c color.RGBA) (*walk.Icon, error) {
 	const size = 32
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
@@ -337,8 +302,7 @@ func solidIcon(c color.RGBA) (*walk.Icon, error) {
 func setupLogger() {
 	f, err := os.OpenFile(filepath.Join(exeDir, "tray.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		// Can't write the log file — fall back to discarding rather than
-		// crashing a GUI app that has nowhere to show the error anyway.
+		// no log file, just don't log
 		logger = log.New(io.Discard, "", log.LstdFlags)
 		return
 	}
@@ -348,11 +312,8 @@ func setupLogger() {
 func configPath() string      { return filepath.Join(exeDir, "client-config.json") }
 func connectionsPath() string { return filepath.Join(exeDir, "connections.json") }
 
-// loadConnections reads connections.json. If it doesn't exist yet but
-// an already-configured client-config.json does (from before this
-// feature existed, or from the single-connection v2 of this app),
-// imports it as one named connection instead of just discarding
-// whatever was already set up.
+// loadConnections reads connections.json. If there's none but
+// client-config.json exists, it is imported as one connection.
 func loadConnections() {
 	if data, err := os.ReadFile(connectionsPath()); err == nil {
 		if err := json.Unmarshal(data, &connections); err != nil {
@@ -438,14 +399,8 @@ func currentFieldsAsConnection() connection {
 	return c
 }
 
-// upsertConnection adds c as a new entry, or replaces an existing one
-// in place. originalName (loadedConnectionName at save time) is the
-// name the fields were loaded under, if any — matching on that first
-// is what makes a rename (Name field changed, then Save) update the
-// same entry instead of leaving the old name behind as an orphaned
-// duplicate. Falls back to matching by c.Name (the pre-rename
-// behavior) so typing a brand new entry's name over an existing one
-// still overwrites that one, same as before.
+// upsertConnection updates the entry called originalName (for renames),
+// or the one with the same name, or adds a new one.
 func upsertConnection(c connection, originalName string) {
 	if originalName != "" {
 		for i := range connections {
@@ -527,12 +482,8 @@ func onDeleteConnection() {
 	setStatus("удалено: " + name)
 }
 
-// writeClientConfigFromConnection compiles a saved connection into
-// client-config.json — the file client.exe actually reads. Preserves
-// every field this app doesn't expose (insecure, pin_file,
-// vpn_tun_name, ...) by reading the existing file as a generic map
-// first; seeds the same defaults client-config.example.json ships for
-// vpn mode if the file doesn't exist yet.
+// writeClientConfigFromConnection writes the connection into
+// client-config.json. Other fields in the file are kept as they are.
 func writeClientConfigFromConnection(c connection) error {
 	m := map[string]interface{}{}
 	if data, err := os.ReadFile(configPath()); err == nil {
@@ -583,18 +534,9 @@ func onWindowConnect() {
 	go connect()
 }
 
-// onPingCheck does a real, protocol-level reachability check against
-// whatever's currently typed in the Server/Key fields — dials the vpn
-// channel and runs the actual auth handshake (internal/transport +
-// internal/auth, the same packages cmd/client uses), rather than a
-// bare ICMP/TCP ping. That's deliberate: a plain port-open check
-// wouldn't catch a wrong or not-yet-authorized client_key, and this
-// project's own network findings (IDEAS.md §2) show ICMP/port
-// reachability alone doesn't reliably predict whether the actual
-// tunnel protocol gets through anyway. Doesn't touch server_pin/
-// pin_file verification (dials with insecure:true, no pin) — this is a
-// "can I reach the server and is this key authorized" check, not a
-// substitute for the real pinned connection Connect performs.
+// onPingCheck connects to the server and does the auth handshake with
+// the key from the fields. This also checks that the key is accepted,
+// not just that the port is open. Doesn't check the pin.
 func onPingCheck() {
 	addr := strings.TrimSpace(vpnAddrEdit.Text())
 	keyStr := strings.TrimSpace(clientKeyEdit.Text())
@@ -638,11 +580,7 @@ func onPingCheck() {
 			setStatus(fmt.Sprintf("пинг: %d мс, ключ принят", r.ms))
 		}
 	case <-time.After(6 * time.Second):
-		// The dial goroutine above is left running — it'll finish on its
-		// own (success or the OS's own TCP timeout) and just write into
-		// resCh, which nothing reads after this point; harmless, no
-		// explicit cancellation plumbed through for what's meant to be a
-		// quick manual check, not a long-running operation.
+		// the goroutine above will finish by itself later
 		setStatus("пинг: сервер не ответил за 6 секунд")
 	}
 }
@@ -653,7 +591,7 @@ func setStatus(text string) {
 		_ = statusLabel.SetText("Статус: " + text)
 	}
 	if notifyIcon != nil {
-		_ = notifyIcon.SetToolTip("splicertc — " + text)
+		_ = notifyIcon.SetToolTip("splicertc - " + text)
 	}
 }
 
@@ -681,14 +619,8 @@ func fail(text string) {
 	setConnected(false)
 }
 
-// connect spawns client.exe, waits for it to report the vpn channel is
-// up, then runs the existing routing script — the exact two steps
-// run-vpn.ps1 already performs, just driven from Go instead of a second
-// PowerShell window. Uses whatever is currently in client-config.json —
-// callers that want a specific saved connection must call
-// writeClientConfigFromConnection first (see onWindowConnect/
-// onListActivated); the tray menu's plain "Подключиться" intentionally
-// just reuses whatever was compiled in last.
+// connect starts client.exe, waits until it's connected and runs the
+// routing script. It uses whatever is in client-config.json now.
 func connect() {
 	setConnected(false)
 	setStatus("подключение...")
@@ -732,9 +664,7 @@ func connect() {
 	go scanForConnected(stdout, connectedCh)
 	go scanForConnected(stderr, connectedCh)
 	go func() {
-		// If client.exe exits later (crash, kicked by another peer,
-		// network drop — see IDEAS.md P1 #4, this isn't fixed yet), the
-		// app shouldn't keep claiming to be connected.
+		// client.exe can exit later (connection lost etc.)
 		err := c.Wait()
 		mu.Lock()
 		stillOurs := clientCmd == c
@@ -744,17 +674,17 @@ func connect() {
 		mu.Unlock()
 		if stillOurs {
 			logger.Println("client.exe exited:", err)
-			fail("клиент неожиданно завершился — смотри tray.log")
+			fail("клиент неожиданно завершился, смотри tray.log")
 		}
 	}()
 
 	select {
 	case ok := <-connectedCh:
 		if !ok {
-			return // scanForConnected already called fail()
+			return
 		}
 	case <-time.After(connectTimeout):
-		fail("клиент не подключился за " + connectTimeout.String() + " — смотри tray.log")
+		fail("клиент не подключился за " + connectTimeout.String() + ", смотри tray.log")
 		stopClient()
 		return
 	}
@@ -766,7 +696,7 @@ func connect() {
 	out, err := rc.CombinedOutput()
 	logger.Println("setup-vpn-route.ps1 output:\n" + string(out))
 	if err != nil {
-		fail("не удалось настроить маршрутизацию — смотри tray.log")
+		fail("не удалось настроить маршрутизацию, смотри tray.log")
 		stopClient()
 		return
 	}
@@ -778,10 +708,8 @@ func connect() {
 	setConnected(true)
 }
 
-// scanForConnected copies r into the log file line by line and reports
-// true on connectedCh the moment it sees the "connected to vpn channel"
-// line client.exe logs on success (cmd/client/vpn.go). Reports false if
-// the stream ends first without ever seeing it (client exited early).
+// scanForConnected writes client output to the log and sends true when
+// it sees "connected to vpn channel", or false if the output ends first.
 func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 	buf := make([]byte, 4096)
 	var line []byte
@@ -852,28 +780,13 @@ func stopClient() {
 	if c == nil || c.Process == nil {
 		return
 	}
-	// Killing client.exe destroys its TUN adapter as a side effect of
-	// the process exiting (same behavior run-vpn.ps1 already relies on
-	// for Ctrl+C — see its header comment); Windows then drops routes
-	// bound to the now-gone adapter on its own. The one thing that can
-	// be left behind is the harmless anti-loop host route, cleaned up
-	// automatically by setup-vpn-route.ps1's own idempotent cleanup step
-	// on the next Connect.
-	//
-	// No explicit Wait() here on purpose: connect() already has a
-	// background goroutine blocked on c.Wait() for this same process
-	// (to notice an unexpected exit) — calling Wait() a second time
-	// concurrently isn't something exec.Cmd promises is safe. clientCmd
-	// was already cleared above, so that goroutine's stillOurs check
-	// will correctly see this as an expected exit and stay quiet.
+	// Windows removes the TUN adapter and its routes when the process dies.
+	// No Wait() here, the goroutine in connect() already waits on it.
 	_ = c.Process.Kill()
 }
 
-// relaunchElevated re-starts this same exe with a UAC prompt (the
-// "runas" verb) and lets the caller exit — TUN creation and route
-// changes both need Administrator, and a GUI app should ask for that
-// itself instead of expecting a friend to know to right-click "Run as
-// administrator".
+// relaunchElevated starts this exe again as admin (UAC prompt). Admin is
+// needed for the TUN adapter and routes.
 func relaunchElevated(exe string) error {
 	shell32 := syscall.NewLazyDLL("shell32.dll")
 	shellExecute := shell32.NewProc("ShellExecuteW")
@@ -900,8 +813,7 @@ func relaunchElevated(exe string) error {
 		uintptr(unsafe.Pointer(dir)),
 		swShowNormal,
 	)
-	// ShellExecute returns a value > 32 on success; anything else is an
-	// error code (e.g. the user clicked "No" on the UAC prompt).
+	// > 32 means success
 	if ret <= 32 {
 		if ret == 5 {
 			return fmt.Errorf("отказано в запросе прав администратора")
@@ -911,10 +823,7 @@ func relaunchElevated(exe string) error {
 	return nil
 }
 
-// fatalStartup handles failures before the walk window/message loop
-// exists (can't resolve our own exe path, can't elevate, can't create
-// the window) — there's no console and no walk.MsgBox available yet, so
-// this calls MessageBoxW directly.
+// fatalStartup shows an error with MessageBoxW, used before the window exists.
 func fatalStartup(text string) {
 	user32 := syscall.NewLazyDLL("user32.dll")
 	messageBoxW := user32.NewProc("MessageBoxW")

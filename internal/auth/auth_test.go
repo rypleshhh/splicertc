@@ -2,8 +2,8 @@ package auth
 
 import (
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -17,8 +17,7 @@ import (
 	"time"
 )
 
-// selfSignedCert builds a throwaway self-signed cert/key pair entirely
-// in memory, the same shape internal/transport's own tests use.
+// selfSignedCert makes an in-memory self-signed cert for tests.
 func selfSignedCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -46,10 +45,8 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 	}
 }
 
-// tlsPair opens one real TLS connection over loopback TCP and returns
-// both ends with their handshake already complete — what
-// ServerHandshake/ClientHandshake actually run over in production
-// (auth.go requires a *tls.Conn, so net.Pipe won't do here).
+// tlsPair returns both ends of a real TLS connection over loopback.
+// net.Pipe won't work because auth needs a *tls.Conn.
 func tlsPair(t *testing.T) (server, client net.Conn) {
 	t.Helper()
 	cert := selfSignedCert(t)
@@ -132,10 +129,7 @@ func TestHandshakeSucceedsWithAuthorizedKey(t *testing.T) {
 	}
 }
 
-// TestHandshakeFailsWithUnauthorizedKey uses a real, validly-signed
-// Ed25519 identity that was simply never added to the server's list —
-// proving possession of *some* key pair isn't enough, it has to be one
-// the server was told to trust.
+// A valid key that isn't in the server's list must be rejected.
 func TestHandshakeFailsWithUnauthorizedKey(t *testing.T) {
 	_, seed, err := GenerateKeypair()
 	if err != nil {
@@ -161,12 +155,8 @@ func TestHandshakeFailsWithUnauthorizedKey(t *testing.T) {
 	}
 }
 
-// TestHandshakeBindsToTLSSession is the direct regression test for the
-// exporter binding in bindingMessage: it proves a signature computed
-// for one TLS connection is invalid on a different one, even given the
-// identical challenge bytes on both — the property that defeats a party
-// able to relay a challenge between two separate connections to the
-// real server without ever holding the private key itself.
+// A signature made for one TLS connection must not verify on another,
+// even with the same challenge.
 func TestHandshakeBindsToTLSSession(t *testing.T) {
 	_, seed, err := GenerateKeypair()
 	if err != nil {
@@ -186,7 +176,7 @@ func TestHandshakeBindsToTLSSession(t *testing.T) {
 		t.Fatal("connB is not a *tls.Conn")
 	}
 
-	forcedChallenge := make([]byte, challengeSize) // identical on both, on purpose
+	forcedChallenge := make([]byte, challengeSize) // same challenge for both
 
 	msgA, err := bindingMessage(tcA, forcedChallenge)
 	if err != nil {
@@ -205,7 +195,7 @@ func TestHandshakeBindsToTLSSession(t *testing.T) {
 		t.Fatal("sanity check failed: signature didn't verify against its own message")
 	}
 	if ed25519.Verify(pub, msgB, sigA) {
-		t.Fatal("signature computed for connection A verified against connection B's message — TLS session binding is not working")
+		t.Fatal("signature from connection A is valid on connection B")
 	}
 }
 

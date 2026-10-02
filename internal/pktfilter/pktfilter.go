@@ -1,14 +1,7 @@
-// Package pktfilter inspects raw IP packets read off a TUN device and
-// separates real traffic (unicast, going somewhere specific — what a
-// game or any other application actually sends) from the local service
-// discovery chatter every OS generates on any interface that has an
-// address: NetBIOS, mDNS, SSDP, LLMNR, and the like. None of that has
-// any business going through the tunnel.
-//
-// This is a negative list (known-noise ports + multicast/broadcast
-// destinations), not a positive allowlist of "known game ports" —
-// games routinely use dynamic/ephemeral UDP ports (Steam Datagram
-// Relay in particular), so there's no fixed port to allow-list against.
+// Package pktfilter parses packets from the TUN device and filters out
+// local discovery noise (NetBIOS, mDNS, SSDP, LLMNR...) that shouldn't
+// go through the tunnel. Games use random ports, so this is a blocklist,
+// not an allowlist.
 package pktfilter
 
 import (
@@ -22,11 +15,11 @@ type Info struct {
 	Version          int
 	Proto            byte
 	Src, Dst         net.IP
-	SrcPort, DstPort uint16 // 0 if not UDP, or ports weren't parseable
-	Payload          []byte // UDP payload, if Proto==17 and long enough to have one; aliases the input slice
+	SrcPort, DstPort uint16 // only for UDP
+	Payload          []byte // UDP payload, points into the packet
 	Len              int
 	Noise            bool
-	Reason           string // why it's noise, or why it's not (both informative)
+	Reason           string
 }
 
 func (i Info) String() string {
@@ -43,9 +36,7 @@ func (i Info) String() string {
 		i.Version, i.Src, srcPortPart, i.Dst, portPart, protoStr, i.Len, i.Noise, i.Reason)
 }
 
-// wellKnownNoisePorts are UDP ports used exclusively for local service
-// discovery/announcement protocols — never for actual application data
-// a game or a normal client would tunnel.
+// UDP ports used only for local discovery.
 var wellKnownNoisePorts = map[uint16]string{
 	137:  "NetBIOS Name Service",
 	138:  "NetBIOS Datagram",
@@ -58,9 +49,7 @@ var wellKnownNoisePorts = map[uint16]string{
 	68:   "DHCP client",
 }
 
-// Parse reads the IP header (and UDP header, if present) from a raw
-// packet as read off a TUN device (no link-layer header). ok is false
-// if the packet is too short to even determine its IP version.
+// Parse reads the IP header and the UDP ports if there are any.
 func Parse(pkt []byte) (info Info, ok bool) {
 	if len(pkt) < 1 {
 		return Info{}, false
@@ -95,9 +84,7 @@ func Parse(pkt []byte) (info Info, ok bool) {
 		info.Src = net.IP(pkt[8:24])
 		info.Dst = net.IP(pkt[24:40])
 
-		// Doesn't walk IPv6 extension header chains — fine here, real
-		// traffic to a game server won't have them between the fixed
-		// header and the UDP payload.
+		// extension headers are not handled
 		if info.Proto == 17 && len(pkt) >= 44 {
 			info.SrcPort = binary.BigEndian.Uint16(pkt[40:42])
 			info.DstPort = binary.BigEndian.Uint16(pkt[42:44])
@@ -116,13 +103,8 @@ func classify(i Info) (noise bool, reason string) {
 		return true, "multicast destination"
 	}
 	if i.Version == 4 {
-		// ".255" only means "subnet broadcast" within a private/
-		// link-local range — on the public internet it's an ordinary
-		// host address. Full-tunnel VPN mode runs this classifier
-		// against every internet-bound packet (not just a hand-picked
-		// local subnet like the original glue/tun modes), so without
-		// this scoping a real server whose public IP happens to end in
-		// .255 would be silently dropped instead of tunneled.
+		// .255 is a broadcast only in private ranges, public IPs can
+		// end with .255 too
 		if d4 := i.Dst.To4(); d4 != nil && d4[3] == 255 && (i.Dst.IsPrivate() || i.Dst.IsLinkLocalUnicast()) {
 			return true, "broadcast destination"
 		}

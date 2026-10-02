@@ -21,9 +21,7 @@ import (
 	"tcp-dormtun/internal/transport"
 )
 
-// Config mirrors the server's flags — every field optional, JSON tags
-// snake_case to match the convention the client config also uses. A CLI
-// flag, if explicitly passed, always overrides the matching field here.
+// Config is server-config.json. Command line flags override it.
 type Config struct {
 	Addr        string `json:"addr,omitempty"`
 	DropAddr    string `json:"drop_addr,omitempty"`
@@ -35,30 +33,16 @@ type Config struct {
 	EgressIface string `json:"egress_iface,omitempty"`
 	Cert        string `json:"cert,omitempty"`
 	Key         string `json:"key,omitempty"`
-	// AuthorizedKeysFile lists the Ed25519 public keys (one per person)
-	// allowed to connect — see internal/auth and authorized_keys.example.json.
+	// list of client public keys, see authorized_keys.example.json
 	AuthorizedKeysFile string `json:"authorized_keys_file,omitempty"`
-	// VPNDownMbps caps the vpn channel's server→client rate (0 = no cap).
-	// Set it a little below the client's real download speed so the
-	// queue forms here, where it's fair-queued, instead of in the
-	// client-side network's router — see sched.Shaper.
+	// speed limit server->client in Mbit/s, 0 = off
 	VPNDownMbps float64 `json:"vpn_down_mbps,omitempty"`
 }
 
-// authorizedKeys is nil when auth is disabled (no authorized_keys file
-// configured) — checkAuth becomes a no-op in that case.
+// nil means auth is off
 var authorizedKeys *auth.AuthorizedKeys
 
-// Blunt, IP-scoped brute-force/scan defense: after maxAuthFailures
-// failed handshakes (wrong public key, bad signature, garbage instead
-// of a response — anything ServerHandshake rejects) from the same
-// source IP, that IP is refused outright — no handshake attempted at
-// all — for authBanDuration. A successful auth clears the count.
-// This can't tell a scanner apart from a legitimate client that just
-// mistyped its own client_key, so the ban is kept short and always
-// logged loudly (`docker compose logs` shows "auth: banning ..." /
-// "auth: rejected ...: banned until ..." if a real client suddenly
-// can't connect).
+// Ban an IP for authBanDuration after maxAuthFailures failed logins.
 const (
 	maxAuthFailures = 3
 	authBanDuration = 10 * time.Minute
@@ -70,9 +54,7 @@ var authFailures = struct {
 	bannedUntil map[string]time.Time
 }{count: make(map[string]int), bannedUntil: make(map[string]time.Time)}
 
-// authIP extracts just the host part of conn.RemoteAddr() — failures
-// are tracked per source IP, not per source port, so opening many
-// connections from the same machine doesn't reset the count.
+// authIP returns the remote IP without the port.
 func authIP(conn net.Conn) string {
 	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
@@ -81,9 +63,7 @@ func authIP(conn net.Conn) string {
 	return host
 }
 
-// checkAuthBan reports whether ip is currently banned. An expired ban
-// is cleared here (lazily, on the next attempt) rather than by a
-// background sweep — simplest correct option at personal-server scale.
+// checkAuthBan also removes expired bans.
 func checkAuthBan(ip string) (until time.Time, banned bool) {
 	authFailures.mu.Lock()
 	defer authFailures.mu.Unlock()
@@ -117,11 +97,8 @@ func recordAuthSuccess(ip string) {
 	delete(authFailures.bannedUntil, ip)
 }
 
-// checkAuth runs the challenge-response handshake if auth is enabled,
-// and returns the caller's authorized name for logging. Call this first
-// thing after Accept, before any protocol-specific logic — an
-// unauthenticated connection shouldn't get far enough to open a SOCKS5
-// tunnel, occupy a droppable session, or relay UDP.
+// checkAuth runs the auth handshake (if enabled) and returns the client
+// name. Must be called right after Accept.
 func checkAuth(conn net.Conn) (name string, ok bool) {
 	if authorizedKeys == nil {
 		return "", true
@@ -143,17 +120,15 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 	return name, true
 }
 
-// dropSession is shared by every connection that presents the same
-// session ID — that's what lets N parallel "duplicate" connections
-// dedupe against each other instead of each pretending every frame
-// it sees is new.
+// dropSession is shared by all connections with the same session ID,
+// so duplicates from parallel paths are detected.
 type dropSession struct {
 	mu         sync.Mutex
 	recv       *frame.Receiver
-	seen       map[uint32]struct{} // distinct frames ever observed, regardless of outcome
+	seen       map[uint32]struct{}
 	accepted   int
-	ttlDropped int // copy-level count — informative, but NOT the real loss rate under multipath
-	duplicates int // arrived after a fresher/earlier copy already won — expected cost of duplication, not loss
+	ttlDropped int // counts copies, not real loss with multipath
+	duplicates int
 }
 
 var dropSessions = struct {
@@ -172,11 +147,9 @@ func getDropSession(id string) *dropSession {
 	return s
 }
 
-// glueSession is shared by all parallel paths carrying the same session
-// ID. The dedup receiver rejects duplicate copies of a frame that
-// arrived on more than one path; udpFlows are the real sockets out to
-// game servers; paths is the set of currently-connected client
-// connections, any/all of which a reply can be duplicated back over.
+// glueSession is shared by all paths with the same session ID.
+// udpFlows are the UDP sockets to game servers, paths are the client
+// connections replies are sent to.
 type glueSession struct {
 	mu       sync.Mutex
 	recv     *frame.Receiver
@@ -185,12 +158,8 @@ type glueSession struct {
 	replySeq uint32
 }
 
-// Each glue path gets its own writer (sched.PathWriter) so one path
-// stuck in a retransmit can't hold up the copies going out on the
-// others. gluePathDepth frames of backlog is ~half a second of typical
-// game traffic; anything older than glueStaleAfter would be discarded
-// as stale by the client's receiver anyway (same 150ms TTL), so it
-// isn't sent at all.
+// Queue size per glue path (~0.5s of game traffic). Older frames would
+// be dropped by the client anyway (150ms TTL).
 const (
 	gluePathDepth  = 32
 	glueStaleAfter = 150 * time.Millisecond
@@ -216,22 +185,17 @@ func getGlueSession(id string) *glueSession {
 	return s
 }
 
-// broadcastPing echoes a measurement ping back over every live path.
+// broadcastPing sends a ping reply to all paths.
 func (s *glueSession) broadcastPing(nonce uint64) {
 	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodePing(nonce)).Marshal() })
 }
 
-// broadcastReply duplicates one reply frame across every currently
-// connected path for this session. Under multipath that's the same
-// loss-hedging in the server->client direction as the client does
-// client->server.
+// broadcastReply sends a reply to all paths.
 func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
 	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodeInbound(flowID, payload)).Marshal() })
 }
 
-// broadcast hands one frame to every path's writer without waiting on
-// any of them. A path whose connection died removes itself: its writer
-// closes the connection, and handleGlueConn's reader exits and cleans up.
+// broadcast doesn't block. Dead paths are removed by handleGlueConn.
 func (s *glueSession) broadcast(build func(seq uint32) []byte) {
 	s.mu.Lock()
 	seq := s.replySeq
@@ -269,7 +233,7 @@ func main() {
 	egressIface := flag.String("egress-iface", cfg.EgressIface, "interface to MASQUERADE full-tunnel VPN egress traffic out of (empty = auto-detect via `ip route get`)")
 	cert := flag.String("cert", config.Str(cfg.Cert, "devcerts/dev.crt"), "TLS cert file")
 	key := flag.String("key", config.Str(cfg.Key, "devcerts/dev.key"), "TLS key file")
-	authorizedKeysFile := flag.String("authorized-keys-file", cfg.AuthorizedKeysFile, "path to authorized_keys.json (Ed25519 public keys allowed to connect) — leave empty to disable auth (NOT recommended for anything reachable from the internet)")
+	authorizedKeysFile := flag.String("authorized-keys-file", cfg.AuthorizedKeysFile, "path to authorized_keys.json, empty = no auth")
 	vpnDownMbps := flag.Float64("vpn-down-mbps", cfg.VPNDownMbps, "cap the vpn channel's server->client rate in Mbit/s, a bit below the client's real download speed (0 = no cap)")
 	flag.String("config", configPath, "path to a JSON config file (server-config.json by default; explicit flags override its values)")
 	flag.Parse()
@@ -296,7 +260,7 @@ func main() {
 		authorizedKeys = keys
 		log.Printf("client authentication enabled (%s)", *authorizedKeysFile)
 	} else {
-		log.Println("!!! WARNING: no -authorized-keys-file/config authorized_keys_file given — this server accepts connections from ANYONE who finds it. It can be used as an open proxy or a UDP relay for amplification attacks. Set one before exposing this to the internet.")
+		log.Println("WARNING: no authorized_keys_file, anyone can connect to this server!")
 	}
 
 	ln, err := transport.Listen(*addr, *cert, *key)
@@ -372,10 +336,8 @@ func main() {
 	}
 }
 
-// handleDroppableConn is deliberately separate from the smux/SOCKS5 path:
-// its own TLS connection, its own accept loop, no shared state. That's
-// the point — a stall on the reliable side must never affect this one,
-// and vice versa.
+// handleDroppableConn uses its own connection, separate from smux, so a
+// stall on one doesn't affect the other.
 func handleDroppableConn(conn net.Conn) {
 	defer conn.Close()
 	name, ok := checkAuth(conn)
@@ -403,7 +365,7 @@ func handleDroppableConn(conn net.Conn) {
 			if total > 0 {
 				lossPct = 100 * float64(lost) / float64(total)
 			}
-			log.Printf("droppable path closed (session %s): %v — session summary so far: %d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
+			log.Printf("droppable path closed (session %s): %v. summary: %d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
 				sid, err, a, total, lost, lossPct, t, d)
 			return
 		}
@@ -489,12 +451,8 @@ func relay(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-// handleGlueConn carries real captured UDP traffic (see internal/glue).
-// Multiple parallel connections can share one session ID (multipath):
-// they join a common glueSession so a frame duplicated across paths is
-// only acted on once, replies fan back out over every live path, and
-// all paths share one real UDP socket per flow. Single-path use (one
-// connection per session) is just the degenerate case.
+// handleGlueConn relays UDP for the client. Several connections can have
+// the same session ID (multipath), they share one glueSession.
 func handleGlueConn(conn net.Conn) {
 	defer conn.Close()
 	name, ok := checkAuth(conn)
@@ -535,10 +493,7 @@ func handleGlueConn(conn net.Conn) {
 			return
 		}
 
-		// Measurement ping: dedup by sequence only (a second copy from
-		// another multipath path), but never by staleness — echo it
-		// straight back over all paths regardless of how old it is, so
-		// the client can report the true RTT instead of a silent drop.
+		// pings: only check duplicates, not age
 		if glue.IsPing(f.Payload) {
 			sess.mu.Lock()
 			ok, _ := sess.recv.AcceptSeq(f)
@@ -554,7 +509,7 @@ func handleGlueConn(conn net.Conn) {
 		ok, _ := sess.recv.Accept(f)
 		sess.mu.Unlock()
 		if !ok {
-			continue // duplicate copy from another path, or stale — already handled
+			continue // duplicate or too old
 		}
 
 		flowID, dst, dstPort, payload, err := glue.DecodeOutbound(f.Payload)
@@ -584,7 +539,7 @@ func handleGlueConn(conn net.Conn) {
 			sess.mu.Unlock()
 			log.Printf("glue: new flow %d -> %s (session %s)", flowID, raddr, sid)
 
-			// One reader per flow, shipping replies back across all paths.
+			// read replies for this flow
 			go func(flowID uint16, uc *net.UDPConn) {
 				buf := make([]byte, 65535)
 				for {

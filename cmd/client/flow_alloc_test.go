@@ -2,13 +2,7 @@ package main
 
 import "testing"
 
-// TestFlowIDCollision is the direct regression test for IDEAS.md's
-// P0 #2: with the old info.SrcPort-only scheme, two flows sharing a
-// source port but going to different destinations (routine for Steam
-// Datagram Relay, which pings many relay POPs from one socket) got the
-// same flow ID, and the server would silently write the second
-// destination's traffic into the first destination's already-connected
-// UDP socket. Keying by the full 4-tuple must give them distinct IDs.
+// Same source port, different destinations -> different IDs.
 func TestFlowIDCollision(t *testing.T) {
 	ids := make(map[flowKey]uint16)
 	var counter uint16
@@ -24,14 +18,11 @@ func TestFlowIDCollision(t *testing.T) {
 	idB := allocFlowID(ids, &counter, keyB)
 
 	if idA == idB {
-		t.Fatalf("two different destinations sharing a source port collided on flow ID %d — this is exactly the bug: traffic for one destination would be written to the other's socket", idA)
+		t.Fatalf("two different destinations sharing a source port got the same flow ID %d", idA)
 	}
 }
 
-// TestFlowIDStable checks the other half of correctness: repeated
-// packets on the same flow (same 4-tuple) must keep resolving to the
-// same ID, or replies would stop matching flows[flowID] on the client
-// and get silently dropped.
+// Same flow should always get the same ID.
 func TestFlowIDStable(t *testing.T) {
 	ids := make(map[flowKey]uint16)
 	var counter uint16
@@ -47,9 +38,6 @@ func TestFlowIDStable(t *testing.T) {
 	}
 }
 
-// TestFlowIDThreeDistinctFlows rounds out the picture: a third,
-// unrelated flow must get its own third ID, not collide with either of
-// the first two.
 func TestFlowIDThreeDistinctFlows(t *testing.T) {
 	ids := make(map[flowKey]uint16)
 	var counter uint16

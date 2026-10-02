@@ -1,6 +1,5 @@
-// Package transport handles the TLS dial/listen side of the tunnel.
-// Later this is where utls fingerprinting (MVP step 4) will slot in —
-// for now it's plain crypto/tls so we can validate the pipe end-to-end.
+// Package transport handles TLS dial/listen for the tunnel.
+// TODO: utls fingerprinting.
 package transport
 
 import (
@@ -16,9 +15,7 @@ import (
 	"strings"
 )
 
-// Listen binds addr and returns a listener that terminates TLS 1.3
-// using the given cert/key pair (PEM files on disk). Every accepted
-// connection has Nagle's algorithm disabled — see Dial's comment.
+// Listen starts a TLS 1.3 listener with the given cert/key files.
 func Listen(addr, certFile, keyFile string) (net.Listener, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -34,13 +31,12 @@ func Listen(addr, certFile, keyFile string) (net.Listener, error) {
 	}
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
-		return tls.NewListener(ln, cfg), nil // shouldn't happen for the "tcp" network, but don't crash if it does
+		return tls.NewListener(ln, cfg), nil
 	}
 	return tls.NewListener(noDelayListener{tcpLn}, cfg), nil
 }
 
-// noDelayListener disables Nagle's algorithm on every accepted
-// connection before it's handed to the TLS layer.
+// noDelayListener turns off Nagle on accepted connections.
 type noDelayListener struct {
 	*net.TCPListener
 }
@@ -55,27 +51,12 @@ func (l noDelayListener) Accept() (net.Conn, error) {
 	return conn, nil
 }
 
-// Dial opens a TLS connection to addr, with Nagle's algorithm disabled
-// on the underlying TCP connection. This project's traffic is bursts of
-// small packets (game actions, individually-framed tunneled packets) —
-// Nagle coalescing them to fill a fuller segment trades throughput
-// efficiency for latency we can't afford, exactly backwards from what a
-// latency-sensitive tunnel wants. Every real-time protocol disables it
-// for the same reason; tls.Dial doesn't expose the underlying
-// net.TCPConn to configure this, so the connection is built by hand.
+// Dial connects with TLS. Nagle is disabled because we send lots of
+// small packets and don't want them delayed (tls.Dial doesn't let us
+// set it, so the TCP connection is created manually).
 //
-// If pin is non-nil, the peer's certificate must match it exactly
-// (SHA-256 of the leaf certificate's DER bytes) or the handshake is
-// aborted; insecureSkipVerify is then moot — a specific pinned
-// certificate is strictly stronger than either CA validation or no
-// validation at all — and only applies when pin is nil. Without a pin,
-// insecureSkipVerify:true (the project's throwaway self-signed dev
-// cert) accepts *any* certificate from *anyone*, which lets a
-// TLS-intercepting middlebox terminate the connection itself and read
-// everything; pinning closes that, since TLS 1.3 (already the minimum
-// version here) requires proving possession of the certificate's
-// private key to complete the handshake — a party without that key
-// cannot complete a handshake presenting the pinned cert, period.
+// If pin is set, the server cert's SHA-256 must match it, otherwise the
+// handshake fails. insecureSkipVerify is only used when pin is nil.
 func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 	rawConn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -88,8 +69,7 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13}
 	if pin != nil {
-		// We do our own verification in VerifyPeerCertificate below,
-		// which is why the default verification is skipped here.
+		// we check the cert ourselves below
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
@@ -113,18 +93,10 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 	return tlsConn, nil
 }
 
-// ResolvePin implements trust-on-first-use (TOFU) pinning, the same
-// model ssh's known_hosts uses: if pinFile already holds a saved
-// fingerprint, it's read back and returned — from then on this is
-// exactly as strict as a manually-entered pin. If pinFile doesn't exist
-// yet, this dials addr once, accepts whatever certificate the server
-// presents (the same exposure insecureSkipVerify:true has, but only for
-// this one bootstrap connection), saves its fingerprint to pinFile, and
-// returns it. Every connection after this point — including the rest of
-// the caller's current run — is then pinned to that fingerprint.
-//
-// To force re-trusting a server (e.g. after regenerating its cert),
-// delete pinFile; the next call repeats the bootstrap step.
+// ResolvePin does trust-on-first-use, like ssh known_hosts. If pinFile
+// exists, the saved fingerprint is returned. Otherwise it connects once,
+// saves the server's cert fingerprint to pinFile and returns it.
+// Delete pinFile to trust a new server cert.
 func ResolvePin(addr, pinFile string) ([]byte, error) {
 	if data, err := os.ReadFile(pinFile); err == nil {
 		pin, err := hex.DecodeString(strings.TrimSpace(string(data)))
@@ -166,10 +138,8 @@ func ResolvePin(addr, pinFile string) ([]byte, error) {
 	return fingerprint, nil
 }
 
-// LoadCertFingerprint reads a PEM certificate file and returns the
-// SHA-256 of its leaf certificate's DER bytes — the value to print at
-// server startup for the user to copy into the client's server_pin
-// config field, and the value Dial's pin parameter is compared against.
+// LoadCertFingerprint returns SHA-256 of the certificate in a PEM file.
+// The server prints it on startup so it can be used as server_pin.
 func LoadCertFingerprint(certFile string) ([]byte, error) {
 	raw, err := os.ReadFile(certFile)
 	if err != nil {

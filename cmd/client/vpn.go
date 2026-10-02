@@ -19,56 +19,33 @@ import (
 	"tcp-dormtun/internal/transport"
 )
 
-// vpnKeepaliveInterval is how often an empty frame goes out when there's
-// no real traffic. Some NATs/firewalls (observed on the dorm network
-// this project targets) silently drop an idle TCP connection carrying no
-// data within a couple of minutes; a small periodic write is enough to
-// keep it classified as active.
+// The dorm network kills idle TCP connections after a few minutes, so we
+// send an empty frame from time to time.
 const vpnKeepaliveInterval = 20 * time.Second
 
-// gameFlowIdleTimeout bounds how long a glue-routed flow's bookkeeping
-// entry survives with no traffic — a long session touching many
-// ephemeral UDP flows would otherwise leak them for its whole lifetime.
-// (Server-side glue session/flow cleanup is a separate, broader gap —
-// see IDEAS.md P1 #7 — this only covers the client-side maps this mode
-// adds.)
+// Game flows with no traffic for this long are removed.
+// TODO: server side doesn't clean up flows yet.
 const gameFlowIdleTimeout = 60 * time.Second
 
-// keepaliveFlow is the scheduler flow keepalive frames travel in — its
-// own tiny flow, so one always goes out promptly even behind a download.
+// keepalives get their own flow so they're not stuck behind a download
 var keepaliveFlow = sched.FlowKey{Proto: 255}
 
-// Per-path writer sizing for multipath glue connections: gluePathDepth
-// frames of backlog is ~half a second of typical game traffic, and a
-// frame older than glueStaleAfter would be discarded by the server's
-// receiver anyway (same 150ms TTL), so it isn't sent at all.
+// Queue size per glue path (~0.5s of game traffic). Older frames would
+// be dropped by the server anyway (150ms TTL).
 const (
 	gluePathDepth  = 32
 	glueStaleAfter = 150 * time.Millisecond
 )
 
-// runVPNMode is the full-tunnel counterpart to runTunMode: it forwards
-// every non-noise IPv4 packet whole, byte-for-byte, over one vpn TLS
-// connection — the server writes each one into its own TUN device and
-// lets the kernel do real routing+NAT, so ordinarily there's no flow
-// bookkeeping or packet rebuild here at all.
+// runVPNMode sends all IPv4 packets from the TUN device to the server,
+// which puts them into its own TUN and does NAT.
 //
-// The exception: if gameProcesses is non-empty, UDP packets whose local
-// source port is currently owned by one of those processes (resolved
-// live via internal/procmap, the Windows IP Helper API) are instead
-// routed through gamePaths parallel glue connections with multipath
-// duplication — the same droppable/multipath mechanism runTunMode uses,
-// which vpn mode's single TCP stream can't offer on its own (a burst of
-// small packets on one TCP connection is exactly the head-of-line-
-// blocking scenario this project's glue channel exists to avoid). With
-// gameProcesses empty, none of this runs and behavior is identical to
-// before — zero cost, fully backward compatible.
+// If gameProcesses is set, UDP from those processes goes through the
+// glue channel instead (several parallel connections with duplication),
+// to avoid head-of-line blocking on the single vpn connection.
 //
-// Nothing in the TUN read loop below ever waits on the network: vpn
-// packets go into a fair queue (internal/sched) drained by their own
-// writer goroutine, and game packets go to per-path writers. Before, one
-// loop wrote synchronously to the vpn socket, so an upload filling that
-// socket stalled game packets that weren't even headed for it.
+// The TUN read loop never blocks on the network: vpn packets go to the
+// scheduler, game packets go to the path writers.
 func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu int, key []byte, glueAddr string, gameProcesses []string, gamePaths int, upMbps float64) {
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
@@ -78,10 +55,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 	actualName, _ := dev.Name()
 	log.Printf("TUN interface up: %s (requested %q, mtu %d)", actualName, tunName, mtu)
 
-	// Shared across the vpn reply reader and any glue reply readers
-	// below — wintun's Write (AllocateSendPacket + SendPacket as two
-	// separate calls) has no documented guarantee of being safe for
-	// concurrent callers, so serialize rather than assume.
+	// not sure wintun's Write is safe for concurrent use, so lock it
 	var devMu sync.Mutex
 	devWrite := func(pkt []byte) {
 		devMu.Lock()
@@ -121,7 +95,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 				log.Fatalf("vpn: connection closed: %v", err)
 			}
 			if len(f.Payload) == 0 {
-				continue // peer keepalive, not a packet
+				continue // keepalive
 			}
 			devWrite(f.Payload)
 		}
@@ -155,7 +129,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		}
 	}()
 
-	// --- optional: selective multipath for matched game processes' UDP ---
+	// game traffic over glue (only if game_processes is set)
 
 	gameTraffic := len(gameProcesses) > 0
 	var (
@@ -177,8 +151,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		glueSeqMu.Unlock()
 		return v
 	}
-	// Each path has its own writer, so a path stuck in a retransmit
-	// can't delay the copy going out on the others.
+	// each path has its own writer so a slow path doesn't block the others
 	writeAllGluePaths := func(wire []byte) {
 		for _, w := range glueWriters {
 			w.Send(wire)
@@ -216,14 +189,12 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		}
 		defer func() {
 			for _, w := range glueWriters {
-				w.Close() // also closes the connection
+				w.Close()
 			}
 		}()
 		log.Printf("connected to glue channel %s over %d path(s) for: %s", glueAddr, gamePaths, strings.Join(gameProcesses, ", "))
 
-		// Replies come back duplicated across every glue path, so a
-		// receiver dedupes them here before reinjecting — same pattern
-		// runTunMode uses for its own glue reply path.
+		// replies come on every path, drop the duplicates
 		replyRecv := frame.NewReceiver(150 * time.Millisecond)
 		var replyMu sync.Mutex
 		for _, c := range glueConns {
@@ -234,10 +205,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 						log.Printf("glue: path closed: %v", err)
 						return
 					}
-					// Measurement/keepalive ping echo — bypasses the TTL/dedup
-					// receiver entirely (see internal/frame's AcceptSeq), same
-					// as runTunMode: a late reply is exactly what a real
-					// measurement would want to see, not something to drop.
+					// ping reply
 					if _, isPing := glue.DecodePing(f.Payload); isPing {
 						continue
 					}
@@ -246,7 +214,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 					ok, _ := replyRecv.Accept(f)
 					replyMu.Unlock()
 					if !ok {
-						continue // duplicate copy from another path
+						continue // duplicate
 					}
 
 					flowID, payload, err := glue.DecodeInbound(f.Payload)
@@ -264,9 +232,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 			}(c)
 		}
 
-		// Keepalive on the glue paths too — the same idle-connection
-		// timeout risk already guarded against on the vpn connection
-		// above applies here between game-action bursts.
+		// keepalive for glue paths too
 		go func() {
 			ticker := time.NewTicker(vpnKeepaliveInterval)
 			defer ticker.Stop()
@@ -307,7 +273,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		}()
 	}
 
-	log.Println("waiting for outbound traffic to tunnel — bring the interface up and set it as the default route")
+	log.Println("waiting for packets, set up the interface and default route")
 
 	batch := dev.BatchSize()
 	bufs := make([][]byte, batch)
@@ -324,7 +290,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 		for i := 0; i < n; i++ {
 			info, ok := pktfilter.Parse(bufs[i][:sizes[i]])
 			if !ok || info.Noise || info.Version != 4 {
-				continue // local discovery noise, or IPv6 (not forwarded in Phase 1)
+				continue // noise or IPv6
 			}
 
 			if gameTraffic && info.Proto == 17 {
@@ -350,7 +316,7 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 			}
 
 			pkt := bufs[i][:sizes[i]]
-			// Marshal copies pkt, so bufs can be reused on the next Read.
+			// Marshal copies pkt
 			vq.Enqueue(sched.FlowOf(pkt), frame.New(nextSeq(), pkt).Marshal())
 		}
 	}

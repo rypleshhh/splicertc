@@ -1,7 +1,5 @@
-// Package socks5 implements just enough of the SOCKS5 protocol (RFC 1928)
-// to sit at the client edge: no-auth handshake, CONNECT command only.
-// This is what apps like Steam/curl/a browser configured to use a SOCKS5
-// proxy will actually speak to us.
+// Package socks5 is a minimal SOCKS5 server (RFC 1928): no auth,
+// CONNECT only.
 package socks5
 
 import (
@@ -21,9 +19,7 @@ const (
 	atypIPv6   = 0x04
 )
 
-// Handshake performs SOCKS5 method negotiation, always selecting
-// "no authentication required" — dev-stage simplification, revisit
-// if the tunnel ever needs to gate who can use the local proxy.
+// Handshake does method negotiation. Always picks "no auth".
 func Handshake(conn net.Conn) error {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -96,12 +92,11 @@ func ReadRequest(conn net.Conn) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
-// WriteReply sends the SOCKS5 reply. Bound address/port are zeroed out —
-// fine for a CONNECT-only proxy, most clients never inspect them.
+// WriteReply sends the reply. Bound address is just zeros.
 func WriteReply(conn net.Conn, success bool) error {
 	rep := byte(0x00)
 	if !success {
-		rep = 0x01 // general failure — good enough at this stage
+		rep = 0x01 // general failure
 	}
 	reply := []byte{version5, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
 	_, err := conn.Write(reply)

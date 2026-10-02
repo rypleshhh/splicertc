@@ -29,8 +29,7 @@ func TestLossCounted(t *testing.T) {
 	s.OnSend(2) // never answered
 	s.OnRecv(1)
 
-	// nonce 2 is still outstanding; with a tiny timeout it should count
-	// as lost.
+	// nonce 2 had no reply, should count as lost
 	time.Sleep(10 * time.Millisecond)
 	sum := s.Snapshot(5 * time.Millisecond)
 	if sum.Sent != 2 || sum.Received != 1 {
@@ -45,7 +44,7 @@ func TestDuplicateEchoIgnored(t *testing.T) {
 	s := New()
 	s.OnSend(7)
 	s.OnRecv(7)
-	s.OnRecv(7) // duplicate copy arriving via a second path
+	s.OnRecv(7) // duplicate
 
 	sum := s.Snapshot(time.Second)
 	if sum.Received != 1 {

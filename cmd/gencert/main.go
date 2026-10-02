@@ -1,12 +1,5 @@
-// Command gencert writes a self-signed TLS cert/key pair to devcerts/.
-// Run it once and keep the result — the tunnel's own client-side pinning
-// (server_pin/pin_file) is what actually authenticates the server, not
-// this cert's chain, so there's no need to regenerate it regularly; in
-// fact regenerating it changes its fingerprint and breaks every existing
-// client's pin until they update it. For a real deployment, generate
-// this once and mount the resulting devcerts/ into the server container
-// as a persistent volume (see docker-compose.yml) instead of letting the
-// Docker build regenerate a fresh one on every rebuild.
+// Command gencert writes a self-signed cert to devcerts/. Generate it once,
+// a new cert breaks the clients' pinned fingerprint.
 package main
 
 import (
@@ -38,13 +31,7 @@ func main() {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "localhost"},
 		NotBefore:    time.Now(),
-		// Long-lived on purpose: this project's client never does normal
-		// chain/expiry validation against this cert (see transport.Dial's
-		// pin path and -insecure) — it's checked only by exact fingerprint
-		// match or not checked at all. A short expiry would add nothing
-		// here and would be one more reason to regenerate (and thereby
-		// change the fingerprint, breaking every client's server_pin/
-		// pin_file) for no security benefit.
+		// 10 years, clients only check the fingerprint anyway
 		NotAfter:    time.Now().Add(10 * 365 * 24 * time.Hour),
 		DNSNames:    []string{"localhost"},
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},

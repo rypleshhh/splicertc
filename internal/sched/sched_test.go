@@ -8,9 +8,7 @@ import (
 	"time"
 )
 
-// ipv4 builds a minimal IPv4 packet of total length size (>= 28) with
-// the given protocol, addresses and ports, and optional flags/fragment
-// offset word.
+// ipv4 builds a test IPv4 packet with the given header fields.
 func ipv4(proto byte, src, dst [4]byte, sport, dport uint16, size int, fragWord uint16) []byte {
 	if size < 28 {
 		size = 28
@@ -40,7 +38,7 @@ func TestFlowOf(t *testing.T) {
 	if udp.SrcPort != 27015 || udp.DstPort != 27016 {
 		t.Errorf("UDP ports wrong: %+v", udp)
 	}
-	// First fragment (MF set) and a later fragment must share one key.
+	// all fragments of one datagram should get the same key
 	first := FlowOf(ipv4(17, ipA, ipB, 1111, 2222, 60, 0x2000))
 	later := FlowOf(ipv4(17, ipA, ipB, 0x4142, 0x4344, 60, 0x0010))
 	if first != later || first.SrcPort != 0 {
@@ -80,9 +78,7 @@ func pkt(tag byte, size int) []byte {
 	return b
 }
 
-// TestSparseFlowJumpsBacklog is the core property: once a bulk flow has
-// been backlogged, a packet from a flow that just became active goes out
-// next instead of waiting behind the whole backlog.
+// A new small flow should go out before a backlogged bulk flow.
 func TestSparseFlowJumpsBacklog(t *testing.T) {
 	s, _ := newTestSched(Config{})
 	bulk := FlowKey{Proto: 6, SrcPort: 1}
@@ -97,7 +93,7 @@ func TestSparseFlowJumpsBacklog(t *testing.T) {
 	s.Enqueue(game, pkt('G', 120))
 
 	if got := mustDequeue(t, s); got[0] != 'G' {
-		t.Fatalf("expected the game packet next, got a %q packet — sparse flow waited behind the backlog", got[0])
+		t.Fatalf("expected the game packet next, got %q", got[0])
 	}
 }
 
@@ -119,8 +115,7 @@ func TestPerFlowOrderPreserved(t *testing.T) {
 	}
 }
 
-// TestBulkFlowsShareFairly: two continuously backlogged flows get
-// roughly equal bytes, whatever their packet sizes.
+// Two bulk flows should get about the same number of bytes.
 func TestBulkFlowsShareFairly(t *testing.T) {
 	s, _ := newTestSched(Config{})
 	big := FlowKey{Proto: 6, SrcPort: 1}
@@ -160,17 +155,13 @@ func TestOverflowDropsFromFattestFlow(t *testing.T) {
 	}
 }
 
-// TestCodelDropsStandingQueue: a queue that stays well above target for
-// longer than an interval gets packets dropped; one that drains quickly
-// doesn't.
 func TestCodelDropsStandingQueue(t *testing.T) {
 	s, clk := newTestSched(Config{})
 	bulk := FlowKey{Proto: 6, SrcPort: 1}
 	for i := 0; i < 300; i++ {
 		s.Enqueue(bulk, pkt('B', 1400))
 	}
-	// Drain slowly: 2ms per packet, so every packet waits far longer
-	// than the 5ms target, for much longer than the 100ms interval.
+	// drain slowly so packets wait longer than target
 	for i := 0; i < 200; i++ {
 		clk.advance(2 * time.Millisecond)
 		s.mu.Lock()
@@ -264,7 +255,7 @@ func TestShaperPacesToRate(t *testing.T) {
 		sh.Wait(1000)
 	}
 	elapsed := clk.t.Sub(start)
-	// One second of data, minus the initial burst allowance.
+	// should take about 1s (minus the initial burst)
 	if elapsed < 950*time.Millisecond || elapsed > 1050*time.Millisecond {
 		t.Fatalf("1 MB at 1 MB/s took %v, want ~1s", elapsed)
 	}
@@ -278,8 +269,6 @@ func TestNilShaperIsUnlimited(t *testing.T) {
 	}
 }
 
-// TestPathWriterStalledPathNeverBlocks: a path whose peer never reads
-// must not make Send block — that's the whole point of it.
 func TestPathWriterStalledPathNeverBlocks(t *testing.T) {
 	stalled, other := net.Pipe() // nobody reads `other`: every Write blocks
 	defer other.Close()
@@ -343,8 +332,7 @@ func TestPathWriterSkipsStaleFrames(t *testing.T) {
 	pw := NewPathWriter(a, 8, 10*time.Millisecond)
 	defer pw.Close()
 
-	// Block the writer on a first frame nobody reads yet, queue more
-	// behind it, let them go stale, then start reading.
+	// first frame blocks the writer, 2 and 3 get old in the queue
 	pw.Send([]byte{1})
 	time.Sleep(5 * time.Millisecond)
 	pw.Send([]byte{2})

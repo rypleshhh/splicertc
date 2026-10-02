@@ -19,9 +19,7 @@ import (
 	"time"
 )
 
-// selfSignedCert builds a throwaway self-signed cert/key pair, the same
-// shape cmd/gencert produces, entirely in memory (no disk, no
-// dependency on the gencert binary).
+// selfSignedCert makes an in-memory self-signed cert for tests.
 func selfSignedCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -54,9 +52,7 @@ func fingerprintOf(cert tls.Certificate) []byte {
 	return sum[:]
 }
 
-// listenWith starts a bare TLS listener presenting cert, and returns
-// its address. Not transport.Listen (which reads cert/key from disk) —
-// this test builds certs in memory instead.
+// listenWith starts a TLS listener with cert and returns its address.
 func listenWith(t *testing.T, cert tls.Certificate) string {
 	t.Helper()
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
@@ -75,10 +71,7 @@ func listenWith(t *testing.T, cert tls.Certificate) string {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				// crypto/tls's handshake is lazy (happens on first
-				// Read/Write) — force it to complete server-side before
-				// this connection can be closed out from under a client
-				// that's still mid-handshake itself.
+				// finish the handshake before closing, it's lazy in crypto/tls
 				if tc, ok := c.(*tls.Conn); ok {
 					_ = tc.Handshake()
 				}
@@ -89,8 +82,6 @@ func listenWith(t *testing.T, cert tls.Certificate) string {
 	return ln.Addr().String()
 }
 
-// TestDialAcceptsPinnedCert proves the ordinary, expected path: dialing
-// with the real server's own fingerprint as the pin succeeds.
 func TestDialAcceptsPinnedCert(t *testing.T) {
 	certA := selfSignedCert(t)
 	addr := listenWith(t, certA)
@@ -102,18 +93,10 @@ func TestDialAcceptsPinnedCert(t *testing.T) {
 	conn.Close()
 }
 
-// TestDialRejectsWrongCert is the direct regression test for IDEAS.md's
-// P0 #3: it simulates a MITM by pointing the client's pin (for the real
-// server's cert A) at a *different* listener presenting cert B — the
-// same shape a TLS-intercepting middlebox would have, since it can't
-// produce a certificate matching cert A's fingerprint without cert A's
-// private key. Without pinning (plain insecure:true, tested for
-// contrast below) this would silently succeed; with pinning it must
-// fail the handshake outright, proving a party without the pinned
-// cert's private key cannot complete a connection under that pin.
+// Pin is for cert A but the server has cert B (like a MITM) - must fail.
 func TestDialRejectsWrongCert(t *testing.T) {
 	certA := selfSignedCert(t)
-	certB := selfSignedCert(t) // stands in for a MITM's own certificate
+	certB := selfSignedCert(t) // MITM cert
 	addrB := listenWith(t, certB)
 
 	_, err := Dial(addrB, false, fingerprintOf(certA))
@@ -122,13 +105,7 @@ func TestDialRejectsWrongCert(t *testing.T) {
 	}
 }
 
-// TestDialInsecureWithoutPinAcceptsAnything documents the pre-pinning
-// behavior this fix is meant to close: with pin == nil, insecure:true
-// still accepts any certificate at all — the exact gap a MITM exploits.
-// This isn't asserting new behavior, just pinning down (no pun
-// intended) that the old insecure-only path is unchanged and still
-// opt-in, so pin is additive rather than a silent behavior change for
-// existing configs that don't set it.
+// Without a pin, insecure mode accepts any cert.
 func TestDialInsecureWithoutPinAcceptsAnything(t *testing.T) {
 	certB := selfSignedCert(t)
 	addrB := listenWith(t, certB)
@@ -140,10 +117,6 @@ func TestDialInsecureWithoutPinAcceptsAnything(t *testing.T) {
 	conn.Close()
 }
 
-// TestResolvePinSavesOnFirstUse proves the bootstrap step: with no pin
-// file yet, ResolvePin accepts whatever certificate the server presents
-// and persists its fingerprint to disk in the same hex form Dial's pin
-// parameter expects.
 func TestResolvePinSavesOnFirstUse(t *testing.T) {
 	cert := selfSignedCert(t)
 	addr := listenWith(t, cert)
@@ -170,11 +143,7 @@ func TestResolvePinSavesOnFirstUse(t *testing.T) {
 	}
 }
 
-// TestResolvePinReadsSavedFileWithoutRedialing proves the second-use
-// path reads the already-saved fingerprint back rather than
-// re-bootstrapping: it points addr at a closed port, so any attempt to
-// actually dial would fail, yet ResolvePin still succeeds because it
-// only needed to read the file.
+// If the pin file exists ResolvePin shouldn't connect at all.
 func TestResolvePinReadsSavedFileWithoutRedialing(t *testing.T) {
 	cert := selfSignedCert(t)
 	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
@@ -192,11 +161,7 @@ func TestResolvePinReadsSavedFileWithoutRedialing(t *testing.T) {
 	}
 }
 
-// TestResolvePinThenDialDetectsCertChange is the end-to-end TOFU
-// regression: trust a server on first contact, then simulate that
-// server's cert changing later (cert rotation, or a MITM stepping in)
-// and prove the saved pin still rejects it via the normal Dial path —
-// the same guarantee a manually-entered server_pin gives.
+// After TOFU, a different cert must be rejected.
 func TestResolvePinThenDialDetectsCertChange(t *testing.T) {
 	certA := selfSignedCert(t)
 	addrA := listenWith(t, certA)
@@ -207,7 +172,7 @@ func TestResolvePinThenDialDetectsCertChange(t *testing.T) {
 		t.Fatalf("ResolvePin (first use): %v", err)
 	}
 
-	certB := selfSignedCert(t) // stands in for a rotated cert or a MITM
+	certB := selfSignedCert(t)
 	addrB := listenWith(t, certB)
 
 	if _, err := Dial(addrB, false, pin); err == nil {

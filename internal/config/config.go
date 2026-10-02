@@ -1,8 +1,5 @@
-// Package config loads optional JSON settings files for the server and
-// client binaries. A config file is entirely optional — every field in
-// it just seeds that flag's default, so an explicit CLI flag always
-// wins, and a missing config file falls back to today's pure-flags
-// behavior unchanged.
+// Package config loads the JSON config files. Values from the file are
+// used as flag defaults, so command line flags still override them.
 package config
 
 import (
@@ -11,9 +8,7 @@ import (
 	"os"
 )
 
-// Load reads path as JSON into v. A missing file is reported via found
-// == false, not an error — the caller treats that as "no config, use
-// flag defaults" rather than failing to start.
+// Load reads a JSON file into v. Missing file is not an error, found is false.
 func Load(path string, v any) (found bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -28,12 +23,8 @@ func Load(path string, v any) (found bool, err error) {
 	return true, nil
 }
 
-// FindFlag manually scans args for -name/--name (space- or
-// =-separated) and returns its value. Used only to read -config itself
-// before the real flag.FlagSet exists to seed other flags' defaults —
-// flag.Parse can't do this because all flags must be defined up front,
-// and a throwaway FlagSet would abort on the first *other* flag it
-// doesn't recognize.
+// FindFlag gets the value of -name from args by hand. We need -config
+// before flag.Parse because the config sets the other flags' defaults.
 func FindFlag(args []string, name string) string {
 	long := "--" + name
 	short := "-" + name
@@ -61,8 +52,7 @@ func cutPrefix(s, prefix string) (string, bool) {
 	return "", false
 }
 
-// Str returns cfgVal if non-empty, else fallback — for seeding a flag's
-// default from an optional config field.
+// Str returns cfgVal, or fallback if it's empty.
 func Str(cfgVal, fallback string) string {
 	if cfgVal != "" {
 		return cfgVal

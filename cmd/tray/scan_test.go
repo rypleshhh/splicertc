@@ -36,7 +36,7 @@ func TestScanForConnectedReportsFalseWhenStreamEndsFirst(t *testing.T) {
 	select {
 	case ok := <-ch:
 		if ok {
-			t.Fatal("expected false — the stream ended without the connected marker ever appearing")
+			t.Fatal("expected false, there was no marker")
 		}
 	default:
 		t.Fatal("expected a result on connectedCh, got none")
@@ -44,8 +44,7 @@ func TestScanForConnectedReportsFalseWhenStreamEndsFirst(t *testing.T) {
 }
 
 func TestScanForConnectedIgnoresPartialMatchAcrossLines(t *testing.T) {
-	// The marker text split across two separate log lines must not
-	// falsely trigger — scanForConnected checks per completed line.
+	// marker split over two lines should not match
 	r := strings.NewReader("connected to vpn\nchannel 1.2.3.4:587\n")
 	ch := make(chan bool, 1)
 	scanForConnected(r, ch)
@@ -53,7 +52,7 @@ func TestScanForConnectedIgnoresPartialMatchAcrossLines(t *testing.T) {
 	select {
 	case ok := <-ch:
 		if ok {
-			t.Fatal("expected false — the marker text was split across two lines, neither of which contains it whole")
+			t.Fatal("expected false, marker is split over two lines")
 		}
 	default:
 		t.Fatal("expected a result on connectedCh, got none")
@@ -78,10 +77,7 @@ func TestContainsConnected(t *testing.T) {
 	}
 }
 
-// TestScanForConnectedDoesNotBlockOnUnbufferedChannel is a light
-// concurrency sanity check: connectedCh is typically buffered size 1 in
-// real use (two goroutines, stdout and stderr, both racing to report),
-// but scanForConnected must not deadlock even if the receiver is slow.
+// scanForConnected must not block if nobody reads the channel.
 func TestScanForConnectedDoesNotBlockOnUnbufferedChannel(t *testing.T) {
 	r := strings.NewReader("connected to vpn channel 1.2.3.4:587\n")
 	ch := make(chan bool, 1)
@@ -95,6 +91,6 @@ func TestScanForConnectedDoesNotBlockOnUnbufferedChannel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("scanForConnected did not return in time — possible deadlock on a full/unread channel")
+		t.Fatal("scanForConnected blocked")
 	}
 }

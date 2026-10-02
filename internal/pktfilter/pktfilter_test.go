@@ -2,13 +2,11 @@ package pktfilter
 
 import "testing"
 
-// buildIPv4UDP constructs a minimal, valid IPv4+UDP packet for testing —
-// just enough header for Parse to work, no real checksum (Parse doesn't
-// check it).
+// buildIPv4UDP makes a test packet, checksum is not set.
 func buildIPv4UDP(src, dst [4]byte, srcPort, dstPort uint16) []byte {
 	pkt := make([]byte, 28) // 20 IP + 8 UDP, no payload
-	pkt[0] = 0x45           // version 4, IHL 5 (20 bytes)
-	pkt[9] = 17             // protocol UDP
+	pkt[0] = 0x45           // IPv4
+	pkt[9] = 17             // UDP
 	copy(pkt[12:16], src[:])
 	copy(pkt[16:20], dst[:])
 	pkt[20] = byte(srcPort >> 8)
@@ -55,8 +53,7 @@ func TestNetbiosIsNoise(t *testing.T) {
 }
 
 func TestSubnetBroadcastIsNoise(t *testing.T) {
-	// Not a well-known port, but the destination is a subnet broadcast —
-	// should still be caught.
+	// broadcast address should be noise even on a normal port
 	pkt := buildIPv4UDP([4]byte{10, 99, 0, 1}, [4]byte{10, 99, 0, 255}, 12345, 54321)
 	info, ok := Parse(pkt)
 	if !ok {
@@ -68,10 +65,7 @@ func TestSubnetBroadcastIsNoise(t *testing.T) {
 }
 
 func TestPublicAddressEndingIn255IsNotNoise(t *testing.T) {
-	// Full-tunnel VPN mode runs this classifier against every
-	// internet-bound destination, not just a hand-picked local subnet —
-	// a real public server whose IP happens to end in .255 must not be
-	// silently dropped as if it were a subnet broadcast.
+	// public IP ending in .255 is not a broadcast
 	pkt := buildIPv4UDP([4]byte{10, 66, 0, 2}, [4]byte{203, 0, 113, 255}, 54321, 27015)
 	info, ok := Parse(pkt)
 	if !ok {

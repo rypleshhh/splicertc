@@ -16,25 +16,18 @@ import (
 	"tcp-dormtun/internal/sched"
 )
 
-// currentVPN is the single registered full-tunnel peer. This is a
-// personal VPN, not multi-tenant — a new connection simply evicts
-// whatever was previously registered, matching how a personal
-// WireGuard-style endpoint behaves.
+// Only one vpn client at a time, a new one replaces the old one.
 var (
 	vpnMu      sync.Mutex
 	currentVPN *vpnPeer
 	vpnSeq     uint32
 
-	// vpnDownRate is the server->client shaping rate in Mbit/s (0 = off),
-	// set once from config at startup.
+	// Mbit/s, 0 = no limit
 	vpnDownRate float64
 )
 
-// vpnPeer pairs a client connection with the queue feeding it. The TUN
-// reader only ever enqueues (never blocks on the network), and one
-// writer goroutine drains the queue into the connection — so the order
-// packets leave in is decided by sched's fair queueing, not by whatever
-// happened to be written first into a socket buffer.
+// vpnPeer is a client connection plus its send queue. The TUN reader
+// only puts packets in the queue, writeLoop sends them.
 type vpnPeer struct {
 	conn net.Conn
 	q    *sched.Scheduler
@@ -50,16 +43,13 @@ func (p *vpnPeer) writeLoop() {
 		shaper.Wait(len(wire))
 		if _, err := p.conn.Write(wire); err != nil {
 			log.Printf("vpn: write to client failed: %v", err)
-			p.conn.Close() // unblocks handleVPNConn's reader, which cleans up
+			p.conn.Close() // handleVPNConn will clean up
 			return
 		}
 	}
 }
 
-// logQueueDrops reports, every 30s and only when something happened,
-// how many packets the queue dropped — the visible sign that a bulk
-// transfer was outrunning the link and got slowed down instead of
-// building a queue everything else would have to wait behind.
+// logQueueDrops logs queue drops every 30s (if there were any).
 func logQueueDrops(name string, q *sched.Scheduler, done <-chan struct{}) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -88,10 +78,8 @@ func nextVPNSeq() uint32 {
 	return v
 }
 
-// setupVPNTun creates the server's own TUN device, addresses it, brings
-// it up, enables IPv4 forwarding, and installs idempotent iptables rules
-// so packets routed onto that device reach the real internet and back.
-// Linux-only — the server always runs on the VPS.
+// setupVPNTun creates and configures the server TUN device and the NAT
+// rules. Linux only.
 func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (dev tun.Device, serverIP, clientIP net.IP, actualName string, err error) {
 	dev, err = tun.CreateTUN(name, mtu)
 	if err != nil {
@@ -122,19 +110,14 @@ func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (dev tun.
 		return nil, nil, nil, "", fmt.Errorf("ip link set up: %w", err)
 	}
 
-	// Docker remounts /proc/sys read-only inside the container by
-	// default (independent of capabilities — only --privileged lifts
-	// it), and network sysctls aren't settable via `--sysctl` under
-	// network_mode: host anyway. So this is a host-level prerequisite,
-	// not something the container can fix itself: check it, and fail
-	// with an actionable message instead of trying to write it.
+	// can't set this from inside docker, /proc/sys is read-only there
 	if cur, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err != nil {
 		dev.Close()
 		return nil, nil, nil, "", fmt.Errorf("read ip_forward: %w", err)
 	} else if strings.TrimSpace(string(cur)) != "1" {
 		dev.Close()
 		return nil, nil, nil, "", fmt.Errorf(
-			"net.ipv4.ip_forward is not enabled on the host — run this on the VPS host (not in the container) and retry:\n" +
+			"net.ipv4.ip_forward is off, run on the host (not in docker):\n" +
 				"  sudo sysctl -w net.ipv4.ip_forward=1\n" +
 				"  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-dormtun.conf")
 	}
@@ -158,9 +141,7 @@ func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (dev tun.
 	return dev, serverIP, clientIP, actualName, nil
 }
 
-// detectEgressIface asks the kernel what interface it would use to reach
-// the public internet — the same info `ip route get` reports
-// interactively. Typical output:
+// detectEgressIface parses `ip route get 8.8.8.8`, e.g.:
 //
 //	8.8.8.8 via 203.0.113.1 dev eth0 src 203.0.113.5 uid 0
 func detectEgressIface() (string, error) {
@@ -177,25 +158,15 @@ func detectEgressIface() (string, error) {
 	return "", fmt.Errorf("could not parse egress interface from: %q", string(out))
 }
 
-// iptablesRule is one rule expressed as its own check (exit 0 = already
-// present) and add invocation, kept as separate literals rather than
-// derived from one another so the args stay easy to read and verify.
+// iptablesRule has the args to check a rule (-C) and to add it.
 type iptablesRule struct {
 	check, add []string
 }
 
-// ensureIptables adds the MASQUERADE + FORWARD + MSS-clamp rules this
-// tunnel needs, skipping any that are already present so restarting the
-// server never duplicates rules.
+// ensureIptables adds NAT, FORWARD and MSS clamp rules if they're not
+// there yet.
 func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
-	// MASQUERADE is the one rule that's fatal if it can't be applied —
-	// without it there's no NAT and the VPN can't work at all. The rest
-	// (FORWARD/DOCKER-USER accept rules, MSS clamping) are best-effort:
-	// their absence usually just means "the host's default FORWARD
-	// policy already accepts everything" or "no Docker-managed chain
-	// exists here" — worth a loud warning, not worth crash-looping the
-	// entire server (which would also take down the unrelated reliable/
-	// droppable/glue channels).
+	// without MASQUERADE nothing works, the other rules are optional
 	masquerade := iptablesRule{
 		check: []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
 		add:   []string{"-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
@@ -207,15 +178,8 @@ func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
 	}
 
 	rules := []iptablesRule{
-		// Docker manages the FORWARD chain itself (DOCKER-USER then
-		// DOCKER-FORWARD jumps, ahead of anything we append to FORWARD
-		// directly) and typically defaults FORWARD's policy to DROP —
-		// an ACCEPT rule appended to FORWARD can be dead code if
-		// DOCKER-FORWARD already terminates the packet first. DOCKER-USER
-		// is the chain Docker documents specifically for user rules that
-		// must run before its own logic, so put the real ACCEPT rules
-		// there (inserted at the top, not appended, so nothing already in
-		// that chain can shadow them).
+		// docker sets FORWARD policy to DROP, our rules have to go into
+		// DOCKER-USER which is checked first
 		{
 			check: []string{"-C", "DOCKER-USER", "-i", tunIface, "-j", "ACCEPT"},
 			add:   []string{"-I", "DOCKER-USER", "1", "-i", tunIface, "-j", "ACCEPT"},
@@ -224,9 +188,7 @@ func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
 			check: []string{"-C", "DOCKER-USER", "-o", tunIface, "-j", "ACCEPT"},
 			add:   []string{"-I", "DOCKER-USER", "1", "-o", tunIface, "-j", "ACCEPT"},
 		},
-		// Belt-and-suspenders for non-Docker hosts (no DOCKER-USER chain,
-		// plain FORWARD policy DROP) — harmless no-op where DOCKER-USER
-		// already accepted the packet.
+		// for hosts without docker
 		{
 			check: []string{"-C", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
 			add:   []string{"-A", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
@@ -242,10 +204,10 @@ func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
 	}
 	for _, r := range rules {
 		if err := run("iptables", r.check...); err == nil {
-			continue // already present
+			continue
 		}
 		if err := run("iptables", r.add...); err != nil {
-			log.Printf("vpn: WARNING: iptables %v failed (%v) — full-tunnel traffic through %s may be dropped by the host's own FORWARD policy; check manually", r.add, err, tunIface)
+			log.Printf("vpn: WARNING: iptables %v failed (%v), traffic on %s may be dropped", r.add, err, tunIface)
 		}
 	}
 	return nil
@@ -259,20 +221,10 @@ func run(name string, args ...string) error {
 	return nil
 }
 
-// vpnTunReader is the single reader for the server's TUN device. Every
-// packet the kernel routes back onto this interface (real replies from
-// the internet, un-MASQUERADE'd back to the tunnel subnet) goes to
-// whoever is currently the registered VPN client.
+// vpnTunReader reads replies from the TUN device and queues them for the
+// current client.
 func vpnTunReader(dev tun.Device) {
-	// Linux enables GRO/offload on the TUN device whenever the kernel
-	// supports it (tun.CreateTUN does this unconditionally — see
-	// setupVPNTun), which means a single Read can hand back a
-	// GRO-coalesced "superpacket" from a real TCP flow well past the
-	// interface MTU — wireguard-go's own internal read buffer reserves
-	// a full 65535 bytes for exactly this. Sizing ours at mtu+32 (fine
-	// on Windows/wintun, which never coalesces) would make Read fail
-	// with "overflows bufs element" on the first sufficiently bulky
-	// download/page load, and that error is currently fatal below.
+	// with GRO a read can be bigger than MTU
 	const maxReadSize = 65535 + 64
 	batch := dev.BatchSize()
 	bufs := make([][]byte, batch)
@@ -293,15 +245,13 @@ func vpnTunReader(dev tun.Device) {
 		}
 		for i := 0; i < n; i++ {
 			pkt := bufs[i][:sizes[i]]
-			// Marshal copies pkt, so bufs can be reused on the next Read.
+			// Marshal copies pkt
 			peer.q.Enqueue(sched.FlowOf(pkt), frame.New(nextVPNSeq(), pkt).Marshal())
 		}
 	}
 }
 
-// handleVPNConn is the accept-loop handler for the full-tunnel channel.
-// Deliberately no session ID handshake (unlike handleDroppableConn/
-// handleGlueConn) — there's exactly one logical VPN peer.
+// handleVPNConn handles one vpn client connection.
 func handleVPNConn(conn net.Conn, dev tun.Device) {
 	defer conn.Close()
 	name, ok := checkAuth(conn)
@@ -341,7 +291,7 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 			return
 		}
 		if len(f.Payload) == 0 {
-			continue // client keepalive, not a packet
+			continue // keepalive
 		}
 		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)
@@ -349,16 +299,8 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 	}
 }
 
-// virtioHdrLen mirrors the size of wireguard-go's internal (unexported)
-// virtioNetHdr struct — 6 fields, all uint8/uint16, no padding, 10
-// bytes. On Linux, tun.CreateTUN enables IFF_VNET_HDR whenever the
-// kernel's TUN driver supports it, and Write then requires this many
-// bytes of header room before the packet even when no offload is in use
-// (an all-zero header, which is what withVirtioHdr produces, means "no
-// offload" — exactly what a plain passthrough packet needs). Harmless
-// on the rarer kernel that lacks IFF_VNET_HDR support too: Write treats
-// the offset as a plain data-start index in that case, and the packet
-// still begins at bufs[0][virtioHdrLen:] either way.
+// On Linux wireguard-go's TUN wants a 10 byte virtio header before the
+// packet. All zeros = no offload.
 const virtioHdrLen = 10
 
 func withVirtioHdr(payload []byte) []byte {

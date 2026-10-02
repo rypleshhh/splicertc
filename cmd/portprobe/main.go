@@ -1,13 +1,7 @@
-// portprobe answers one question: which ports actually get through the
-// network you're sitting in. The server binds a whole list of TCP and
-// UDP ports at once and answers each with a token naming that exact
-// port; the client tries them all and prints what came back.
-//
-// The token carries the port number on purpose. A plain timeout means
-// "blocked"; a token for a *different* port (or garbage) means a
-// middlebox answered or redirected instead of the real server — a very
-// different finding, and one a simple connect-test would report as
-// success.
+// portprobe checks which ports get through the network. The server
+// listens on many TCP/UDP ports and answers with a token containing the
+// port number, the client tries them all. A wrong token means something
+// in the middle answered instead of our server.
 package main
 
 import (
@@ -22,9 +16,7 @@ import (
 	"time"
 )
 
-// Defaults lean on ports a restrictive network plausibly allows:
-// standard web/mail/VPN/STUN ports, plus the high ports this project
-// already tried and saw blocked, as a control group.
+// common web/mail/VPN ports plus some high ports that were blocked before
 const (
 	defaultTCP = "80,443,8080,8443,2053,2083,2087,2096,53,123,143,465,587,993,995,1194,3478,5349,5222,3389"
 	defaultUDP = "443,53,123,500,1194,3478,4500,51820,8443"
@@ -34,14 +26,8 @@ func token(port int, proto string) string {
 	return fmt.Sprintf("PORTPROBE-OK %s/%d\n", proto, port)
 }
 
-// UDP source addresses are trivially spoofed, so a server that answers
-// any datagram with a larger one is an amplification weapon: an
-// attacker sends tiny packets with a victim's address and we blast the
-// replies at the victim. Two rules make that worthless — the request
-// must carry a magic prefix (no answering random scan traffic), and it
-// must be at least as large as our reply (so the "amplification" factor
-// is below 1 and there's nothing to gain). Anything else is dropped in
-// silence.
+// To not be usable for UDP amplification, we only answer requests with
+// the magic prefix that are at least as big as our reply.
 const (
 	probeMagic      = "PORTPROBE-REQ"
 	probeRequestLen = 64
@@ -58,9 +44,7 @@ func udpRequest() []byte {
 }
 
 func parsePorts(s string) []int {
-	// "none" spelled out, because Windows PowerShell 5.1 silently drops
-	// an empty-string argument to a native binary — `-udp ""` arrives as
-	// a bare `-udp`, which then swallows the next flag as its value.
+	// "none" because PowerShell 5.1 drops empty string args
 	if t := strings.TrimSpace(s); t == "" || t == "none" || t == "-" {
 		return nil
 	}
@@ -80,9 +64,7 @@ func parsePorts(s string) []int {
 		if f == "" {
 			continue
 		}
-		// "a-b" is an inclusive range, e.g. "1-999" for every
-		// privileged/well-known port in one sweep — spelling out a
-		// thousand comma-separated ports by hand isn't practical.
+		// range like "1-999"
 		if dash := strings.IndexByte(f, '-'); dash > 0 {
 			loStr, hiStr := f[:dash], f[dash+1:]
 			lo, errLo := strconv.Atoi(loStr)
@@ -105,17 +87,12 @@ func parsePorts(s string) []int {
 	return out
 }
 
-// Well-known public endpoints, one per interesting port. Probing these
-// says whether the network lets that port out at all, without opening
-// a single hole in our own VPS firewall — useful for narrowing down
-// which ports are even worth testing against our own box.
+// Public servers on different ports, to test without our own server.
 const defaultTargets = "www.google.com:80,www.google.com:443,github.com:22,8.8.8.8:53," +
 	"smtp.gmail.com:25,smtp.gmail.com:465,smtp.gmail.com:587,imap.gmail.com:993," +
 	"pop.gmail.com:995,ftp.gnu.org:21,irc.libera.chat:6667,irc.libera.chat:6697"
 
-// probeTarget just asks whether a TCP connection to somebody else's
-// server completes. No token to compare against — a completed handshake
-// (and any banner the service volunteers) is the whole signal.
+// probeTarget only checks that the TCP connection works.
 func probeTarget(target string, timeout time.Duration) string {
 	conn, err := net.DialTimeout("tcp", target, timeout)
 	if err != nil {
@@ -127,8 +104,7 @@ func probeTarget(target string, timeout time.Duration) string {
 	buf := make([]byte, 96)
 	n, err := conn.Read(buf)
 	if err != nil || n == 0 {
-		// Plenty of services (HTTPS, HTTP) say nothing until spoken to;
-		// the completed handshake already answered the question.
+		// HTTP/HTTPS don't send anything first, that's fine
 		return "reachable"
 	}
 	banner := strings.TrimSpace(string(buf[:n]))
@@ -175,7 +151,7 @@ func runTargets(targets []string, timeout time.Duration, parallel int) {
 		fmt.Printf(" %s %-24s %s\n", mark, r.target, r.status)
 	}
 	fmt.Printf("\n%d of %d reachable: %s\n", len(ok), len(out), strings.Join(ok, " "))
-	fmt.Println("a port open here is worth re-testing against your own server — a filter can allow a port only toward well-known destinations")
+	fmt.Println("open ports should be tested against your own server too")
 }
 
 func runServer(tcpPorts, udpPorts []int) {
@@ -184,17 +160,13 @@ func runServer(tcpPorts, udpPorts []int) {
 	for _, p := range tcpPorts {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
 		if err != nil {
-			// Almost always "address already in use" — something real
-			// is on that port (sshd, a web server, Xray). Skipping is
-			// the right move: never fight a live service for its port.
+			// port is used by something else (sshd, xray...), skip it
 			skipped = append(skipped, fmt.Sprintf("tcp/%d (%v)", p, err))
 			continue
 		}
 		bound = append(bound, fmt.Sprintf("tcp/%d", p))
 		go func(ln net.Listener, p int) {
-			// Cap concurrent connections per port so a flood can't turn
-			// this throwaway diagnostic into a memory-exhaustion lever
-			// on a box that's running real services.
+			// limit connections per port
 			sem := make(chan struct{}, 32)
 			for {
 				conn, err := ln.Accept()
@@ -214,11 +186,7 @@ func runServer(tcpPorts, udpPorts []int) {
 					if _, err := c.Write([]byte(token(p, "tcp"))); err != nil {
 						return
 					}
-					// Then echo whatever arrives, so the client can hold
-					// the connection open and find out whether the
-					// network lets a long-lived flow survive — the
-					// question that actually decides whether a tunnel
-					// can live on this port.
+					// echo for the -sustain test
 					buf := make([]byte, 4096)
 					for {
 						c.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -251,7 +219,7 @@ func runServer(tcpPorts, udpPorts []int) {
 					return
 				}
 				if !validUDPRequest(buf[:n]) {
-					continue // not ours, or too short to answer safely
+					continue
 				}
 				pc.WriteTo([]byte(token(p, "udp")), addr)
 			}
@@ -260,7 +228,7 @@ func runServer(tcpPorts, udpPorts []int) {
 
 	log.Printf("listening on %d ports: %s", len(bound), strings.Join(bound, " "))
 	if len(skipped) > 0 {
-		log.Printf("skipped %d ports already in use (expected — leave live services alone):", len(skipped))
+		log.Printf("skipped %d ports already in use:", len(skipped))
 		for _, s := range skipped {
 			log.Printf("  %s", s)
 		}
@@ -272,7 +240,7 @@ func runServer(tcpPorts, udpPorts []int) {
 type result struct {
 	proto  string
 	port   int
-	status string // "open", "blocked", or a description of what went wrong
+	status string // open, blocked or an error
 }
 
 func probeTCP(host string, port int, timeout time.Duration) result {
@@ -295,7 +263,7 @@ func probeTCP(host string, port int, timeout time.Duration) result {
 	if got == token(port, "tcp") {
 		r.status = "open"
 	} else {
-		r.status = fmt.Sprintf("WRONG REPLY %q — something answered instead of our server", strings.TrimSpace(got))
+		r.status = fmt.Sprintf("WRONG REPLY %q (not our server)", strings.TrimSpace(got))
 	}
 	return r
 }
@@ -311,8 +279,7 @@ func probeUDP(host string, port int, timeout time.Duration) result {
 
 	buf := make([]byte, 128)
 	req := udpRequest()
-	// UDP has no handshake: a lost probe is indistinguishable from a
-	// blocked one, so retry before calling it blocked.
+	// UDP can get lost, retry a few times
 	for attempt := 0; attempt < 3; attempt++ {
 		if _, err := conn.Write(req); err != nil {
 			r.status = classify(err)
@@ -327,7 +294,7 @@ func probeUDP(host string, port int, timeout time.Duration) result {
 		if got == token(port, "udp") {
 			r.status = "open"
 		} else {
-			r.status = fmt.Sprintf("WRONG REPLY %q — something answered instead of our server", strings.TrimSpace(got))
+			r.status = fmt.Sprintf("WRONG REPLY %q (not our server)", strings.TrimSpace(got))
 		}
 		return r
 	}
@@ -335,11 +302,8 @@ func probeUDP(host string, port int, timeout time.Duration) result {
 	return r
 }
 
-// sustain holds one port open and keeps traffic flowing on it, because
-// "a connection can be established" and "a tunnel can live here for
-// hours" are different questions — and this project has already been
-// bitten by the second one (a flow that came up fine and died a minute
-// and a half later).
+// sustain keeps a connection open with traffic, to see if the network
+// kills it after some time.
 func sustain(host string, r result, dur, interval time.Duration) string {
 	addr := net.JoinHostPort(host, strconv.Itoa(r.port))
 	conn, err := net.DialTimeout(r.proto, addr, 5*time.Second)
@@ -350,7 +314,7 @@ func sustain(host string, r result, dur, interval time.Duration) string {
 
 	buf := make([]byte, 4096)
 	if r.proto == "tcp" {
-		// Drain the greeting token before the echo phase.
+		// read the token first
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if _, err := conn.Read(buf); err != nil {
 			return "died reading greeting: " + classify(err)
@@ -360,8 +324,7 @@ func sustain(host string, r result, dur, interval time.Duration) string {
 	start := time.Now()
 	deadline := start.Add(dur)
 	var sent, lost int
-	// Magic-prefixed so the UDP side accepts it (see validUDPRequest);
-	// harmless on TCP, which just echoes whatever it gets.
+	// needs the magic prefix for UDP
 	payload := make([]byte, 256)
 	copy(payload, probeMagic)
 
@@ -375,8 +338,7 @@ func sustain(host string, r result, dur, interval time.Duration) string {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		if _, err := conn.Read(buf); err != nil {
 			if r.proto == "udp" {
-				// A lost datagram isn't a dead path; only a long run of
-				// them is.
+				// a few lost packets are ok
 				lost++
 				if lost > 10 {
 					return fmt.Sprintf("DIED after %v (%d msgs, 10 replies missed in a row)", time.Since(start).Round(time.Second), sent)
@@ -462,7 +424,7 @@ func runClient(host string, tcpPorts, udpPorts []int, timeout time.Duration, par
 
 	fmt.Printf("\n%d of %d got through: %s\n", len(open), len(results), strings.Join(open, " "))
 	if len(open) == 0 {
-		fmt.Println("nothing got through — check that the server is running and the VPS firewall allows these ports before concluding the network blocks them")
+		fmt.Println("nothing got through, check that the server is running and the firewall is open")
 	}
 	return results
 }
@@ -514,7 +476,7 @@ func main() {
 	parallel := flag.Int("parallel", 8, "how many ports to probe at once (client mode)")
 	sustainFor := flag.Duration("sustain", 0, "client mode: after scanning, hold every open port this long with traffic flowing, to see which survive a long-lived flow (e.g. 5m)")
 	sustainEvery := flag.Duration("sustain-interval", time.Second, "client mode: spacing between messages while sustaining")
-	targets := flag.String("targets", "", "client mode: instead of probing our own server, TCP-connect to these host:port pairs (comma-separated, or \"default\" for a built-in list of public services) — needs no server and no firewall changes")
+	targets := flag.String("targets", "", "client mode: instead of probing our own server, TCP-connect to these host:port pairs (comma-separated, or \"default\" for a built-in list)")
 	flag.Parse()
 
 	if *targets != "" {

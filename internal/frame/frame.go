@@ -1,17 +1,10 @@
-// Package frame implements the droppable channel's own wire format and
-// the receiver-side staleness logic described in the brief: each frame
-// carries a sequence number and send timestamp; a frame that arrives
-// too late (older than maxAge) or that's been superseded by a newer
-// sequence number already delivered gets dropped instead of queued —
-// the whole point of this channel existing separately from the
-// reliable/smux one.
+// Package frame is the wire format for the droppable/glue channels.
+// Every frame has a sequence number and a send timestamp, so the
+// receiver can drop frames that arrived too late or were already
+// superseded by a newer one.
 //
-// Note: over a single TCP/TLS connection, frames can never actually
-// arrive out of order — TCP guarantees that. What this logic protects
-// against is a frame that's *stale by the time it's read*, because the
-// connection stalled (retransmit, congestion) while it was in flight.
-// TCP hides packet loss as added latency; this is where that latency
-// gets turned into an explicit drop instead of being delivered late.
+// TCP never reorders, but a stalled connection can deliver frames late.
+// Here late frames get dropped instead of being delivered.
 package frame
 
 import (
@@ -20,21 +13,19 @@ import (
 	"time"
 )
 
-const headerSize = 4 + 8 + 2 // seq(4) + timestampMS(8) + payloadLen(2)
+const headerSize = 4 + 8 + 2 // seq + timestamp ms + payload length
 
-// Frame is one unit sent over the droppable channel.
 type Frame struct {
 	Seq         uint32
 	TimestampMS int64
 	Payload     []byte
 }
 
-// New builds a frame stamped with the current time.
+// New creates a frame with the current time.
 func New(seq uint32, payload []byte) Frame {
 	return Frame{Seq: seq, TimestampMS: time.Now().UnixMilli(), Payload: payload}
 }
 
-// Marshal encodes the frame for the wire.
 func (f Frame) Marshal() []byte {
 	buf := make([]byte, headerSize+len(f.Payload))
 	binary.BigEndian.PutUint32(buf[0:4], f.Seq)
@@ -44,8 +35,6 @@ func (f Frame) Marshal() []byte {
 	return buf
 }
 
-// ReadFrame reads one frame from r. Blocks until a full frame arrives
-// or the connection errors/closes.
 func ReadFrame(r io.Reader) (Frame, error) {
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -62,54 +51,33 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	return Frame{Seq: seq, TimestampMS: ts, Payload: payload}, nil
 }
 
-// Receiver holds the delivery state for one droppable stream and decides
-// whether each incoming frame is still worth delivering.
+// Receiver decides if an incoming frame should still be delivered.
 type Receiver struct {
 	maxAge      time.Duration
 	lastSeq     uint32
 	haveLastSeq bool
 
-	// Accept's staleness check compares f.TimestampMS (stamped on the
-	// *sender's* clock) against the local clock — a raw difference that
-	// conflates real network delay with whatever clock skew exists
-	// between the two machines. Skew of even 100-200ms (common between
-	// an unsynced client and a VPS) makes every frame look stale and
-	// get dropped regardless of actual network conditions. To cancel
-	// that out, we track the smallest (recv_time - send_time) ever
-	// observed — that floor is network_delay_floor + skew, both
-	// roughly constant — and measure staleness as delay *beyond* that
-	// floor instead of raw age. Two windows (current + previous) so a
-	// single unlucky sample right at a window boundary can't corrupt
-	// the baseline.
+	// Client and server clocks are not in sync, so recv-send time includes
+	// the clock difference. We keep the minimum (recv-send) seen and count
+	// the age from that, not from zero. Two windows so the minimum can
+	// slowly follow clock drift.
 	haveOffset    bool
 	prevMinOffset time.Duration
 	curMinOffset  time.Duration
 	windowStart   time.Time
 }
 
-// offsetWindow is how often the skew/delay-floor baseline is allowed to
-// adapt — long enough to collect plenty of samples at typical game-tick
-// rates, short enough to track real drift within tens of seconds.
 const offsetWindow = 5 * time.Second
 
-// NewReceiver creates a receiver that drops any frame more than maxAge
-// late relative to the best (recv - send) offset seen so far — not
-// relative to zero, since the two clocks aren't assumed to agree.
+// NewReceiver drops frames that are more than maxAge late compared to
+// the best delay seen so far.
 func NewReceiver(maxAge time.Duration) *Receiver {
 	return &Receiver{maxAge: maxAge}
 }
 
-// Accept reports whether f should be delivered to the application, and
-// updates internal state if so. Call this exactly once per frame, in
-// the order frames were read.
-//
-// The very first frame a Receiver ever sees always establishes the
-// baseline against itself (age 0) and is accepted unconditionally —
-// with zero prior samples there's no way to distinguish "this one frame
-// is stale" from "this is just what skew+delay looks like on this
-// link," and accepting one frame at connection start is far cheaper
-// than the alternative (see frame_test.go's clock-skew regression test
-// for what that alternative used to cost).
+// Accept reports if f should be delivered. Call it once per frame, in
+// the order frames were read. The first frame is always accepted since
+// there's nothing to compare it with yet.
 func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
 	now := time.Now()
 	raw := now.Sub(time.UnixMilli(f.TimestampMS))
@@ -138,11 +106,8 @@ func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
 	return r.AcceptSeq(f)
 }
 
-// AcceptSeq applies only the duplicate/supersession check, ignoring
-// staleness. Used for measurement pings: a late reply is exactly the
-// high-RTT result the measurement exists to report, not something to
-// silently drop — but a duplicate arriving via a second multipath path
-// still shouldn't be double-counted.
+// AcceptSeq only checks for duplicates, not age. Used for ping frames,
+// where we want to see late replies too.
 func (r *Receiver) AcceptSeq(f Frame) (deliver bool, reason string) {
 	if r.haveLastSeq && f.Seq <= r.lastSeq {
 		return false, "superseded"

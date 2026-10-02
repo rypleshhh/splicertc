@@ -1,12 +1,5 @@
-// Command tunprobe is a diagnostic tool: it creates a TUN interface,
-// reads raw IP packets, classifies each as real traffic or local
-// discovery noise (internal/pktfilter), and logs accordingly — real
-// traffic gets a full line every time, noise just increments counters
-// summarized periodically. No forwarding yet.
-//
-// The tun.Device interface (tailscale's wireguard-go fork) is identical
-// across platforms: this code runs unmodified on Linux (/dev/net/tun)
-// and Windows (wintun.dll) — only tun.CreateTUN's internals differ.
+// Command tunprobe creates a TUN interface and logs the packets it sees.
+// Noise (mDNS, SSDP...) is only counted. Doesn't forward anything.
 package main
 
 import (
@@ -33,7 +26,7 @@ func main() {
 
 	actualName, _ := dev.Name()
 	log.Printf("TUN interface up: %s (requested %q, mtu %d)", actualName, *name, *mtu)
-	log.Println("waiting for packets — on Linux, bring the interface up and route something through it in another shell; on Windows, do the same via netsh once the interface appears")
+	log.Println("waiting for packets, set up the interface and route something through it")
 
 	noise := newNoiseCounter()
 	go noise.summarizeEvery(5 * time.Second)
@@ -65,10 +58,7 @@ func main() {
 	}
 }
 
-// noiseCounter tallies suppressed noise packets by reason and prints a
-// summary on a fixed interval instead of one log line per packet —
-// mDNS/SSDP/etc. fire constantly and would otherwise drown out the
-// traffic we actually care about.
+// noiseCounter counts noise packets and prints a summary from time to time.
 type noiseCounter struct {
 	mu     sync.Mutex
 	counts map[string]int

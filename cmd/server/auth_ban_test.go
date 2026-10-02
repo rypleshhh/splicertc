@@ -6,9 +6,7 @@ import (
 	"time"
 )
 
-// TestAuthIPStripsPort confirms failures are tracked per source IP, not
-// per source port — two connections from the same machine on different
-// ephemeral ports must count against the same ban bucket.
+// Failures are counted per IP, so the port must be removed.
 func TestAuthIPStripsPort(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -39,9 +37,7 @@ func TestAuthIPStripsPort(t *testing.T) {
 	}
 }
 
-// TestBanAfterMaxFailures is the direct regression test for the
-// brute-force defense: exactly maxAuthFailures failures ban the IP, one
-// fewer doesn't.
+// maxAuthFailures failures -> ban, one less -> no ban.
 func TestBanAfterMaxFailures(t *testing.T) {
 	ip := "test-ban-after-max-failures"
 
@@ -52,7 +48,7 @@ func TestBanAfterMaxFailures(t *testing.T) {
 		}
 	}
 
-	recordAuthFailure(ip) // the maxAuthFailures-th failure
+	recordAuthFailure(ip)
 	until, banned := checkAuthBan(ip)
 	if !banned {
 		t.Fatalf("expected a ban after %d failures", maxAuthFailures)
@@ -62,9 +58,7 @@ func TestBanAfterMaxFailures(t *testing.T) {
 	}
 }
 
-// TestBanClearsOnSuccess proves a successful auth resets the counter —
-// a legitimate client that mistyped its key a couple of times before
-// getting it right shouldn't stay one failure away from a ban forever.
+// A successful login resets the counter.
 func TestBanClearsOnSuccess(t *testing.T) {
 	ip := "test-ban-clears-on-success"
 
@@ -79,14 +73,13 @@ func TestBanClearsOnSuccess(t *testing.T) {
 	}
 }
 
-// TestBanExpires proves an expired ban is treated as not-banned and its
-// bookkeeping is actually cleared, not just skipped for this one check.
+// Expired ban should be removed.
 func TestBanExpires(t *testing.T) {
 	ip := "test-ban-expires"
 
 	authFailures.mu.Lock()
 	authFailures.count[ip] = maxAuthFailures
-	authFailures.bannedUntil[ip] = time.Now().Add(-time.Minute) // already expired
+	authFailures.bannedUntil[ip] = time.Now().Add(-time.Minute)
 	authFailures.mu.Unlock()
 
 	if _, banned := checkAuthBan(ip); banned {

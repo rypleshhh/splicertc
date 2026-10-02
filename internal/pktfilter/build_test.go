@@ -36,8 +36,7 @@ func TestBuildIPv4UDPRoundTripsThroughParse(t *testing.T) {
 func TestBuildIPv4UDPHeaderChecksumValid(t *testing.T) {
 	pkt := BuildIPv4UDP([4]byte{1, 2, 3, 4}, [4]byte{5, 6, 7, 8}, 1111, 2222, []byte("x"))
 
-	// Recomputing the checksum over the header AS SENT (checksum field
-	// included, not zeroed) must fold to exactly 0 for a valid checksum.
+	// checksum over a valid header (with the checksum) gives 0
 	var sum uint32
 	header := pkt[0:20]
 	for i := 0; i+1 < len(header); i += 2 {

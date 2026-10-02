@@ -29,8 +29,7 @@ import (
 	"tcp-dormtun/internal/transport"
 )
 
-// Config mirrors the client's flags — every field optional. A CLI flag,
-// if explicitly passed, always overrides the matching field here.
+// Config is client-config.json. Command line flags override it.
 type Config struct {
 	Mode               string `json:"mode,omitempty"`
 	Listen             string `json:"listen,omitempty"`
@@ -45,49 +44,28 @@ type Config struct {
 	VPNAddr            string `json:"vpn_addr,omitempty"`
 	VPNTunName         string `json:"vpn_tun_name,omitempty"`
 	VPNTunMTU          int    `json:"vpn_tun_mtu,omitempty"`
-	// GameProcesses selectively routes matched processes' UDP traffic
-	// through the glue channel (multipath duplication) instead of vpn
-	// mode's single TCP stream — see runVPNMode. Empty means vpn mode
-	// behaves exactly as before (no glue connections opened at all).
+	// UDP from these processes goes through glue (multipath)
 	GameProcesses []string `json:"game_processes,omitempty"`
-	// GamePaths is the multipath duplication factor for GameProcesses'
-	// UDP traffic; defaults to 3 if GameProcesses is set but this isn't.
+	// number of glue paths, 3 by default
 	GamePaths int `json:"game_paths,omitempty"`
-	// VPNUpMbps caps the vpn channel's client→server rate (0 = no cap);
-	// the upload-direction counterpart of the server's vpn_down_mbps.
+	// speed limit client->server in Mbit/s, 0 = off
 	VPNUpMbps    float64 `json:"vpn_up_mbps,omitempty"`
 	DropCount    int     `json:"drop_count,omitempty"`
 	DropInterval string  `json:"drop_interval,omitempty"` // e.g. "33ms"
 	DropPaths    int     `json:"drop_paths,omitempty"`
 	Insecure     bool    `json:"insecure,omitempty"`
-	// ServerPin is the SHA-256 (hex) of the server's TLS certificate,
-	// printed by the server at startup. When set, the client verifies
-	// the server presents exactly this certificate instead of trusting
-	// insecure's "accept anything" — without a pin, insecure:true is
-	// vulnerable to a TLS-intercepting middlebox reading all traffic.
+	// SHA-256 of the server cert (the server prints it on start)
 	ServerPin string `json:"server_pin,omitempty"`
-	// PinFile enables trust-on-first-use pinning as an alternative to
-	// manually copying ServerPin out of the server's startup log: the
-	// first connection saves the server's certificate fingerprint here,
-	// every connection after that (including future runs) is pinned to
-	// it automatically. Ignored if ServerPin is also set. See
-	// transport.ResolvePin.
+	// file to save the server cert fingerprint on first connect (TOFU),
+	// ignored if ServerPin is set
 	PinFile string `json:"pin_file,omitempty"`
-	// ClientKeyFile is a file holding this client's base64 Ed25519
-	// private seed (generate one with `cmd/genkey`), the counterpart to
-	// the server's authorized_keys.json. Keep it as secret as the old
-	// psk — anyone who has it can connect as you.
+	// file with the client private key (from cmd/genkey)
 	ClientKeyFile string `json:"client_key_file,omitempty"`
-	// ClientKey is the same seed written directly into the config file,
-	// as an alternative to -client-key-file/ClientKeyFile. Keep the
-	// config file out of git if it holds a real key (see
-	// client-config.example.json vs client-config.json).
+	// or the same key directly in the config
 	ClientKey string `json:"client_key,omitempty"`
 }
 
-// parseGameProcesses turns a comma-separated -game-processes value into
-// a normalized (lowercase, trimmed, empty entries dropped) list, ready
-// to compare directly against procmap's already-lowercase process names.
+// parseGameProcesses splits the comma list and lowercases the names.
 func parseGameProcesses(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
@@ -138,12 +116,12 @@ func main() {
 	dropInterval := flag.Duration("drop-interval", parseDurationOr(cfg.DropInterval, 33*time.Millisecond), "droptest: spacing between frames in stress mode (33ms ~ 30 ticks/sec, like a game sending state updates)")
 	dropPaths := flag.Int("drop-paths", config.Int(cfg.DropPaths, 1), "droptest stress mode: number of parallel TLS connections to duplicate each frame across")
 	insecure := flag.Bool("insecure", cfg.Insecure, "skip TLS cert verification (dev only)")
-	serverPin := flag.String("server-pin", cfg.ServerPin, "SHA-256 (hex) of the server's TLS certificate — when set, the server must present exactly this cert (see -insecure's caveat about MITM otherwise)")
+	serverPin := flag.String("server-pin", cfg.ServerPin, "SHA-256 (hex) of the server certificate, connection fails if it doesn't match")
 	pinFile := flag.String("pin-file", cfg.PinFile, "trust-on-first-use: path to save/read the server's certificate fingerprint automatically, instead of copying -server-pin by hand (ignored if -server-pin is set)")
 	gameProcessesFlag := flag.String("game-processes", strings.Join(cfg.GameProcesses, ","), "vpn mode: comma-separated executable names (e.g. deadlock.exe) whose UDP traffic gets routed through the glue channel with multipath duplication instead of the single vpn stream")
 	gamePaths := flag.Int("game-paths", config.Int(cfg.GamePaths, 0), "vpn mode: multipath duplication factor for -game-processes UDP traffic (0 = default of 3 if -game-processes is set)")
 	vpnUpMbps := flag.Float64("vpn-up-mbps", cfg.VPNUpMbps, "vpn mode: cap the client->server rate in Mbit/s, a bit below the real upload speed (0 = no cap)")
-	clientKeyFile := flag.String("client-key-file", cfg.ClientKeyFile, "path to this client's base64 Ed25519 private key file, generated with cmd/genkey — required if the server has auth enabled")
+	clientKeyFile := flag.String("client-key-file", cfg.ClientKeyFile, "file with the client private key (from cmd/genkey)")
 	flag.String("config", configPath, "path to a JSON config file (client-config.json by default; explicit flags override its values)")
 	flag.Parse()
 
@@ -176,9 +154,7 @@ func main() {
 		}
 		pin = p
 	case *pinFile != "":
-		// Same server cert is served on every channel (see
-		// transport.Listen calls in cmd/server), so it doesn't matter
-		// which of this mode's addresses the bootstrap probe uses.
+		// all channels use the same cert, any address works
 		probeAddr := *serverAddr
 		switch *mode {
 		case "vpn":
@@ -198,7 +174,7 @@ func main() {
 		if existed {
 			log.Printf("verified server against saved pin in %s", *pinFile)
 		} else {
-			log.Printf("trust-on-first-use: saved server's certificate fingerprint to %s (%x) — future connections verify against it automatically", *pinFile, pin)
+			log.Printf("saved server certificate fingerprint to %s (%x)", *pinFile, pin)
 		}
 	}
 
@@ -311,11 +287,8 @@ func relay(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-// runDropTest sends a fixed sequence of frames over the droppable channel,
-// injecting an artificial delay before some of them are written — standing
-// in for "this frame got stuck behind a retransmit" without needing real
-// packet loss. The server's TTL is 150ms (see cmd/server), so delays past
-// that should show up there as drops.
+// runDropTest sends a few frames with artificial delays. Delays over
+// 150ms should show up as drops on the server.
 func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
 	conn, err := transport.Dial(dropAddr, insecure, pin)
 	if err != nil {
@@ -349,12 +322,8 @@ func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
 	time.Sleep(300 * time.Millisecond)
 }
 
-// runDropStress sends count frames spaced by interval, with no artificial
-// delay — under a lossy/jittery real connection (tc netem on the server
-// side), some frames will genuinely arrive stale due to real TCP
-// retransmission stalls, not a simulated sleep. Check the server's log
-// for the accepted/DROPPED breakdown; this side just confirms what left
-// the client.
+// runDropStress sends count frames every interval. Use with tc netem on
+// the server and check the server log for drops.
 func runDropStress(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, key []byte) {
 	conn, err := transport.Dial(dropAddr, insecure, pin)
 	if err != nil {
@@ -385,16 +354,9 @@ func runDropStress(dropAddr string, insecure bool, pin []byte, count int, interv
 	time.Sleep(300 * time.Millisecond)
 }
 
-// runDropMultipath opens `paths` independent TLS connections, all tagged
-// with the same 8-byte session ID so the server can dedupe across them,
-// and writes every frame to all of them — a cheap stand-in for real path
-// diversity (see the ExitLag/multipath discussion): even sharing one
-// physical uplink, each TCP connection draws netem's loss independently,
-// so a frame only truly dies if it's unlucky on *every* path at once.
-// sendNewSessionID generates a fresh random 8-byte session id and writes
-// it as the header every droppable connection is now expected to send —
-// required so the server's shared-receiver bookkeeping (used for
-// multipath dedup) has a consistent handshake regardless of mode.
+// runDropMultipath sends every frame over several connections with the
+// same session ID. A frame is lost only if it's lost on all of them.
+// sendNewSessionID writes a random 8 byte session ID.
 func sendNewSessionID(conn net.Conn) error {
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
@@ -447,35 +409,22 @@ func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, int
 	time.Sleep(300 * time.Millisecond)
 }
 
-// flowInfo remembers the original 4-tuple of a captured outbound packet
-// so a reply can be turned back into a packet the OS will recognize as
-// belonging to that same local socket.
+// flowInfo keeps the addresses of the original packet so we can build
+// the reply packet.
 type flowInfo struct {
 	origSrc, origDst         [4]byte
 	origSrcPort, origDstPort uint16
 }
 
-// flowKey identifies one UDP flow by its full 4-tuple. Keying only by
-// source port (the old scheme) collapses distinct flows whenever one
-// local socket talks to more than one remote destination — routine for
-// Steam Datagram Relay, which pings many relay POPs from a single UDP
-// socket. The server trusts flowID as an opaque handle and never
-// second-guesses it (see cmd/server/main.go handleGlueConn), so once
-// two different destinations shared an ID, later traffic for one
-// destination could get silently written to the other's socket.
+// flowKey is the full 4-tuple. Source port alone isn't enough, Steam
+// talks to many relays from one socket.
 type flowKey struct {
 	srcPort uint16
 	dst     [4]byte
 	dstPort uint16
 }
 
-// allocFlowID returns the flow ID already assigned to key, or allocates
-// the next free one. uint16 gives 65536 concurrent flows — several
-// orders of magnitude more than a real gaming session touches, so IDs
-// are safe to leave unreclaimed here (idle expiry is a separate,
-// already-tracked improvement, not a correctness requirement for this
-// fix: the bug was that two different destinations could collide on
-// the same ID, not that IDs are ever reused today).
+// allocFlowID returns the ID for key or gives it a new one.
 func allocFlowID(ids map[flowKey]uint16, counter *uint16, key flowKey) uint16 {
 	if id, ok := ids[key]; ok {
 		return id
@@ -485,10 +434,8 @@ func allocFlowID(ids map[flowKey]uint16, counter *uint16, key flowKey) uint16 {
 	return *counter
 }
 
-// runTunMode is the real integration: captures actual outbound UDP from
-// a TUN interface, tunnels it through the glue channel, and reinjects
-// whatever comes back so the OS (and the game/app that opened the local
-// socket) sees an ordinary reply. IPv4 only — see internal/glue.
+// runTunMode captures UDP from the TUN device, sends it through glue and
+// writes the replies back into the TUN. IPv4 only.
 func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
 	if paths < 1 {
 		paths = 1
@@ -506,8 +453,7 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		stats = measure.New()
 	}
 
-	// One shared session id across all paths, so the server dedupes
-	// duplicated copies against each other.
+	// same session id on all paths so the server can dedup
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
 		log.Fatalf("generate session id: %v", err)
@@ -541,13 +487,10 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 	flowIDs := make(map[flowKey]uint16)
 	var flowIDCounter uint16
 
-	// Replies come back duplicated across every path (server-side
-	// broadcast), so a receiver dedupes them here before reinjecting —
-	// otherwise the OS would see each reply N times.
+	// replies come on every path, drop the duplicates
 	replyRecv := frame.NewReceiver(150 * time.Millisecond)
 	var replyMu sync.Mutex
 
-	// One reader goroutine per path.
 	for _, c := range conns {
 		go func(c net.Conn) {
 			for {
@@ -555,10 +498,7 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 				if err != nil {
 					return
 				}
-				// Measurement ping echo coming back — record RTT
-				// regardless of how stale it looks; duplicate copies
-				// from other multipath paths are already handled by
-				// stats.OnRecv (first arrival wins, nonce removed).
+				// ping reply, stats ignores duplicates
 				if nonce, isPing := glue.DecodePing(f.Payload); isPing {
 					if stats != nil {
 						stats.OnRecv(nonce)
@@ -570,7 +510,7 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 				ok, _ := replyRecv.Accept(f)
 				replyMu.Unlock()
 				if !ok {
-					continue // duplicate copy from another path
+					continue // duplicate
 				}
 
 				flowID, payload, err := glue.DecodeInbound(f.Payload)
@@ -591,7 +531,7 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		}(c)
 	}
 
-	log.Println("waiting for outbound UDP to tunnel — bring the interface up and route real traffic through it")
+	log.Println("waiting for UDP packets, set up the interface and routes")
 
 	var seqMu sync.Mutex
 	var seq uint32
@@ -603,8 +543,7 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		return v
 	}
 
-	// Each path has its own writer, so a path stuck in a retransmit
-	// can't delay the copy going out on the others.
+	// each path has its own writer so a slow path doesn't block the others
 	writers := make([]*sched.PathWriter, len(conns))
 	for i, c := range conns {
 		writers[i] = sched.NewPathWriter(c, gluePathDepth, glueStaleAfter)
