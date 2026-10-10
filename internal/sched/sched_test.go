@@ -348,3 +348,17 @@ func TestPathWriterSkipsStaleFrames(t *testing.T) {
 		t.Fatalf("expected stale frames 2,3 to be skipped and 4 delivered, got %v", buf[0])
 	}
 }
+
+func TestPathWriterClosesStuckPath(t *testing.T) {
+	stalled, other := net.Pipe()
+	defer other.Close()
+	pw := newPathWriter(stalled, 4, 0, 50*time.Millisecond)
+	defer pw.Close()
+
+	pw.Send([]byte("frame"))
+	select {
+	case <-pw.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("stuck path was not closed after the write timeout")
+	}
+}

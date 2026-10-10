@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // Listen starts a TLS 1.3 listener with the given cert/key files.
@@ -51,6 +52,9 @@ func (l noDelayListener) Accept() (net.Conn, error) {
 	return conn, nil
 }
 
+// DialTimeout limits both the TCP connect and the TLS handshake.
+const DialTimeout = 10 * time.Second
+
 // Dial connects with TLS. Nagle is disabled because we send lots of
 // small packets and don't want them delayed (tls.Dial doesn't let us
 // set it, so the TCP connection is created manually).
@@ -58,10 +62,11 @@ func (l noDelayListener) Accept() (net.Conn, error) {
 // If pin is set, the server cert's SHA-256 must match it, otherwise the
 // handshake fails. insecureSkipVerify is only used when pin is nil.
 func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
-	rawConn, err := net.Dial("tcp", addr)
+	rawConn, err := net.DialTimeout("tcp", addr, DialTimeout)
 	if err != nil {
 		return nil, err
 	}
+	_ = rawConn.SetDeadline(time.Now().Add(DialTimeout))
 	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 		tuneSocket(tcpConn)
@@ -90,7 +95,32 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 		rawConn.Close()
 		return nil, err
 	}
+	_ = rawConn.SetDeadline(time.Time{})
 	return tlsConn, nil
+}
+
+// tcpConnOf returns the TCP connection under c (c can be a *tls.Conn).
+func tcpConnOf(c net.Conn) *net.TCPConn {
+	if tc, ok := c.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	tcp, _ := c.(*net.TCPConn)
+	return tcp
+}
+
+// SetSendBuffer sets SO_SNDBUF. Useful for low-rate connections where we
+// don't want old data piling up in the kernel when the path is stuck.
+func SetSendBuffer(c net.Conn, bytes int) {
+	if tcp := tcpConnOf(c); tcp != nil {
+		_ = tcp.SetWriteBuffer(bytes)
+	}
+}
+
+// SetNotSentLowat overrides the default unsent-data limit (Linux only).
+func SetNotSentLowat(c net.Conn, bytes int) {
+	if tcp := tcpConnOf(c); tcp != nil {
+		setNotSentLowat(tcp, bytes)
+	}
 }
 
 // ResolvePin does trust-on-first-use, like ssh known_hosts. If pinFile
@@ -108,11 +138,12 @@ func ResolvePin(addr, pinFile string) ([]byte, error) {
 		return nil, fmt.Errorf("read pin file %s: %w", pinFile, err)
 	}
 
-	rawConn, err := net.Dial("tcp", addr)
+	rawConn, err := net.DialTimeout("tcp", addr, DialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("trust-on-first-use dial %s: %w", addr, err)
 	}
 	defer rawConn.Close()
+	_ = rawConn.SetDeadline(time.Now().Add(DialTimeout))
 
 	var fingerprint []byte
 	cfg := &tls.Config{

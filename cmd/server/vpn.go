@@ -26,6 +26,16 @@ var (
 	vpnDownRate float64
 )
 
+// The client sends a keepalive every 2s. Nothing for vpnReadTimeout
+// or a write stuck for vpnWriteTimeout = the connection is dead.
+const (
+	vpnReadTimeout  = 30 * time.Second
+	vpnWriteTimeout = 10 * time.Second
+)
+
+// keepalives get their own flow so they're not stuck behind a download
+var keepaliveFlow = sched.FlowKey{Proto: 255}
+
 // vpnPeer is a client connection plus its send queue. The TUN reader
 // only puts packets in the queue, writeLoop sends them.
 type vpnPeer struct {
@@ -41,6 +51,7 @@ func (p *vpnPeer) writeLoop() {
 			return
 		}
 		shaper.Wait(len(wire))
+		_ = p.conn.SetWriteDeadline(time.Now().Add(vpnWriteTimeout))
 		if _, err := p.conn.Write(wire); err != nil {
 			log.Printf("vpn: write to client failed: %v", err)
 			p.conn.Close() // handleVPNConn will clean up
@@ -286,12 +297,15 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 	}()
 
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(vpnReadTimeout))
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
 			return
 		}
 		if len(f.Payload) == 0 {
-			continue // keepalive
+			// keepalive, send it back so the client knows the link works
+			peer.q.Enqueue(keepaliveFlow, frame.New(nextVPNSeq(), nil).Marshal())
+			continue
 		}
 		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)

@@ -271,6 +271,11 @@ the tunnel does about it (all on by default, nothing to configure):
   client no longer waits on the vpn socket before sending a game packet
   into glue.
 
+- **Small buffers on glue paths** — 32 KB send buffer on the client
+  and a 4 KB unsent-data cap on the server: game packets are tiny, and
+  with a big buffer a stuck path keeps old packets instead of being
+  detected as dead quickly.
+
 When the queue is actually cutting something, the server logs
 `vpn: queue dropped N packets ...` every 30 seconds — normal during
 downloads; that's how it keeps them from inflating latency.
@@ -285,6 +290,34 @@ link → `"vpn_down_mbps": 44` and `"vpn_up_mbps": 17`. The queue then
 forms inside the tunnel, where FQ-CoDel manages it, instead of in the
 router, which the tunnel can't reach. Off by default — without knowing
 the real link speed it could cut throughput for nothing.
+
+### Disconnects and reconnecting
+
+The client survives disconnects by itself, the process doesn't exit:
+
+- **`vpn` channel**: the client sends a keepalive every 2 seconds, the
+  server answers. If nothing at all arrived for 7 seconds (the network
+  silently stopped forwarding, no RST), the connection is treated as
+  dead and the client reconnects with a 0.5 → 5 s backoff. The log shows
+  `vpn: connection lost (...), reconnecting`, then `connected to vpn
+  channel ...` again. The TUN adapter and routes stay; packets during
+  the outage are lost (TCP inside the tunnel resends them).
+- **glue paths**: each path is pinged separately every 200 ms. A path
+  that didn't answer for 1 second is closed and redialed in the
+  background under the same session ID, the other paths keep working.
+  The log shows `glue: path N lost: ..., reconnecting`.
+- A socket write stuck for more than 1 s (glue) or 10 s (vpn) also
+  counts as a disconnect.
+- Only the very first connect is fatal (wrong address/key), so the
+  error is visible right away.
+
+Update server and client together: an old server doesn't answer path
+pings and keepalives, and a new client will keep treating its
+connections as dead and reconnecting.
+
+The server cleans up after itself: UDP sockets to game servers with no
+packets for 2 minutes are closed, sessions with no paths for 2 minutes
+are removed.
 
 ### Selective multipath for games (optional)
 
@@ -311,8 +344,17 @@ Windows IP Helper API, `GetExtendedUdpTable` — no third-party
 dependency), so there's no need to guess game-server IP ranges. UDP
 only; that process's TCP and everything else still rides the single
 `vpn` stream. The server also needs a working `glue_addr` in
-`server-config.json` for this — no server code changes, just both
-channels listening (two different ports).
+`server-config.json` for this — both channels listening (two different
+ports).
+
+The "glue or vpn" decision is made once per flow (destination
+address+port and local port) and never changes: moving a flow between
+channels changes its outside address, and the game server sees that
+as a new client. If the port isn't in the Windows table yet (socket
+just opened), the client reloads the table right away (at most every
+100 ms) and drops packets until then — better to lose one packet than
+to start the flow on the wrong channel. If the owner doesn't show up
+within a second, the flow goes over `vpn`.
 
 #### Finding the exact process name
 
@@ -424,13 +466,11 @@ routes). Then:
   drawing every control). Not configurable and doesn't follow the
   system theme — just always dark.
 
-**Honest about the limits**: this is a thin wrapper, not a rewritten,
-more robust client. If the tunnel drops on its own (`client.exe` still
-crashes on any disconnect — see IDEAS.md P1 #4, not fixed yet), the app
-notices and shows "client exited unexpectedly," but doesn't reconnect
-automatically — you have to click "Connect" again. Treat it as a
-convenient control panel on top of the existing stack, not a guarantee
-of automatic reconnection.
+On a disconnect `client.exe` reconnects by itself (see
+["Disconnects and reconnecting"](#disconnects-and-reconnecting)); the
+status shows "переподключение..." and then "подключено" again, nothing
+to click. "Client exited unexpectedly" only happens if the process
+really crashed — check `tray.log` then.
 
 ## Authentication
 

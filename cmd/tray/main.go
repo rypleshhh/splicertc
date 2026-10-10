@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -64,6 +65,9 @@ var (
 
 	mu        sync.Mutex
 	clientCmd *exec.Cmd
+	// set when connect() finished, after that client lines about
+	// reconnects change the status
+	tunnelUp atomic.Bool
 
 	connections []connection
 	// name of the connection shown in the fields ("" = new one),
@@ -611,6 +615,7 @@ func setConnected(connected bool) {
 }
 
 func fail(text string) {
+	tunnelUp.Store(false)
 	logger.Println("error:", text)
 	setStatus(text)
 	if notifyIcon != nil {
@@ -706,6 +711,27 @@ func connect() {
 		_ = notifyIcon.SetIcon(iconGreen)
 	}
 	setConnected(true)
+	tunnelUp.Store(true)
+}
+
+// onClientLine updates the status when client.exe loses the connection
+// and gets it back (it reconnects by itself, the routes stay).
+func onClientLine(line []byte) {
+	if !tunnelUp.Load() {
+		return
+	}
+	switch {
+	case strings.Contains(string(line), "vpn: connection lost"):
+		setStatus("переподключение...")
+		if notifyIcon != nil {
+			_ = notifyIcon.SetIcon(iconGray)
+		}
+	case containsConnected(line):
+		setStatus("подключено")
+		if notifyIcon != nil {
+			_ = notifyIcon.SetIcon(iconGreen)
+		}
+	}
 }
 
 // scanForConnected writes client output to the log and sends true when
@@ -726,6 +752,8 @@ func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 						case connectedCh <- true:
 						default:
 						}
+					} else if seen {
+						onClientLine(line)
 					}
 					line = line[:0]
 				} else {
@@ -763,6 +791,7 @@ func indexOf(s, sub string) int {
 }
 
 func disconnect() {
+	tunnelUp.Store(false)
 	setStatus("отключение...")
 	stopClient()
 	setStatus("отключено")

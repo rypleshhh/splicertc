@@ -94,3 +94,16 @@ func TestScanForConnectedDoesNotBlockOnUnbufferedChannel(t *testing.T) {
 		t.Fatal("scanForConnected blocked")
 	}
 }
+
+// Lines after the first connect go to onClientLine; with the tunnel not
+// up yet (as here, no GUI) it must not touch anything.
+func TestScanForConnectedHandlesReconnectLines(t *testing.T) {
+	r := strings.NewReader("connected to vpn channel 1.2.3.4:587\n" +
+		"vpn: connection lost (EOF), reconnecting\n" +
+		"connected to vpn channel 1.2.3.4:587\n")
+	ch := make(chan bool, 1)
+	scanForConnected(r, ch)
+	if ok := <-ch; !ok {
+		t.Fatal("expected the first marker to be reported")
+	}
+}

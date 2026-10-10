@@ -129,6 +129,8 @@ type dropSession struct {
 	accepted   int
 	ttlDropped int // counts copies, not real loss with multipath
 	duplicates int
+	paths      int
+	lastActive time.Time
 }
 
 var dropSessions = struct {
@@ -136,6 +138,8 @@ var dropSessions = struct {
 	m  map[string]*dropSession
 }{m: make(map[string]*dropSession)}
 
+// getDropSession also counts the caller as a connected path, call
+// leave() when it disconnects.
 func getDropSession(id string) *dropSession {
 	dropSessions.mu.Lock()
 	defer dropSessions.mu.Unlock()
@@ -144,7 +148,18 @@ func getDropSession(id string) *dropSession {
 		s = &dropSession{recv: frame.NewReceiver(150 * time.Millisecond), seen: make(map[uint32]struct{})}
 		dropSessions.m[id] = s
 	}
+	s.mu.Lock()
+	s.paths++
+	s.lastActive = time.Now()
+	s.mu.Unlock()
 	return s
+}
+
+func (s *dropSession) leave() {
+	s.mu.Lock()
+	s.paths--
+	s.lastActive = time.Now()
+	s.mu.Unlock()
 }
 
 // glueSession is shared by all paths with the same session ID.
@@ -153,9 +168,18 @@ func getDropSession(id string) *dropSession {
 type glueSession struct {
 	mu       sync.Mutex
 	recv     *frame.Receiver
-	udpFlows map[uint16]*net.UDPConn
+	udpFlows map[uint16]*udpFlow
 	paths    map[net.Conn]*sched.PathWriter
 	replySeq uint32
+	// when the last path went away, zero while there are paths
+	emptySince time.Time
+}
+
+// udpFlow is one UDP socket to a game server.
+type udpFlow struct {
+	conn     *net.UDPConn
+	dst      string
+	lastSeen time.Time
 }
 
 // Queue size per glue path (~0.5s of game traffic). Older frames would
@@ -163,6 +187,18 @@ type glueSession struct {
 const (
 	gluePathDepth  = 32
 	glueStaleAfter = 150 * time.Millisecond
+	// client sends a path ping every 200ms, so 10s of silence = dead path
+	glueReadTimeout = 10 * time.Second
+	// small unsent-data limit for glue sockets, game packets are tiny
+	glueNotSentLowat = 4 * 1024
+)
+
+// Cleanup: flows with no packets either way and sessions with no paths
+// are removed after this long.
+const (
+	glueFlowIdle    = 2 * time.Minute
+	glueSessionIdle = 2 * time.Minute
+	janitorInterval = 30 * time.Second
 )
 
 var glueSessions = struct {
@@ -170,19 +206,130 @@ var glueSessions = struct {
 	m  map[string]*glueSession
 }{m: make(map[string]*glueSession)}
 
-func getGlueSession(id string) *glueSession {
+// attachGluePath finds or creates the session and adds the path to it.
+// Both happen under glueSessions.mu so the janitor can't delete the
+// session in between.
+func attachGluePath(id string, conn net.Conn, w *sched.PathWriter) (*glueSession, int) {
 	glueSessions.mu.Lock()
 	defer glueSessions.mu.Unlock()
 	s, ok := glueSessions.m[id]
 	if !ok {
 		s = &glueSession{
 			recv:     frame.NewReceiver(150 * time.Millisecond),
-			udpFlows: make(map[uint16]*net.UDPConn),
+			udpFlows: make(map[uint16]*udpFlow),
 			paths:    make(map[net.Conn]*sched.PathWriter),
 		}
 		glueSessions.m[id] = s
 	}
-	return s
+	s.mu.Lock()
+	s.paths[conn] = w
+	s.emptySince = time.Time{}
+	n := len(s.paths)
+	s.mu.Unlock()
+	return s, n
+}
+
+func (s *glueSession) detachPath(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.paths, conn)
+	if len(s.paths) == 0 {
+		s.emptySince = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+// flow returns the UDP socket for flowID. If the client reused flowID for
+// another destination, the old socket is closed and a new one is made.
+// Everything is done under s.mu so two paths can't create two sockets
+// for the same flow (DialUDP doesn't send anything, it's fast).
+func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16) (*net.UDPConn, error) {
+	raddr := &net.UDPAddr{IP: dst, Port: int(dstPort)}
+	key := raddr.String()
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.udpFlows[flowID]; ok {
+		if f.dst == key {
+			f.lastSeen = now
+			return f.conn, nil
+		}
+		log.Printf("glue: flow %d moved %s -> %s (session %s)", flowID, f.dst, key, sid)
+		f.conn.Close()
+		delete(s.udpFlows, flowID)
+	}
+
+	uc, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return nil, err
+	}
+	f := &udpFlow{conn: uc, dst: key, lastSeen: now}
+	s.udpFlows[flowID] = f
+	log.Printf("glue: new flow %d -> %s (session %s)", flowID, key, sid)
+
+	// read replies for this flow until the socket is closed
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, err := uc.Read(buf)
+			if err != nil {
+				return
+			}
+			s.mu.Lock()
+			f.lastSeen = time.Now()
+			s.mu.Unlock()
+			s.broadcastReply(flowID, buf[:n])
+		}
+	}()
+	return uc, nil
+}
+
+// cleanupGlue removes idle flows and sessions nobody is connected to.
+func cleanupGlue(now time.Time) {
+	glueSessions.mu.Lock()
+	defer glueSessions.mu.Unlock()
+	for id, s := range glueSessions.m {
+		s.mu.Lock()
+		for flowID, f := range s.udpFlows {
+			if now.Sub(f.lastSeen) > glueFlowIdle {
+				f.conn.Close()
+				delete(s.udpFlows, flowID)
+			}
+		}
+		gone := len(s.paths) == 0 && !s.emptySince.IsZero() && now.Sub(s.emptySince) > glueSessionIdle
+		if gone {
+			for _, f := range s.udpFlows {
+				f.conn.Close()
+			}
+			s.udpFlows = map[uint16]*udpFlow{}
+		}
+		s.mu.Unlock()
+		if gone {
+			delete(glueSessions.m, id)
+			log.Printf("glue: session %s removed (no paths for %v)", id, glueSessionIdle)
+		}
+	}
+}
+
+func cleanupDrop(now time.Time) {
+	dropSessions.mu.Lock()
+	defer dropSessions.mu.Unlock()
+	for id, s := range dropSessions.m {
+		s.mu.Lock()
+		gone := s.paths == 0 && now.Sub(s.lastActive) > glueSessionIdle
+		s.mu.Unlock()
+		if gone {
+			delete(dropSessions.m, id)
+		}
+	}
+}
+
+func janitor() {
+	for range time.Tick(janitorInterval) {
+		now := time.Now()
+		cleanupGlue(now)
+		cleanupDrop(now)
+	}
 }
 
 // broadcastPing sends a ping reply to all paths.
@@ -292,6 +439,7 @@ func main() {
 		log.Fatalf("vpn tun setup: %v", err)
 	}
 	go vpnTunReader(vpnDev)
+	go janitor()
 
 	go func() {
 		for {
@@ -352,6 +500,7 @@ func handleDroppableConn(conn net.Conn) {
 	}
 	sid := hex.EncodeToString(sidBuf)
 	sess := getDropSession(sid)
+	defer sess.leave()
 	log.Printf("droppable path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
 
 	for {
@@ -466,20 +615,14 @@ func handleGlueConn(conn net.Conn) {
 		return
 	}
 	sid := hex.EncodeToString(sidBuf)
-	sess := getGlueSession(sid)
-	log.Printf("glue path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
+	transport.SetNotSentLowat(conn, glueNotSentLowat)
 
 	writer := sched.NewPathWriter(conn, gluePathDepth, glueStaleAfter)
-	sess.mu.Lock()
-	sess.paths[conn] = writer
-	nPaths := len(sess.paths)
-	sess.mu.Unlock()
-	log.Printf("glue path connected: %s (session %s, %d path(s) now)", conn.RemoteAddr(), sid, nPaths)
+	sess, nPaths := attachGluePath(sid, conn, writer)
+	log.Printf("glue path connected: %s (session %s, client %q, %d path(s) now)", conn.RemoteAddr(), sid, name, nPaths)
 
 	defer func() {
-		sess.mu.Lock()
-		delete(sess.paths, conn)
-		sess.mu.Unlock()
+		sess.detachPath(conn)
 		writer.Close()
 		if d := writer.Drops(); d > 0 {
 			log.Printf("glue path %s: %d reply frame(s) dropped while this path was backed up (the other paths carried them)", conn.RemoteAddr(), d)
@@ -487,10 +630,17 @@ func handleGlueConn(conn net.Conn) {
 	}()
 
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(glueReadTimeout))
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
 			log.Printf("glue: path closed (session %s): %v", sid, err)
 			return
+		}
+
+		// path ping: send it back on this path only, no dedup
+		if glue.IsPathPing(f.Payload) {
+			writer.Send(f.Marshal())
+			continue
 		}
 
 		// pings: only check duplicates, not age
@@ -523,35 +673,11 @@ func handleGlueConn(conn net.Conn) {
 			continue
 		}
 
-		sess.mu.Lock()
-		udpConn, exists := sess.udpFlows[flowID]
-		sess.mu.Unlock()
-
-		if !exists {
-			raddr := &net.UDPAddr{IP: dst, Port: int(dstPort)}
-			udpConn, err = net.DialUDP("udp", nil, raddr)
-			if err != nil {
-				log.Printf("glue: dial UDP %s for flow %d: %v", raddr, flowID, err)
-				continue
-			}
-			sess.mu.Lock()
-			sess.udpFlows[flowID] = udpConn
-			sess.mu.Unlock()
-			log.Printf("glue: new flow %d -> %s (session %s)", flowID, raddr, sid)
-
-			// read replies for this flow
-			go func(flowID uint16, uc *net.UDPConn) {
-				buf := make([]byte, 65535)
-				for {
-					n, err := uc.Read(buf)
-					if err != nil {
-						return
-					}
-					sess.broadcastReply(flowID, buf[:n])
-				}
-			}(flowID, udpConn)
+		udpConn, err := sess.flow(sid, flowID, dst, dstPort)
+		if err != nil {
+			log.Printf("glue: dial UDP %s:%d for flow %d: %v", dst, dstPort, flowID, err)
+			continue
 		}
-
 		if _, err := udpConn.Write(payload); err != nil {
 			log.Printf("glue: write to UDP target for flow %d: %v", flowID, err)
 		}

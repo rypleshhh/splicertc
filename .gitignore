@@ -27,6 +27,8 @@ devcerts/
 
 # Build output
 *.exe
+/server
+/client
 tunprobe.exe
 portprobe-linux
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -35,13 +36,21 @@ const (
 type Table struct {
 	mu     sync.RWMutex
 	byPort map[uint16]string // e.g. "deadlock.exe"
+
+	refreshMu   sync.Mutex
+	lastRefresh time.Time
+	// pid -> name from the last refresh, so we don't open every process
+	// again each time
+	pidNames map[uint32]string
 }
 
 func New() *Table {
-	return &Table{byPort: make(map[uint16]string)}
+	return &Table{byPort: make(map[uint16]string), pidNames: make(map[uint32]string)}
 }
 
-// ProcessForUDPPort returns the lowercase exe name for the port.
+// ProcessForUDPPort returns the lowercase exe name for the port. ok is
+// true for every open port; name is "" if the process couldn't be
+// opened (system services etc).
 func (t *Table) ProcessForUDPPort(port uint16) (name string, ok bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -51,6 +60,25 @@ func (t *Table) ProcessForUDPPort(port uint16) (name string, ok bool) {
 
 // Refresh reloads the UDP table from Windows.
 func (t *Table) Refresh() error {
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
+	return t.refreshLocked()
+}
+
+// RefreshIfOlder refreshes only if the last refresh was more than d ago.
+// Used on a cache miss, so a burst of unknown packets doesn't call the
+// API for every packet. Returns true if the table was reloaded.
+func (t *Table) RefreshIfOlder(d time.Duration) (bool, error) {
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
+	if time.Since(t.lastRefresh) < d {
+		return false, nil
+	}
+	return true, t.refreshLocked()
+}
+
+func (t *Table) refreshLocked() error {
+	t.lastRefresh = time.Now()
 	buf, err := getExtendedUDPTable()
 	if err != nil {
 		return err
@@ -80,13 +108,18 @@ func (t *Table) Refresh() error {
 
 		name, ok := pidNames[pid]
 		if !ok {
-			name = processName(pid)
+			// empty names are not reused, the open could have failed
+			// because the process was just starting
+			name = t.pidNames[pid]
+			if name == "" {
+				name = processName(pid)
+			}
 			pidNames[pid] = name
 		}
-		if name != "" {
-			byPort[port] = name
-		}
+		byPort[port] = name
 	}
+	// PIDs that are gone are dropped here, so a reused PID is looked up again
+	t.pidNames = pidNames
 
 	t.mu.Lock()
 	t.byPort = byPort

@@ -71,3 +71,16 @@ func TestProcessForUnknownPortNotFound(t *testing.T) {
 		t.Skip("something is using port 1")
 	}
 }
+
+func TestRefreshIfOlderIsRateLimited(t *testing.T) {
+	table := New()
+	if did, err := table.RefreshIfOlder(time.Hour); err != nil || !did {
+		t.Fatalf("first call should refresh: did=%v err=%v", did, err)
+	}
+	if did, _ := table.RefreshIfOlder(time.Hour); did {
+		t.Fatal("second call within the limit should not refresh")
+	}
+	if did, _ := table.RefreshIfOlder(0); !did {
+		t.Fatal("call with a zero limit should refresh")
+	}
+}

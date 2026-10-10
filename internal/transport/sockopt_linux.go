@@ -20,6 +20,16 @@ var (
 	lowatWarnOne sync.Once
 )
 
+func setNotSentLowat(c *net.TCPConn, bytes int) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, bytes)
+	})
+}
+
 // tuneSocket sets TCP_NOTSENT_LOWAT and BBR on the socket. BBR keeps
 // the router queue smaller than the default CUBIC. Errors are only logged.
 func tuneSocket(c *net.TCPConn) {

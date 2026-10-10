@@ -57,3 +57,17 @@ func TestDecodeRejectsShort(t *testing.T) {
 		t.Error("expected DecodeOutbound to reject a too-short envelope")
 	}
 }
+
+func TestPathPingRoundTrip(t *testing.T) {
+	wire := EncodePathPing(12345)
+	if !IsPathPing(wire) || IsPing(wire) {
+		t.Fatal("path ping must not be mistaken for a regular ping")
+	}
+	nonce, ok := DecodePathPing(wire)
+	if !ok || nonce != 12345 {
+		t.Fatalf("got nonce=%d ok=%v", nonce, ok)
+	}
+	if _, ok := DecodePathPing(EncodePing(1)); ok {
+		t.Fatal("regular ping decoded as path ping")
+	}
+}

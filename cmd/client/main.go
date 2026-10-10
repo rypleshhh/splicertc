@@ -10,7 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -24,7 +24,6 @@ import (
 	"tcp-dormtun/internal/measure"
 	"tcp-dormtun/internal/pktfilter"
 	"tcp-dormtun/internal/proto"
-	"tcp-dormtun/internal/sched"
 	"tcp-dormtun/internal/socks5"
 	"tcp-dormtun/internal/transport"
 )
@@ -409,31 +408,6 @@ func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, int
 	time.Sleep(300 * time.Millisecond)
 }
 
-// flowInfo keeps the addresses of the original packet so we can build
-// the reply packet.
-type flowInfo struct {
-	origSrc, origDst         [4]byte
-	origSrcPort, origDstPort uint16
-}
-
-// flowKey is the full 4-tuple. Source port alone isn't enough, Steam
-// talks to many relays from one socket.
-type flowKey struct {
-	srcPort uint16
-	dst     [4]byte
-	dstPort uint16
-}
-
-// allocFlowID returns the ID for key or gives it a new one.
-func allocFlowID(ids map[flowKey]uint16, counter *uint16, key flowKey) uint16 {
-	if id, ok := ids[key]; ok {
-		return id
-	}
-	*counter++
-	ids[key] = *counter
-	return *counter
-}
-
 // runTunMode captures UDP from the TUN device, sends it through glue and
 // writes the replies back into the TUN. IPv4 only.
 func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
@@ -453,111 +427,32 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		stats = measure.New()
 	}
 
-	// same session id on all paths so the server can dedup
-	sid := make([]byte, 8)
-	if _, err := rand.Read(sid); err != nil {
-		log.Fatalf("generate session id: %v", err)
+	flows := newFlowTable()
+	var onPing func(uint64)
+	if stats != nil {
+		onPing = stats.OnRecv
 	}
+	gp, err := startGluePaths(glueAddr, insecure, pin, key, paths, glueReplyHandler(flows, func(pkt []byte) {
+		if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
+			log.Printf("TUN write: %v", err)
+		}
+	}, onPing))
+	if err != nil {
+		log.Fatalf("dial glue channel: %v", err)
+	}
+	log.Printf("connected to glue channel %s over %d path(s)", glueAddr, gp.live())
 
-	conns := make([]net.Conn, 0, paths)
-	for i := 0; i < paths; i++ {
-		c, err := transport.Dial(glueAddr, insecure, pin)
-		if err != nil {
-			log.Fatalf("dial glue path %d: %v", i, err)
-		}
-		if key != nil {
-			if err := auth.ClientHandshake(c, key); err != nil {
-				log.Fatalf("auth on path %d: %v", i, err)
-			}
-		}
-		if _, err := c.Write(sid); err != nil {
-			log.Fatalf("send session id on path %d: %v", i, err)
-		}
-		conns = append(conns, c)
-	}
-	defer func() {
-		for _, c := range conns {
-			c.Close()
+	go func() {
+		for now := range time.Tick(2 * time.Second) {
+			flows.sweep(now, gameFlowIdleTimeout)
 		}
 	}()
-	log.Printf("connected to glue channel %s over %d path(s)", glueAddr, paths)
-
-	var flowsMu sync.Mutex
-	flows := make(map[uint16]flowInfo)
-	flowIDs := make(map[flowKey]uint16)
-	var flowIDCounter uint16
-
-	// replies come on every path, drop the duplicates
-	replyRecv := frame.NewReceiver(150 * time.Millisecond)
-	var replyMu sync.Mutex
-
-	for _, c := range conns {
-		go func(c net.Conn) {
-			for {
-				f, err := frame.ReadFrame(c)
-				if err != nil {
-					return
-				}
-				// ping reply, stats ignores duplicates
-				if nonce, isPing := glue.DecodePing(f.Payload); isPing {
-					if stats != nil {
-						stats.OnRecv(nonce)
-					}
-					continue
-				}
-
-				replyMu.Lock()
-				ok, _ := replyRecv.Accept(f)
-				replyMu.Unlock()
-				if !ok {
-					continue // duplicate
-				}
-
-				flowID, payload, err := glue.DecodeInbound(f.Payload)
-				if err != nil {
-					continue
-				}
-				flowsMu.Lock()
-				fi, known := flows[flowID]
-				flowsMu.Unlock()
-				if !known {
-					continue
-				}
-				pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload)
-				if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
-					log.Printf("TUN write: %v", err)
-				}
-			}
-		}(c)
-	}
 
 	log.Println("waiting for UDP packets, set up the interface and routes")
 
-	var seqMu sync.Mutex
-	var seq uint32
-	nextSeq := func() uint32 {
-		seqMu.Lock()
-		seq++
-		v := seq
-		seqMu.Unlock()
-		return v
-	}
-
-	// each path has its own writer so a slow path doesn't block the others
-	writers := make([]*sched.PathWriter, len(conns))
-	for i, c := range conns {
-		writers[i] = sched.NewPathWriter(c, gluePathDepth, glueStaleAfter)
-	}
-	defer func() {
-		for _, w := range writers {
-			w.Close()
-		}
-	}()
-	writeAllPaths := func(wire []byte) {
-		for _, w := range writers {
-			w.Send(wire)
-		}
-	}
+	var seq atomic.Uint32
+	nextSeq := func() uint32 { return seq.Add(1) }
+	writeAllPaths := gp.send
 
 	if stats != nil {
 		var nonce uint64
@@ -601,18 +496,14 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 				continue
 			}
 
-			var fi flowInfo
+			fi := flowInfo{origSrcPort: info.SrcPort, origDstPort: info.DstPort}
 			copy(fi.origSrc[:], info.Src.To4())
 			copy(fi.origDst[:], info.Dst.To4())
-			fi.origSrcPort = info.SrcPort
-			fi.origDstPort = info.DstPort
 
-			key := flowKey{srcPort: info.SrcPort, dst: fi.origDst, dstPort: info.DstPort}
-
-			flowsMu.Lock()
-			flowID := allocFlowID(flowIDs, &flowIDCounter, key)
-			flows[flowID] = fi
-			flowsMu.Unlock()
+			flowID, ok := flows.id(fi, time.Now())
+			if !ok {
+				continue // all flow IDs in use
+			}
 
 			envelope := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
 			wire := frame.New(nextSeq(), envelope).Marshal()
