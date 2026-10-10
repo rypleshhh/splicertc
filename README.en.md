@@ -550,8 +550,9 @@ TLS.
 
 ### Brute-force/scan defense
 
-After 3 failed authentication attempts (wrong public key, bad
-signature, etc.) from the same IP, the server bans that IP for 10
+After 3 failed authentication attempts (wrong public key or bad
+signature; network errors during TLS don't count, so reconnecting on a
+bad link doesn't ban your own client) from the same IP, the server bans that IP for 10
 minutes — new connections from it are refused immediately, without
 attempting a handshake. A successful authentication resets the counter.
 The ban can't tell a scanner apart from a legitimate client that just
@@ -559,6 +560,20 @@ mistyped its own `client_key`, so it stays short and every ban is
 logged loudly (`auth: banning <IP> until ...`) — if your own client
 suddenly can't connect, the reason is right there in
 `docker compose logs`.
+
+The server confirms an accepted key, so the client knows right away
+when its key was rejected: `client.exe` then exits with `server
+rejected the client key` instead of reconnecting in a loop (which
+would quickly get it banned). It also exits when the server
+certificate doesn't match the pin (`server certificate does not match
+pinned fingerprint` — delete the pin file or update `server_pin`). The
+tray's ping shows the real result too.
+
+If you lost the public key for your `client_key`:
+```
+go run ./cmd/genkey -name me -pub <client_key>
+```
+prints the ready `authorized_keys.json` line.
 
 ### Amplification-attack defense in the glue channel
 

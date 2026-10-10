@@ -9,6 +9,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"errors"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -145,13 +147,53 @@ func TestHandshakeFailsWithUnauthorizedKey(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_, serverErr = ServerHandshake(serverConn, keys)
+		serverConn.Close() // the real server closes on failure
 	}()
 
-	_ = ClientHandshake(clientConn, seed)
+	clientErr := ClientHandshake(clientConn, seed)
 	wg.Wait()
 
-	if serverErr == nil {
-		t.Error("expected server to reject a client whose public key isn't in authorized_keys")
+	if !errors.Is(serverErr, ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized on the server, got %v", serverErr)
+	}
+	// the client must find out, not think it's connected
+	if !errors.Is(clientErr, ErrRejected) {
+		t.Errorf("expected ErrRejected on the client, got %v", clientErr)
+	}
+}
+
+// After a successful handshake the stream must be in sync: the next
+// byte the client reads is application data, not part of the handshake.
+func TestHandshakeLeavesStreamInSync(t *testing.T) {
+	pub, seed, err := GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := &AuthorizedKeys{byKey: map[string]string{string(pub): "friend1"}}
+	serverConn, clientConn := tlsPair(t)
+
+	go func() {
+		if _, err := ServerHandshake(serverConn, keys); err == nil {
+			serverConn.Write([]byte("data"))
+		}
+	}()
+	if err := ClientHandshake(clientConn, seed); err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(clientConn, buf); err != nil || string(buf) != "data" {
+		t.Fatalf("expected %q after the handshake, got %q (%v)", "data", buf, err)
+	}
+}
+
+func TestPublicKeyFromSeed(t *testing.T) {
+	pub, seed, err := GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := PublicKeyFromSeed(seed)
+	if err != nil || string(got) != string(pub) {
+		t.Fatalf("PublicKeyFromSeed doesn't match the generated public key (%v)", err)
 	}
 }
 

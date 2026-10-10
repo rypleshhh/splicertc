@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -34,6 +35,12 @@ type vpnLink struct {
 	conn net.Conn // nil while reconnecting
 }
 
+// isPermanentDialError is true for errors that won't go away by
+// reconnecting: wrong key or a different server certificate.
+func isPermanentDialError(err error) bool {
+	return errors.Is(err, auth.ErrRejected) || errors.Is(err, transport.ErrPinMismatch)
+}
+
 func dialVPN(addr string, insecure bool, pin, key []byte) (net.Conn, error) {
 	c, err := transport.Dial(addr, insecure, pin)
 	if err != nil {
@@ -62,6 +69,11 @@ func (l *vpnLink) run(conn net.Conn) {
 			conn, err = l.dial()
 			if err == nil {
 				break
+			}
+			// retrying won't help here, and with a wrong key it would
+			// only get this IP banned
+			if isPermanentDialError(err) {
+				log.Fatalf("vpn: reconnect: %v", err)
 			}
 			log.Printf("vpn: reconnect failed: %v (retry in %v)", err, min(backoff*2, redialMax))
 			backoff = min(backoff*2, redialMax)

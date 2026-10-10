@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -113,7 +114,11 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 	name, err := auth.ServerHandshake(conn, authorizedKeys)
 	if err != nil {
 		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
-		recordAuthFailure(ip)
+		// only a wrong key counts towards the ban, not network errors:
+		// clients reconnect by themselves and a bad link shouldn't ban them
+		if errors.Is(err, auth.ErrUnauthorized) {
+			recordAuthFailure(ip)
+		}
 		return "", false
 	}
 	recordAuthSuccess(ip)

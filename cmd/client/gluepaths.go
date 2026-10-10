@@ -146,6 +146,9 @@ func (g *gluePaths) keepPath(i int, first chan<- error) {
 			first <- err
 			first = nil
 		}
+		if err != nil && isPermanentDialError(err) {
+			log.Fatalf("glue: path %d: %v", i, err)
+		}
 		if err != nil {
 			log.Printf("glue: path %d: connect failed: %v (retry in %v)", i, err, backoff)
 			time.Sleep(backoff)

@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -55,6 +56,11 @@ func (l noDelayListener) Accept() (net.Conn, error) {
 // DialTimeout limits both the TCP connect and the TLS handshake.
 const DialTimeout = 10 * time.Second
 
+// ErrPinMismatch means the server cert is not the pinned one: the cert
+// was regenerated (delete the pin file / update server_pin) or it's not
+// our server at all.
+var ErrPinMismatch = errors.New("server certificate does not match pinned fingerprint")
+
 // Dial connects with TLS. Nagle is disabled because we send lots of
 // small packets and don't want them delayed (tls.Dial doesn't let us
 // set it, so the TCP connection is created manually).
@@ -82,7 +88,7 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 			}
 			sum := sha256.Sum256(rawCerts[0])
 			if !bytes.Equal(sum[:], pin) {
-				return fmt.Errorf("server certificate does not match pinned fingerprint")
+				return ErrPinMismatch
 			}
 			return nil
 		}
