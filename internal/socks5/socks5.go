@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 )
 
 const (
@@ -89,7 +90,8 @@ func ReadRequest(conn net.Conn) (string, error) {
 	}
 	port := binary.BigEndian.Uint16(portBuf)
 
-	return fmt.Sprintf("%s:%d", host, port), nil
+	// JoinHostPort adds [] around IPv6 addresses
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
 // WriteReply sends the reply. Bound address is just zeros.

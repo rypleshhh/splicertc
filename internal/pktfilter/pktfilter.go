@@ -15,8 +15,9 @@ type Info struct {
 	Version          int
 	Proto            byte
 	Src, Dst         net.IP
-	SrcPort, DstPort uint16 // only for UDP
-	Payload          []byte // UDP payload, points into the packet
+	SrcPort, DstPort uint16 // only for UDP, 0 for fragments
+	Payload          []byte // UDP payload, points into the packet; nil for fragments
+	Fragment         bool   // IPv4 fragment, ports and payload are not known
 	Len              int
 	Noise            bool
 	Reason           string
@@ -64,15 +65,27 @@ func Parse(pkt []byte) (info Info, ok bool) {
 			return info, false
 		}
 		ihl := int(pkt[0]&0x0F) * 4
+		if ihl < 20 || ihl > len(pkt) {
+			return info, false
+		}
 		info.Proto = pkt[9]
 		info.Src = net.IP(pkt[12:16])
 		info.Dst = net.IP(pkt[16:20])
+		// MF flag or a fragment offset: only the first fragment has the
+		// UDP header, and none of them has the whole payload
+		info.Fragment = binary.BigEndian.Uint16(pkt[6:8])&0x3FFF != 0
 
-		if info.Proto == 17 && len(pkt) >= ihl+4 {
+		// the TUN may give us padding after the IP packet
+		if total := int(binary.BigEndian.Uint16(pkt[2:4])); total >= ihl && total < len(pkt) {
+			pkt = pkt[:total]
+		}
+
+		if info.Proto == 17 && !info.Fragment && len(pkt) >= ihl+8 {
 			info.SrcPort = binary.BigEndian.Uint16(pkt[ihl : ihl+2])
 			info.DstPort = binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
-			if len(pkt) >= ihl+8 {
-				info.Payload = pkt[ihl+8:]
+			udpLen := int(binary.BigEndian.Uint16(pkt[ihl+4 : ihl+6]))
+			if udpLen >= 8 && ihl+udpLen <= len(pkt) {
+				info.Payload = pkt[ihl+8 : ihl+udpLen]
 			}
 		}
 

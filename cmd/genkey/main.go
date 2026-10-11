@@ -5,13 +5,29 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 
 	"tcp-dormtun/internal/auth"
 )
 
 func main() {
 	name := flag.String("name", "friend", "label for this identity, just for your own authorized_keys.json bookkeeping")
+	from := flag.String("pub", "", "print the authorized_keys.json entry for an existing client_key instead of making a new pair")
 	flag.Parse()
+
+	if *from != "" {
+		seed, err := auth.DecodeKey(*from)
+		if err == nil {
+			var pub []byte
+			pub, err = auth.PublicKeyFromSeed(seed)
+			if err == nil {
+				fmt.Printf("  { \"name\": %q, \"public_key\": %q }\n", *name, auth.EncodeKey(pub))
+				return
+			}
+		}
+		fmt.Println("bad client_key:", err)
+		os.Exit(1)
+	}
 
 	pub, seed, err := auth.GenerateKeypair()
 	if err != nil {

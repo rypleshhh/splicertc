@@ -13,6 +13,7 @@ type PathWriter struct {
 	conn      net.Conn
 	ch        chan queued
 	maxAge    time.Duration
+	timeout   time.Duration
 	done      chan struct{}
 	closeOnce sync.Once
 	drops     atomic.Uint64
@@ -23,17 +24,26 @@ type queued struct {
 	t    time.Time
 }
 
+// A write that takes longer than this means the path is stuck (the
+// kernel buffer is full and nothing is acked). The path gets closed.
+const PathWriteTimeout = time.Second
+
 // NewPathWriter starts a writer with a queue of depth frames. Frames
 // older than maxAge are skipped (0 = no limit).
 func NewPathWriter(conn net.Conn, depth int, maxAge time.Duration) *PathWriter {
+	return newPathWriter(conn, depth, maxAge, PathWriteTimeout)
+}
+
+func newPathWriter(conn net.Conn, depth int, maxAge, timeout time.Duration) *PathWriter {
 	if depth < 1 {
 		depth = 1
 	}
 	p := &PathWriter{
-		conn:   conn,
-		ch:     make(chan queued, depth),
-		maxAge: maxAge,
-		done:   make(chan struct{}),
+		conn:    conn,
+		ch:      make(chan queued, depth),
+		maxAge:  maxAge,
+		timeout: timeout,
+		done:    make(chan struct{}),
 	}
 	go p.run()
 	return p
@@ -62,6 +72,9 @@ func (p *PathWriter) Send(data []byte) {
 
 func (p *PathWriter) Drops() uint64 { return p.drops.Load() }
 
+// Done is closed after Close (also when a write failed or timed out).
+func (p *PathWriter) Done() <-chan struct{} { return p.done }
+
 // Close stops the writer and closes the connection.
 func (p *PathWriter) Close() {
 	p.closeOnce.Do(func() {
@@ -79,6 +92,9 @@ func (p *PathWriter) run() {
 			if p.maxAge > 0 && time.Since(q.t) > p.maxAge {
 				p.drops.Add(1)
 				continue
+			}
+			if p.timeout > 0 {
+				_ = p.conn.SetWriteDeadline(time.Now().Add(p.timeout))
 			}
 			if _, err := p.conn.Write(q.data); err != nil {
 				p.Close()

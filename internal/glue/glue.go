@@ -13,7 +13,29 @@ const (
 	msgOutbound byte = 1 // client -> server: forward this payload to dst
 	msgInbound  byte = 2 // server -> client: this payload came back from dst
 	msgPing     byte = 3 // ping, server sends it back
+	// path ping: the server sends it back on the same connection only,
+	// without seq dedup. Used to check each path separately.
+	msgPathPing byte = 4
 )
+
+// EncodePathPing makes a path ping. The nonce is usually a send time.
+func EncodePathPing(nonce uint64) []byte {
+	buf := make([]byte, 1+8)
+	buf[0] = msgPathPing
+	binary.BigEndian.PutUint64(buf[1:9], nonce)
+	return buf
+}
+
+func DecodePathPing(b []byte) (nonce uint64, ok bool) {
+	if len(b) < 9 || b[0] != msgPathPing {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(b[1:9]), true
+}
+
+func IsPathPing(b []byte) bool {
+	return len(b) >= 1 && b[0] == msgPathPing
+}
 
 // EncodePing makes a ping with a nonce, the server echoes it back.
 func EncodePing(nonce uint64) []byte {
@@ -57,6 +79,10 @@ func DecodeOutbound(b []byte) (flowID uint16, dst net.IP, dstPort uint16, payloa
 	payload = b[9:]
 	return flowID, dst, dstPort, payload, nil
 }
+
+// MaxInboundPayload is the biggest UDP reply that fits into one frame
+// together with the inbound header (type + flow ID).
+const MaxInboundPayload = 65535 - 3
 
 func EncodeInbound(flowID uint16, payload []byte) []byte {
 	buf := make([]byte, 1+2+len(payload))

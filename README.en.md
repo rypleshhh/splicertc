@@ -238,6 +238,34 @@ Verify: `ping 1.1.1.1`, `curl https://example.com`,
 `curl -UseBasicParsing https://api.ipify.org` (should return the
 server's IP, not your own).
 
+`setup-vpn-route.ps1` takes the server IP from `-ServerIP` (the tray
+passes it, from `vpn_addr`), or without it from `vpn_addr` in
+`client-config.json` next to the script. No need to edit the script
+for your server any more.
+
+### Limits of the vpn channel
+
+- **One client at a time.** The server TUN has one client address
+  (`10.66.0.2`). A reconnect of the same client (same key) replaces the
+  old connection; a different client is refused (`vpn: refusing ... vpn
+  channel is used by ...`) while the first one is connected. So every
+  person and every device needs its own key: two devices with one key
+  kick each other out.
+- **Own source address only.** The server forwards only IPv4 packets
+  with source `10.66.0.2`. Packets with another source are dropped
+  (logged once: `vpn: dropping packets ... with a source address other
+  than ...`), otherwise the VPS could be used to send spoofed packets.
+- **The VPS itself isn't reachable through the tunnel.** `iptables -I
+  INPUT -i dormvpn0 -j DROP` blocks sshd, Xray and everything else
+  listening on the server from the tunnel, and `-d 169.254.0.0/16 -j
+  DROP` blocks the cloud metadata service. The tunnel only forwards to
+  the internet. The reliable channel (`socks5`) doesn't connect to the
+  server's loopback and link-local addresses either.
+- **IPv6 and DNS.** The tunnel is IPv4 only. If the dorm network has
+  IPv6, IPv6 traffic bypasses the tunnel; Windows may also send DNS
+  queries through the normal interface. Doesn't matter for gaming,
+  matters for privacy.
+
 ### Latency under load
 
 All non-game traffic rides inside one TCP connection, and TCP has one
@@ -271,6 +299,11 @@ the tunnel does about it (all on by default, nothing to configure):
   client no longer waits on the vpn socket before sending a game packet
   into glue.
 
+- **Small buffers on glue paths** — 32 KB send buffer on the client
+  and a 4 KB unsent-data cap on the server: game packets are tiny, and
+  with a big buffer a stuck path keeps old packets instead of being
+  detected as dead quickly.
+
 When the queue is actually cutting something, the server logs
 `vpn: queue dropped N packets ...` every 30 seconds — normal during
 downloads; that's how it keeps them from inflating latency.
@@ -285,6 +318,42 @@ link → `"vpn_down_mbps": 44` and `"vpn_up_mbps": 17`. The queue then
 forms inside the tunnel, where FQ-CoDel manages it, instead of in the
 router, which the tunnel can't reach. Off by default — without knowing
 the real link speed it could cut throughput for nothing.
+
+### Disconnects and reconnecting
+
+The client survives disconnects by itself, the process doesn't exit:
+
+- **`vpn` channel**: the client sends a keepalive every 2 seconds, the
+  server answers. If nothing at all arrived for 7 seconds (the network
+  silently stopped forwarding, no RST), the connection is treated as
+  dead and the client reconnects with a 0.5 → 5 s backoff. The log shows
+  `vpn: connection lost (...), reconnecting`, then `connected to vpn
+  channel ...` again. The TUN adapter and routes stay; packets during
+  the outage are lost (TCP inside the tunnel resends them).
+- **glue paths**: each path is pinged separately every 200 ms. A path
+  that didn't answer for 1 second is closed and redialed in the
+  background under the same session ID, the other paths keep working.
+  The log shows `glue: path N lost: ..., reconnecting`.
+- A socket write stuck for more than 1 s (glue) or 10 s (vpn) also
+  counts as a disconnect.
+- Only the very first connect is fatal (wrong address/key), so the
+  error is visible right away.
+
+Update server and client together: an old server doesn't answer path
+pings and keepalives, and a new client will keep treating its
+connections as dead and reconnecting.
+
+The server cleans up after itself: UDP sockets to game servers with no
+packets for 2 minutes are closed, sessions with no paths for 2 minutes
+are removed.
+
+Limits, so one client (or a bug in it) can't eat all server resources:
+at most 512 UDP flows per session, 8 paths per session and 256 glue
+sessions in total. A session belongs to the client that created it:
+another key can't join it. A connection that doesn't finish TLS, the
+key check and the session ID within 15 seconds is closed. Docker logs
+are capped (3 files of 10 MB, see `docker-compose.yml`), and websites
+from the reliable channel are not logged.
 
 ### Selective multipath for games (optional)
 
@@ -311,8 +380,17 @@ Windows IP Helper API, `GetExtendedUdpTable` — no third-party
 dependency), so there's no need to guess game-server IP ranges. UDP
 only; that process's TCP and everything else still rides the single
 `vpn` stream. The server also needs a working `glue_addr` in
-`server-config.json` for this — no server code changes, just both
-channels listening (two different ports).
+`server-config.json` for this — both channels listening (two different
+ports).
+
+The "glue or vpn" decision is made once per flow (destination
+address+port and local port) and never changes: moving a flow between
+channels changes its outside address, and the game server sees that
+as a new client. If the port isn't in the Windows table yet (socket
+just opened), the client reloads the table right away (at most every
+100 ms) and drops packets until then — better to lose one packet than
+to start the flow on the wrong channel. If the owner doesn't show up
+within a second, the flow goes over `vpn`.
 
 #### Finding the exact process name
 
@@ -424,13 +502,11 @@ routes). Then:
   drawing every control). Not configurable and doesn't follow the
   system theme — just always dark.
 
-**Honest about the limits**: this is a thin wrapper, not a rewritten,
-more robust client. If the tunnel drops on its own (`client.exe` still
-crashes on any disconnect — see IDEAS.md P1 #4, not fixed yet), the app
-notices and shows "client exited unexpectedly," but doesn't reconnect
-automatically — you have to click "Connect" again. Treat it as a
-convenient control panel on top of the existing stack, not a guarantee
-of automatic reconnection.
+On a disconnect `client.exe` reconnects by itself (see
+["Disconnects and reconnecting"](#disconnects-and-reconnecting)); the
+status shows "переподключение..." and then "подключено" again, nothing
+to click. "Client exited unexpectedly" only happens if the process
+really crashed — check `tray.log` then.
 
 ## Authentication
 
@@ -510,8 +586,9 @@ TLS.
 
 ### Brute-force/scan defense
 
-After 3 failed authentication attempts (wrong public key, bad
-signature, etc.) from the same IP, the server bans that IP for 10
+After 3 failed authentication attempts (wrong public key or bad
+signature; network errors during TLS don't count, so reconnecting on a
+bad link doesn't ban your own client) from the same IP, the server bans that IP for 10
 minutes — new connections from it are refused immediately, without
 attempting a handshake. A successful authentication resets the counter.
 The ban can't tell a scanner apart from a legitimate client that just
@@ -519,6 +596,20 @@ mistyped its own `client_key`, so it stays short and every ban is
 logged loudly (`auth: banning <IP> until ...`) — if your own client
 suddenly can't connect, the reason is right there in
 `docker compose logs`.
+
+The server confirms an accepted key, so the client knows right away
+when its key was rejected: `client.exe` then exits with `server
+rejected the client key` instead of reconnecting in a loop (which
+would quickly get it banned). It also exits when the server
+certificate doesn't match the pin (`server certificate does not match
+pinned fingerprint` — delete the pin file or update `server_pin`). The
+tray's ping shows the real result too.
+
+If you lost the public key for your `client_key`:
+```
+go run ./cmd/genkey -name me -pub <client_key>
+```
+prints the ready `authorized_keys.json` line.
 
 ### Amplification-attack defense in the glue channel
 

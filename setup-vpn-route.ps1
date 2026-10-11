@@ -5,12 +5,34 @@ re-run — tears down any routes/address left over from a previous run
 (e.g. after the TUN adapter got recreated) before re-adding them, and
 auto-detects the dorm gateway instead of needing it typed in by hand.
 
-Edit the variables below if the VPS IP/port or tunnel subnet change.
+The server IP comes from -ServerIP (the tray app passes it), otherwise
+from vpn_addr in client-config.json next to this script.
 #>
+
+param(
+    [string]$ServerIP = ""
+)
 
 $ErrorActionPreference = "Continue"
 
-$ServerIP   = "82.23.163.204"
+if (-not $ServerIP) {
+    $cfgPath = Join-Path $PSScriptRoot "client-config.json"
+    if (-not (Test-Path $cfgPath)) {
+        Write-Error "No -ServerIP given and $cfgPath not found."
+        exit 1
+    }
+    $vpnAddr = (Get-Content $cfgPath -Raw | ConvertFrom-Json).vpn_addr
+    $hostPart = ($vpnAddr -replace ':\d+$', '')
+    $ServerIP = [System.Net.Dns]::GetHostAddresses($hostPart) |
+        Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+        Select-Object -First 1 | ForEach-Object { $_.IPAddressToString }
+    if (-not $ServerIP) {
+        Write-Error "Could not resolve the server address '$vpnAddr' from $cfgPath."
+        exit 1
+    }
+}
+Write-Host "Server IP: $ServerIP"
+
 $TunName    = "dormvpn0"
 $TunIP      = "10.66.0.2"
 $TunMask    = "255.255.255.0"

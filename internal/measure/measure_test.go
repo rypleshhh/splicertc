@@ -51,3 +51,18 @@ func TestDuplicateEchoIgnored(t *testing.T) {
 		t.Errorf("duplicate echo should not double-count: received=%d", sum.Received)
 	}
 }
+
+// A long run must not keep every sample.
+func TestSamplesAreBounded(t *testing.T) {
+	s := New()
+	for i := uint64(0); i < maxSamples+500; i++ {
+		s.OnSend(i)
+		s.OnRecv(i)
+	}
+	if len(s.rtts) != maxSamples {
+		t.Fatalf("kept %d samples, want %d", len(s.rtts), maxSamples)
+	}
+	if sum := s.Snapshot(time.Second); sum.Received != maxSamples+500 {
+		t.Fatalf("received counter = %d", sum.Received)
+	}
+}

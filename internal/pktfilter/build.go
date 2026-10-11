@@ -7,9 +7,16 @@ import (
 
 var ipID uint32
 
+// MaxUDPPayload is the biggest payload that fits into one IPv4 packet.
+const MaxUDPPayload = 65535 - 20 - 8
+
 // BuildIPv4UDP builds an IPv4+UDP packet to write into the TUN device.
-// UDP checksum is 0, which is allowed for IPv4.
+// UDP checksum is 0, which is allowed for IPv4. Returns nil if the
+// payload is too big for one packet.
 func BuildIPv4UDP(src, dst [4]byte, srcPort, dstPort uint16, payload []byte) []byte {
+	if len(payload) > MaxUDPPayload {
+		return nil
+	}
 	totalLen := 20 + 8 + len(payload)
 	pkt := make([]byte, totalLen)
 

@@ -6,3 +6,5 @@ import "net"
 
 // Not supported outside Linux.
 func tuneSocket(*net.TCPConn) {}
+
+func setNotSentLowat(*net.TCPConn, int) {}

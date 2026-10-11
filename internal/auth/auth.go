@@ -5,7 +5,9 @@
 // Handshake: server sends a random challenge, client signs
 // prefix + challenge + TLS exporter value and sends back its public key
 // and the signature. The exporter value is different for every TLS
-// session, so a signature can't be reused on another connection.
+// session, so a signature can't be reused on another connection. If the
+// key is accepted the server answers with one byte (authOK), otherwise
+// it just closes the connection.
 package auth
 
 import (
@@ -14,6 +16,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +31,17 @@ const authContext = "splicertc-auth-v1"
 
 const exporterLabel = "splicertc-auth-binding"
 const exporterLen = 32
+
+// sent by the server after a successful check
+const authOK byte = 1
+
+// ErrUnauthorized is returned by ServerHandshake when the key is not in
+// the list or the signature is wrong (not for network errors).
+var ErrUnauthorized = errors.New("authentication failed")
+
+// ErrRejected is returned by ClientHandshake when the server closed the
+// connection instead of accepting the key.
+var ErrRejected = errors.New("server rejected the client key (is its public key in the server's authorized_keys.json?)")
 
 // GenerateKeypair returns a public key (for authorized_keys.json) and a
 // private seed (for the client config).
@@ -148,7 +162,7 @@ func ServerHandshake(conn net.Conn, keys *AuthorizedKeys) (string, error) {
 
 	name, known := keys.byKey[string(pub)]
 	if !known {
-		return "", fmt.Errorf("authentication failed: unrecognized public key")
+		return "", fmt.Errorf("%w: unrecognized public key", ErrUnauthorized)
 	}
 
 	msg, err := bindingMessage(tc, challenge)
@@ -156,7 +170,10 @@ func ServerHandshake(conn net.Conn, keys *AuthorizedKeys) (string, error) {
 		return "", err
 	}
 	if !ed25519.Verify(pub, msg, sig) {
-		return "", fmt.Errorf("authentication failed: invalid signature for %q", name)
+		return "", fmt.Errorf("%w: invalid signature for %q", ErrUnauthorized, name)
+	}
+	if _, err := conn.Write([]byte{authOK}); err != nil {
+		return "", fmt.Errorf("send ok: %w", err)
 	}
 	return name, nil
 }
@@ -190,5 +207,24 @@ func ClientHandshake(conn net.Conn, seed []byte) error {
 	if _, err := conn.Write(resp); err != nil {
 		return fmt.Errorf("send response: %w", err)
 	}
+
+	ok := make([]byte, 1)
+	if _, err := io.ReadFull(conn, ok); err != nil {
+		if errors.Is(err, io.EOF) {
+			return ErrRejected // server closed the connection on purpose
+		}
+		return fmt.Errorf("read auth result: %w", err)
+	}
+	if ok[0] != authOK {
+		return fmt.Errorf("unexpected auth result %d", ok[0])
+	}
 	return nil
+}
+
+// PublicKeyFromSeed returns the public key for a client_key.
+func PublicKeyFromSeed(seed []byte) ([]byte, error) {
+	if len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("client key: expected a %d-byte seed, got %d bytes", ed25519.SeedSize, len(seed))
+	}
+	return ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey), nil
 }
