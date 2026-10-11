@@ -80,6 +80,10 @@ func DecodeOutbound(b []byte) (flowID uint16, dst net.IP, dstPort uint16, payloa
 	return flowID, dst, dstPort, payload, nil
 }
 
+// MaxInboundPayload is the biggest UDP reply that fits into one frame
+// together with the inbound header (type + flow ID).
+const MaxInboundPayload = 65535 - 3
+
 func EncodeInbound(flowID uint16, payload []byte) []byte {
 	buf := make([]byte, 1+2+len(payload))
 	buf[0] = msgInbound

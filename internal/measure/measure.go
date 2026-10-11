@@ -5,15 +5,22 @@ package measure
 import (
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
+
+// Only the last maxSamples RTTs are kept for min/mean/p95/max. With a
+// ping every 33ms that's the last ~5 minutes; keeping all of them would
+// grow forever and make every Snapshot slower.
+const maxSamples = 10000
 
 // Stats tracks outstanding pings and completed round trips.
 type Stats struct {
 	mu        sync.Mutex
 	sentAt    map[uint64]time.Time
-	rtts      []time.Duration
+	rtts      []time.Duration // ring buffer, next points to the oldest
+	next      int
 	sent      int
 	received  int
 	lastRTT   time.Duration
@@ -43,7 +50,12 @@ func (s *Stats) OnRecv(nonce uint64) {
 	delete(s.sentAt, nonce)
 
 	rtt := time.Since(sentAt)
-	s.rtts = append(s.rtts, rtt)
+	if len(s.rtts) < maxSamples {
+		s.rtts = append(s.rtts, rtt)
+	} else {
+		s.rtts[s.next] = rtt
+		s.next = (s.next + 1) % maxSamples
+	}
 	s.received++
 
 	// smoothed difference between consecutive RTTs
@@ -74,7 +86,8 @@ type Summary struct {
 }
 
 // Snapshot returns the current stats. Pings without a reply after
-// lossTimeout count as lost.
+// lossTimeout count as lost. Sent/received/loss are for the whole run,
+// the RTT numbers for the last maxSamples replies.
 func (s *Stats) Snapshot(lossTimeout time.Duration) Summary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -90,12 +103,7 @@ func (s *Stats) Snapshot(lossTimeout time.Duration) Summary {
 
 	sorted := make([]time.Duration, len(s.rtts))
 	copy(sorted, s.rtts)
-	// insertion sort, not many samples
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
 	sum.MinRTT = sorted[0]
 	sum.MaxRTT = sorted[len(sorted)-1]

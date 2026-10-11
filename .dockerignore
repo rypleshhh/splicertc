@@ -4,3 +4,16 @@ client
 tunprobe
 *.exe
 .git/
+
+# Real configs and keys are mounted at runtime, they must not end up in
+# the build context (and in the build cache) at all.
+server-config.json
+client-config.json
+authorized_keys.json
+connections.json
+*.key
+*.pin
+tray.log*
+IDEAS.md
+slorc/
+owenlivkit/

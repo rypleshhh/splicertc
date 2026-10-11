@@ -15,6 +15,10 @@ import (
 
 const headerSize = 4 + 8 + 2 // seq + timestamp ms + payload length
 
+// MaxPayload is the biggest payload a frame can carry (the length field
+// is 16 bit). Callers must check it, Marshal can't report an error.
+const MaxPayload = 65535
+
 type Frame struct {
 	Seq         uint32
 	TimestampMS int64

@@ -257,7 +257,9 @@ func glueReplyHandler(flows *flowTable, devWrite func([]byte), onPing func(nonce
 		if !known {
 			return
 		}
-		devWrite(pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload))
+		if pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload); pkt != nil {
+			devWrite(pkt)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"flag"
 	"log"
 	"math/big"
 	"net"
@@ -17,6 +18,12 @@ import (
 )
 
 func main() {
+	force := flag.Bool("force", false, "overwrite an existing devcerts/dev.crt (every client's pin has to be updated after that)")
+	flag.Parse()
+	if _, err := os.Stat("devcerts/dev.crt"); err == nil && !*force {
+		log.Fatalf("devcerts/dev.crt already exists; a new cert breaks the clients' pins. Use -force if you really want a new one")
+	}
+
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Fatalf("generate key: %v", err)
@@ -46,7 +53,7 @@ func main() {
 		log.Fatalf("mkdir: %v", err)
 	}
 
-	certOut, err := os.Create("devcerts/dev.crt")
+	certOut, err := os.OpenFile("devcerts/dev.crt", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("create dev.crt: %v", err)
 	}
@@ -57,7 +64,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("marshal key: %v", err)
 	}
-	keyOut, err := os.Create("devcerts/dev.key")
+	// the private key must not be readable by other users of the VPS
+	keyOut, err := os.OpenFile("devcerts/dev.key", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Fatalf("create dev.key: %v", err)
 	}

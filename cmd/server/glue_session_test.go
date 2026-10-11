@@ -24,8 +24,8 @@ func testSession(t *testing.T, id string) (*glueSession, net.Conn) {
 	t.Cleanup(func() { b.Close() })
 	w := sched.NewPathWriter(a, 4, 0)
 	t.Cleanup(w.Close)
-	s, n := attachGluePath(id, a, w)
-	if n != 1 {
+	s, n, ok := attachGluePath(id, "me", a, w)
+	if !ok || n != 1 {
 		t.Fatalf("expected 1 path, got %d", n)
 	}
 	t.Cleanup(func() {
@@ -113,4 +113,33 @@ func TestCleanupRemovesIdleFlowsAndSessions(t *testing.T) {
 	if ok {
 		t.Fatal("session without paths was not removed")
 	}
+}
+
+// Another client must not join (and read replies of) someone else's session.
+func TestGlueSessionOwnedByOneClient(t *testing.T) {
+	testSession(t, "owned")
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	w := sched.NewPathWriter(a, 4, 0)
+	defer w.Close()
+	if _, _, ok := attachGluePath("owned", "stranger", a, w); ok {
+		t.Fatal("a different client joined the session")
+	}
+}
+
+func TestGlueFlowLimit(t *testing.T) {
+	s, _ := testSession(t, "limit")
+	l := udpListener(t)
+	port := uint16(l.LocalAddr().(*net.UDPAddr).Port)
+	lo := net.IPv4(127, 0, 0, 1)
+	for i := 0; i < maxFlowsPerSession; i++ {
+		if _, err := s.flow("limit", uint16(i), lo, port); err != nil {
+			t.Fatalf("flow %d: %v", i, err)
+		}
+	}
+	if _, err := s.flow("limit", uint16(maxFlowsPerSession), lo, port); err != errTooManyFlows {
+		t.Fatalf("expected errTooManyFlows, got %v", err)
+	}
+	cleanupGlue(time.Now().Add(glueFlowIdle + time.Second))
 }

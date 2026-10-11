@@ -1,24 +1,23 @@
+// Command server is the VPS side of the tunnel. It listens on four TLS
+// ports, one per channel:
+//
+//	reliable  (addr)      SOCKS5-style TCP streams over smux    reliable.go
+//	droppable (drop_addr) test channel, frames are only logged  drop.go
+//	glue      (glue_addr) game UDP, multipath + dedup           glue.go
+//	vpn       (vpn_addr)  whole IP packets into a TUN + NAT     vpn.go, vpn_setup.go
+//
+// Every connection starts with TLS and the key check from auth.go.
 package main
 
 import (
-	"encoding/hex"
-	"errors"
 	"flag"
-	"io"
 	"log"
 	"net"
 	"os"
-	"sync"
 	"time"
-
-	"github.com/xtaci/smux"
 
 	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/config"
-	"tcp-dormtun/internal/frame"
-	"tcp-dormtun/internal/glue"
-	"tcp-dormtun/internal/proto"
-	"tcp-dormtun/internal/sched"
 	"tcp-dormtun/internal/transport"
 )
 
@@ -38,330 +37,6 @@ type Config struct {
 	AuthorizedKeysFile string `json:"authorized_keys_file,omitempty"`
 	// speed limit server->client in Mbit/s, 0 = off
 	VPNDownMbps float64 `json:"vpn_down_mbps,omitempty"`
-}
-
-// nil means auth is off
-var authorizedKeys *auth.AuthorizedKeys
-
-// Ban an IP for authBanDuration after maxAuthFailures failed logins.
-const (
-	maxAuthFailures = 3
-	authBanDuration = 10 * time.Minute
-)
-
-var authFailures = struct {
-	mu          sync.Mutex
-	count       map[string]int
-	bannedUntil map[string]time.Time
-}{count: make(map[string]int), bannedUntil: make(map[string]time.Time)}
-
-// authIP returns the remote IP without the port.
-func authIP(conn net.Conn) string {
-	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-	if err != nil {
-		return conn.RemoteAddr().String()
-	}
-	return host
-}
-
-// checkAuthBan also removes expired bans.
-func checkAuthBan(ip string) (until time.Time, banned bool) {
-	authFailures.mu.Lock()
-	defer authFailures.mu.Unlock()
-	until, banned = authFailures.bannedUntil[ip]
-	if !banned {
-		return time.Time{}, false
-	}
-	if time.Now().After(until) {
-		delete(authFailures.bannedUntil, ip)
-		delete(authFailures.count, ip)
-		return time.Time{}, false
-	}
-	return until, true
-}
-
-func recordAuthFailure(ip string) {
-	authFailures.mu.Lock()
-	defer authFailures.mu.Unlock()
-	authFailures.count[ip]++
-	if authFailures.count[ip] >= maxAuthFailures {
-		until := time.Now().Add(authBanDuration)
-		authFailures.bannedUntil[ip] = until
-		log.Printf("auth: banning %s until %s after %d failed attempts", ip, until.Format(time.RFC3339), authFailures.count[ip])
-	}
-}
-
-func recordAuthSuccess(ip string) {
-	authFailures.mu.Lock()
-	defer authFailures.mu.Unlock()
-	delete(authFailures.count, ip)
-	delete(authFailures.bannedUntil, ip)
-}
-
-// checkAuth runs the auth handshake (if enabled) and returns the client
-// name. Must be called right after Accept.
-func checkAuth(conn net.Conn) (name string, ok bool) {
-	if authorizedKeys == nil {
-		return "", true
-	}
-
-	ip := authIP(conn)
-	if until, banned := checkAuthBan(ip); banned {
-		log.Printf("auth: rejected %s: banned until %s (too many failed attempts)", conn.RemoteAddr(), until.Format(time.RFC3339))
-		return "", false
-	}
-
-	name, err := auth.ServerHandshake(conn, authorizedKeys)
-	if err != nil {
-		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
-		// only a wrong key counts towards the ban, not network errors:
-		// clients reconnect by themselves and a bad link shouldn't ban them
-		if errors.Is(err, auth.ErrUnauthorized) {
-			recordAuthFailure(ip)
-		}
-		return "", false
-	}
-	recordAuthSuccess(ip)
-	return name, true
-}
-
-// dropSession is shared by all connections with the same session ID,
-// so duplicates from parallel paths are detected.
-type dropSession struct {
-	mu         sync.Mutex
-	recv       *frame.Receiver
-	seen       map[uint32]struct{}
-	accepted   int
-	ttlDropped int // counts copies, not real loss with multipath
-	duplicates int
-	paths      int
-	lastActive time.Time
-}
-
-var dropSessions = struct {
-	mu sync.Mutex
-	m  map[string]*dropSession
-}{m: make(map[string]*dropSession)}
-
-// getDropSession also counts the caller as a connected path, call
-// leave() when it disconnects.
-func getDropSession(id string) *dropSession {
-	dropSessions.mu.Lock()
-	defer dropSessions.mu.Unlock()
-	s, ok := dropSessions.m[id]
-	if !ok {
-		s = &dropSession{recv: frame.NewReceiver(150 * time.Millisecond), seen: make(map[uint32]struct{})}
-		dropSessions.m[id] = s
-	}
-	s.mu.Lock()
-	s.paths++
-	s.lastActive = time.Now()
-	s.mu.Unlock()
-	return s
-}
-
-func (s *dropSession) leave() {
-	s.mu.Lock()
-	s.paths--
-	s.lastActive = time.Now()
-	s.mu.Unlock()
-}
-
-// glueSession is shared by all paths with the same session ID.
-// udpFlows are the UDP sockets to game servers, paths are the client
-// connections replies are sent to.
-type glueSession struct {
-	mu       sync.Mutex
-	recv     *frame.Receiver
-	udpFlows map[uint16]*udpFlow
-	paths    map[net.Conn]*sched.PathWriter
-	replySeq uint32
-	// when the last path went away, zero while there are paths
-	emptySince time.Time
-}
-
-// udpFlow is one UDP socket to a game server.
-type udpFlow struct {
-	conn     *net.UDPConn
-	dst      string
-	lastSeen time.Time
-}
-
-// Queue size per glue path (~0.5s of game traffic). Older frames would
-// be dropped by the client anyway (150ms TTL).
-const (
-	gluePathDepth  = 32
-	glueStaleAfter = 150 * time.Millisecond
-	// client sends a path ping every 200ms, so 10s of silence = dead path
-	glueReadTimeout = 10 * time.Second
-	// small unsent-data limit for glue sockets, game packets are tiny
-	glueNotSentLowat = 4 * 1024
-)
-
-// Cleanup: flows with no packets either way and sessions with no paths
-// are removed after this long.
-const (
-	glueFlowIdle    = 2 * time.Minute
-	glueSessionIdle = 2 * time.Minute
-	janitorInterval = 30 * time.Second
-)
-
-var glueSessions = struct {
-	mu sync.Mutex
-	m  map[string]*glueSession
-}{m: make(map[string]*glueSession)}
-
-// attachGluePath finds or creates the session and adds the path to it.
-// Both happen under glueSessions.mu so the janitor can't delete the
-// session in between.
-func attachGluePath(id string, conn net.Conn, w *sched.PathWriter) (*glueSession, int) {
-	glueSessions.mu.Lock()
-	defer glueSessions.mu.Unlock()
-	s, ok := glueSessions.m[id]
-	if !ok {
-		s = &glueSession{
-			recv:     frame.NewReceiver(150 * time.Millisecond),
-			udpFlows: make(map[uint16]*udpFlow),
-			paths:    make(map[net.Conn]*sched.PathWriter),
-		}
-		glueSessions.m[id] = s
-	}
-	s.mu.Lock()
-	s.paths[conn] = w
-	s.emptySince = time.Time{}
-	n := len(s.paths)
-	s.mu.Unlock()
-	return s, n
-}
-
-func (s *glueSession) detachPath(conn net.Conn) {
-	s.mu.Lock()
-	delete(s.paths, conn)
-	if len(s.paths) == 0 {
-		s.emptySince = time.Now()
-	}
-	s.mu.Unlock()
-}
-
-// flow returns the UDP socket for flowID. If the client reused flowID for
-// another destination, the old socket is closed and a new one is made.
-// Everything is done under s.mu so two paths can't create two sockets
-// for the same flow (DialUDP doesn't send anything, it's fast).
-func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16) (*net.UDPConn, error) {
-	raddr := &net.UDPAddr{IP: dst, Port: int(dstPort)}
-	key := raddr.String()
-	now := time.Now()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if f, ok := s.udpFlows[flowID]; ok {
-		if f.dst == key {
-			f.lastSeen = now
-			return f.conn, nil
-		}
-		log.Printf("glue: flow %d moved %s -> %s (session %s)", flowID, f.dst, key, sid)
-		f.conn.Close()
-		delete(s.udpFlows, flowID)
-	}
-
-	uc, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	f := &udpFlow{conn: uc, dst: key, lastSeen: now}
-	s.udpFlows[flowID] = f
-	log.Printf("glue: new flow %d -> %s (session %s)", flowID, key, sid)
-
-	// read replies for this flow until the socket is closed
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, err := uc.Read(buf)
-			if err != nil {
-				return
-			}
-			s.mu.Lock()
-			f.lastSeen = time.Now()
-			s.mu.Unlock()
-			s.broadcastReply(flowID, buf[:n])
-		}
-	}()
-	return uc, nil
-}
-
-// cleanupGlue removes idle flows and sessions nobody is connected to.
-func cleanupGlue(now time.Time) {
-	glueSessions.mu.Lock()
-	defer glueSessions.mu.Unlock()
-	for id, s := range glueSessions.m {
-		s.mu.Lock()
-		for flowID, f := range s.udpFlows {
-			if now.Sub(f.lastSeen) > glueFlowIdle {
-				f.conn.Close()
-				delete(s.udpFlows, flowID)
-			}
-		}
-		gone := len(s.paths) == 0 && !s.emptySince.IsZero() && now.Sub(s.emptySince) > glueSessionIdle
-		if gone {
-			for _, f := range s.udpFlows {
-				f.conn.Close()
-			}
-			s.udpFlows = map[uint16]*udpFlow{}
-		}
-		s.mu.Unlock()
-		if gone {
-			delete(glueSessions.m, id)
-			log.Printf("glue: session %s removed (no paths for %v)", id, glueSessionIdle)
-		}
-	}
-}
-
-func cleanupDrop(now time.Time) {
-	dropSessions.mu.Lock()
-	defer dropSessions.mu.Unlock()
-	for id, s := range dropSessions.m {
-		s.mu.Lock()
-		gone := s.paths == 0 && now.Sub(s.lastActive) > glueSessionIdle
-		s.mu.Unlock()
-		if gone {
-			delete(dropSessions.m, id)
-		}
-	}
-}
-
-func janitor() {
-	for range time.Tick(janitorInterval) {
-		now := time.Now()
-		cleanupGlue(now)
-		cleanupDrop(now)
-	}
-}
-
-// broadcastPing sends a ping reply to all paths.
-func (s *glueSession) broadcastPing(nonce uint64) {
-	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodePing(nonce)).Marshal() })
-}
-
-// broadcastReply sends a reply to all paths.
-func (s *glueSession) broadcastReply(flowID uint16, payload []byte) {
-	s.broadcast(func(seq uint32) []byte { return frame.New(seq, glue.EncodeInbound(flowID, payload)).Marshal() })
-}
-
-// broadcast doesn't block. Dead paths are removed by handleGlueConn.
-func (s *glueSession) broadcast(build func(seq uint32) []byte) {
-	s.mu.Lock()
-	seq := s.replySeq
-	s.replySeq++
-	writers := make([]*sched.PathWriter, 0, len(s.paths))
-	for _, w := range s.paths {
-		writers = append(writers, w)
-	}
-	s.mu.Unlock()
-
-	wire := build(seq)
-	for _, w := range writers {
-		w.Send(wire)
-	}
 }
 
 func main() {
@@ -415,276 +90,53 @@ func main() {
 		log.Println("WARNING: no authorized_keys_file, anyone can connect to this server!")
 	}
 
-	ln, err := transport.Listen(*addr, *cert, *key)
-	if err != nil {
-		log.Fatalf("listen: %v", err)
-	}
-	log.Printf("reliable channel listening on %s", *addr)
+	ln := listen("reliable", *addr, *cert, *key)
+	dropLn := listen("droppable", *dropAddr, *cert, *key)
+	glueLn := listen("glue", *glueAddr, *cert, *key)
+	vpnLn := listen("vpn", *vpnAddr, *cert, *key)
 
-	dropLn, err := transport.Listen(*dropAddr, *cert, *key)
-	if err != nil {
-		log.Fatalf("droppable listen: %v", err)
-	}
-	log.Printf("droppable channel listening on %s", *dropAddr)
-
-	glueLn, err := transport.Listen(*glueAddr, *cert, *key)
-	if err != nil {
-		log.Fatalf("glue listen: %v", err)
-	}
-	log.Printf("glue channel listening on %s", *glueAddr)
-
-	vpnLn, err := transport.Listen(*vpnAddr, *cert, *key)
-	if err != nil {
-		log.Fatalf("vpn listen: %v", err)
-	}
-	log.Printf("vpn channel listening on %s", *vpnAddr)
-
-	vpnDev, _, _, _, err := setupVPNTun(*vpnTunName, *vpnTunMTU, *vpnSubnet, *egressIface)
+	vpnDev, vpnNetwork, err := setupVPNTun(*vpnTunName, *vpnTunMTU, *vpnSubnet, *egressIface)
 	if err != nil {
 		log.Fatalf("vpn tun setup: %v", err)
 	}
 	go vpnTunReader(vpnDev)
 	go janitor()
 
-	go func() {
-		for {
-			conn, err := vpnLn.Accept()
-			if err != nil {
-				log.Printf("vpn accept: %v", err)
-				continue
-			}
-			go handleVPNConn(conn, vpnDev)
-		}
-	}()
+	go acceptLoop("vpn", vpnLn, func(c net.Conn) { handleVPNConn(c, vpnDev, vpnNetwork) })
+	go acceptLoop("droppable", dropLn, handleDroppableConn)
+	go acceptLoop("glue", glueLn, handleGlueConn)
+	acceptLoop("reliable", ln, handleConn)
+}
 
-	go func() {
-		for {
-			conn, err := dropLn.Accept()
-			if err != nil {
-				log.Printf("droppable accept: %v", err)
-				continue
-			}
-			go handleDroppableConn(conn)
-		}
-	}()
+func listen(name, addr, cert, key string) net.Listener {
+	ln, err := transport.Listen(addr, cert, key)
+	if err != nil {
+		log.Fatalf("%s listen: %v", name, err)
+	}
+	log.Printf("%s channel listening on %s", name, addr)
+	return ln
+}
 
-	go func() {
-		for {
-			conn, err := glueLn.Accept()
-			if err != nil {
-				log.Printf("glue accept: %v", err)
-				continue
-			}
-			go handleGlueConn(conn)
-		}
-	}()
-
+// acceptLoop runs handle in its own goroutine for every connection.
+func acceptLoop(name string, ln net.Listener, handle func(net.Conn)) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			log.Printf("%s accept: %v", name, err)
+			// e.g. out of file descriptors, don't spin at 100% CPU
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleConn(conn)
+		go handle(conn)
 	}
 }
 
-// handleDroppableConn uses its own connection, separate from smux, so a
-// stall on one doesn't affect the other.
-func handleDroppableConn(conn net.Conn) {
-	defer conn.Close()
-	name, ok := checkAuth(conn)
-	if !ok {
-		return
-	}
-
-	sidBuf := make([]byte, 8)
-	if _, err := io.ReadFull(conn, sidBuf); err != nil {
-		log.Printf("droppable: read session id: %v", err)
-		return
-	}
-	sid := hex.EncodeToString(sidBuf)
-	sess := getDropSession(sid)
-	defer sess.leave()
-	log.Printf("droppable path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
-
-	for {
-		f, err := frame.ReadFrame(conn)
-		if err != nil {
-			sess.mu.Lock()
-			a, t, d, total := sess.accepted, sess.ttlDropped, sess.duplicates, len(sess.seen)
-			sess.mu.Unlock()
-			lost := total - a
-			lossPct := 0.0
-			if total > 0 {
-				lossPct = 100 * float64(lost) / float64(total)
-			}
-			log.Printf("droppable path closed (session %s): %v. summary: %d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
-				sid, err, a, total, lost, lossPct, t, d)
-			return
-		}
-		age := time.Since(time.UnixMilli(f.TimestampMS))
-
-		sess.mu.Lock()
-		sess.seen[f.Seq] = struct{}{}
-		ok, reason := sess.recv.Accept(f)
-		switch {
-		case ok:
-			sess.accepted++
-		case reason == "ttl exceeded":
-			sess.ttlDropped++
-		default:
-			sess.duplicates++
-		}
-		sess.mu.Unlock()
-
-		if ok {
-			log.Printf("[session %s] frame %d accepted (age %v) via %s", sid, f.Seq, age, conn.RemoteAddr())
-		} else {
-			log.Printf("[session %s] frame %d dropped (%s, age %v) via %s", sid, f.Seq, reason, age, conn.RemoteAddr())
-		}
-	}
-}
-
-func handleConn(conn net.Conn) {
-	defer conn.Close()
-	name, ok := checkAuth(conn)
-	if !ok {
-		return
-	}
-	log.Printf("client connected: %s (%q)", conn.RemoteAddr(), name)
-
-	sess, err := smux.Server(conn, nil)
-	if err != nil {
-		log.Printf("smux server: %v", err)
-		return
-	}
-	defer sess.Close()
-
-	for {
-		stream, err := sess.AcceptStream()
-		if err != nil {
-			log.Printf("session closed: %v", err)
-			return
-		}
-		go handleStream(stream)
-	}
-}
-
-func handleStream(s *smux.Stream) {
-	defer s.Close()
-
-	target, err := proto.ReadTarget(s)
-	if err != nil {
-		log.Printf("stream %d: read target: %v", s.ID(), err)
-		return
-	}
-	log.Printf("stream %d: dialing %s", s.ID(), target)
-
-	outConn, err := net.DialTimeout("tcp", target, 10*time.Second)
-	if err != nil {
-		log.Printf("stream %d: dial %s failed: %v", s.ID(), target, err)
-		s.Write([]byte{0x01})
-		return
-	}
-	defer outConn.Close()
-
-	if _, err := s.Write([]byte{0x00}); err != nil {
-		log.Printf("stream %d: write status: %v", s.ID(), err)
-		return
-	}
-
-	relay(s, outConn)
-	log.Printf("stream %d: closed", s.ID())
-}
-
-func relay(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
-}
-
-// handleGlueConn relays UDP for the client. Several connections can have
-// the same session ID (multipath), they share one glueSession.
-func handleGlueConn(conn net.Conn) {
-	defer conn.Close()
-	name, ok := checkAuth(conn)
-	if !ok {
-		return
-	}
-
-	sidBuf := make([]byte, 8)
-	if _, err := io.ReadFull(conn, sidBuf); err != nil {
-		log.Printf("glue: read session id: %v", err)
-		return
-	}
-	sid := hex.EncodeToString(sidBuf)
-	transport.SetNotSentLowat(conn, glueNotSentLowat)
-
-	writer := sched.NewPathWriter(conn, gluePathDepth, glueStaleAfter)
-	sess, nPaths := attachGluePath(sid, conn, writer)
-	log.Printf("glue path connected: %s (session %s, client %q, %d path(s) now)", conn.RemoteAddr(), sid, name, nPaths)
-
-	defer func() {
-		sess.detachPath(conn)
-		writer.Close()
-		if d := writer.Drops(); d > 0 {
-			log.Printf("glue path %s: %d reply frame(s) dropped while this path was backed up (the other paths carried them)", conn.RemoteAddr(), d)
-		}
-	}()
-
-	for {
-		_ = conn.SetReadDeadline(time.Now().Add(glueReadTimeout))
-		f, err := frame.ReadFrame(conn)
-		if err != nil {
-			log.Printf("glue: path closed (session %s): %v", sid, err)
-			return
-		}
-
-		// path ping: send it back on this path only, no dedup
-		if glue.IsPathPing(f.Payload) {
-			writer.Send(f.Marshal())
-			continue
-		}
-
-		// pings: only check duplicates, not age
-		if glue.IsPing(f.Payload) {
-			sess.mu.Lock()
-			ok, _ := sess.recv.AcceptSeq(f)
-			sess.mu.Unlock()
-			if ok {
-				nonce, _ := glue.DecodePing(f.Payload)
-				sess.broadcastPing(nonce)
-			}
-			continue
-		}
-
-		sess.mu.Lock()
-		ok, _ := sess.recv.Accept(f)
-		sess.mu.Unlock()
-		if !ok {
-			continue // duplicate or too old
-		}
-
-		flowID, dst, dstPort, payload, err := glue.DecodeOutbound(f.Payload)
-		if err != nil {
-			log.Printf("glue: decode: %v", err)
-			continue
-		}
-
-		if ok, reason := glue.DestinationAllowed(dst, dstPort); !ok {
-			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
-			continue
-		}
-
-		udpConn, err := sess.flow(sid, flowID, dst, dstPort)
-		if err != nil {
-			log.Printf("glue: dial UDP %s:%d for flow %d: %v", dst, dstPort, flowID, err)
-			continue
-		}
-		if _, err := udpConn.Write(payload); err != nil {
-			log.Printf("glue: write to UDP target for flow %d: %v", flowID, err)
-		}
+// janitor periodically removes state nobody uses any more.
+func janitor() {
+	for range time.Tick(janitorInterval) {
+		now := time.Now()
+		cleanupGlue(now)
+		cleanupDrop(now)
+		cleanupAuthFailures(now)
 	}
 }

@@ -1,12 +1,9 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
 	"log"
 	"net"
-	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,7 +13,14 @@ import (
 	"tcp-dormtun/internal/sched"
 )
 
-// Only one vpn client at a time, a new one replaces the old one.
+// vpn channel: every frame is one whole IPv4 packet. Packets from the
+// client go into the server TUN (and out to the internet through NAT),
+// packets coming back from the TUN go to the client.
+//
+// The TUN has one client address (.2), so only one vpn client at a time.
+// A new connection from the same client (a reconnect) replaces the old
+// one; a different client is refused while the current one is connected.
+
 var (
 	vpnMu      sync.Mutex
 	currentVPN *vpnPeer
@@ -39,6 +43,7 @@ var keepaliveFlow = sched.FlowKey{Proto: 255}
 // vpnPeer is a client connection plus its send queue. The TUN reader
 // only puts packets in the queue, writeLoop sends them.
 type vpnPeer struct {
+	name string
 	conn net.Conn
 	q    *sched.Scheduler
 }
@@ -89,149 +94,6 @@ func nextVPNSeq() uint32 {
 	return v
 }
 
-// setupVPNTun creates and configures the server TUN device and the NAT
-// rules. Linux only.
-func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (dev tun.Device, serverIP, clientIP net.IP, actualName string, err error) {
-	dev, err = tun.CreateTUN(name, mtu)
-	if err != nil {
-		return nil, nil, nil, "", fmt.Errorf("create TUN: %w", err)
-	}
-	actualName, _ = dev.Name()
-
-	ip, ipnet, err := net.ParseCIDR(subnetCIDR)
-	if err != nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("parse -vpn-subnet %q: %w", subnetCIDR, err)
-	}
-	ones, _ := ipnet.Mask.Size()
-	base := ip.To4()
-	if base == nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("-vpn-subnet %q is not IPv4", subnetCIDR)
-	}
-	serverIP = net.IPv4(base[0], base[1], base[2], base[3]|1)
-	clientIP = net.IPv4(base[0], base[1], base[2], base[3]|2)
-
-	if err := run("ip", "addr", "add", fmt.Sprintf("%s/%d", serverIP, ones), "dev", actualName); err != nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("ip addr add: %w", err)
-	}
-	if err := run("ip", "link", "set", "dev", actualName, "up"); err != nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("ip link set up: %w", err)
-	}
-
-	// can't set this from inside docker, /proc/sys is read-only there
-	if cur, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err != nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("read ip_forward: %w", err)
-	} else if strings.TrimSpace(string(cur)) != "1" {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf(
-			"net.ipv4.ip_forward is off, run on the host (not in docker):\n" +
-				"  sudo sysctl -w net.ipv4.ip_forward=1\n" +
-				"  echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-dormtun.conf")
-	}
-
-	if egressIface == "" {
-		egressIface, err = detectEgressIface()
-		if err != nil {
-			dev.Close()
-			return nil, nil, nil, "", fmt.Errorf("auto-detect egress interface failed, pass -egress-iface explicitly: %w", err)
-		}
-		log.Printf("vpn: auto-detected egress interface: %s", egressIface)
-	}
-
-	if err := ensureIptables(subnetCIDR, egressIface, actualName); err != nil {
-		dev.Close()
-		return nil, nil, nil, "", fmt.Errorf("iptables setup: %w", err)
-	}
-
-	log.Printf("vpn: TUN %s up, server=%s client=%s (subnet %s), forwarding out %s",
-		actualName, serverIP, clientIP, subnetCIDR, egressIface)
-	return dev, serverIP, clientIP, actualName, nil
-}
-
-// detectEgressIface parses `ip route get 8.8.8.8`, e.g.:
-//
-//	8.8.8.8 via 203.0.113.1 dev eth0 src 203.0.113.5 uid 0
-func detectEgressIface() (string, error) {
-	out, err := exec.Command("ip", "route", "get", "8.8.8.8").Output()
-	if err != nil {
-		return "", err
-	}
-	fields := strings.Fields(string(out))
-	for i, f := range fields {
-		if f == "dev" && i+1 < len(fields) {
-			return fields[i+1], nil
-		}
-	}
-	return "", fmt.Errorf("could not parse egress interface from: %q", string(out))
-}
-
-// iptablesRule has the args to check a rule (-C) and to add it.
-type iptablesRule struct {
-	check, add []string
-}
-
-// ensureIptables adds NAT, FORWARD and MSS clamp rules if they're not
-// there yet.
-func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
-	// without MASQUERADE nothing works, the other rules are optional
-	masquerade := iptablesRule{
-		check: []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
-		add:   []string{"-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
-	}
-	if err := run("iptables", masquerade.check...); err != nil {
-		if err := run("iptables", masquerade.add...); err != nil {
-			return fmt.Errorf("iptables %v: %w", masquerade.add, err)
-		}
-	}
-
-	rules := []iptablesRule{
-		// docker sets FORWARD policy to DROP, our rules have to go into
-		// DOCKER-USER which is checked first
-		{
-			check: []string{"-C", "DOCKER-USER", "-i", tunIface, "-j", "ACCEPT"},
-			add:   []string{"-I", "DOCKER-USER", "1", "-i", tunIface, "-j", "ACCEPT"},
-		},
-		{
-			check: []string{"-C", "DOCKER-USER", "-o", tunIface, "-j", "ACCEPT"},
-			add:   []string{"-I", "DOCKER-USER", "1", "-o", tunIface, "-j", "ACCEPT"},
-		},
-		// for hosts without docker
-		{
-			check: []string{"-C", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
-			add:   []string{"-A", "FORWARD", "-i", tunIface, "-j", "ACCEPT"},
-		},
-		{
-			check: []string{"-C", "FORWARD", "-o", tunIface, "-j", "ACCEPT"},
-			add:   []string{"-A", "FORWARD", "-o", tunIface, "-j", "ACCEPT"},
-		},
-		{
-			check: []string{"-t", "mangle", "-C", "FORWARD", "-o", tunIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
-			add:   []string{"-t", "mangle", "-A", "FORWARD", "-o", tunIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
-		},
-	}
-	for _, r := range rules {
-		if err := run("iptables", r.check...); err == nil {
-			continue
-		}
-		if err := run("iptables", r.add...); err != nil {
-			log.Printf("vpn: WARNING: iptables %v failed (%v), traffic on %s may be dropped", r.add, err, tunIface)
-		}
-	}
-	return nil
-}
-
-func run(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %v: %w (%s)", name, args, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
 // vpnTunReader reads replies from the TUN device and queues them for the
 // current client.
 func vpnTunReader(dev tun.Device) {
@@ -256,34 +118,53 @@ func vpnTunReader(dev tun.Device) {
 		}
 		for i := 0; i < n; i++ {
 			pkt := bufs[i][:sizes[i]]
+			if len(pkt) > frame.MaxPayload {
+				continue // doesn't fit in a frame
+			}
 			// Marshal copies pkt
 			peer.q.Enqueue(sched.FlowOf(pkt), frame.New(nextVPNSeq(), pkt).Marshal())
 		}
 	}
 }
 
+// claimVPN makes peer the current client. A reconnect of the same client
+// replaces its old connection, another client gets ok=false.
+func claimVPN(peer *vpnPeer) (old *vpnPeer, ok bool) {
+	vpnMu.Lock()
+	defer vpnMu.Unlock()
+	old = currentVPN
+	if old != nil && old.name != peer.name {
+		return old, false
+	}
+	currentVPN = peer
+	return old, true
+}
+
 // handleVPNConn handles one vpn client connection.
-func handleVPNConn(conn net.Conn, dev tun.Device) {
+func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 	defer conn.Close()
+	startHandshake(conn)
 	name, ok := checkAuth(conn)
 	if !ok {
 		return
 	}
+	endHandshake(conn)
 
-	peer := &vpnPeer{conn: conn, q: sched.New(sched.Config{})}
-	done := make(chan struct{})
-	go peer.writeLoop()
-	go logQueueDrops("vpn", peer.q, done)
-
-	vpnMu.Lock()
-	old := currentVPN
-	currentVPN = peer
-	vpnMu.Unlock()
+	peer := &vpnPeer{name: name, conn: conn, q: sched.New(sched.Config{})}
+	old, ok := claimVPN(peer)
+	if !ok {
+		log.Printf("vpn: refusing %s (%q): vpn channel is used by %q", conn.RemoteAddr(), name, old.name)
+		return
+	}
 	if old != nil {
-		log.Printf("vpn: new client %s replacing previous peer %s", conn.RemoteAddr(), old.conn.RemoteAddr())
+		log.Printf("vpn: %q reconnected from %s, closing the old connection %s", name, conn.RemoteAddr(), old.conn.RemoteAddr())
 		old.conn.Close()
 	}
 	log.Printf("vpn: client connected: %s (%q)", conn.RemoteAddr(), name)
+
+	done := make(chan struct{})
+	go peer.writeLoop()
+	go logQueueDrops("vpn", peer.q, done)
 
 	defer func() {
 		vpnMu.Lock()
@@ -296,6 +177,7 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 		log.Printf("vpn: client disconnected: %s", conn.RemoteAddr())
 	}()
 
+	spoofLogged := false
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(vpnReadTimeout))
 		f, err := frame.ReadFrame(conn)
@@ -307,10 +189,25 @@ func handleVPNConn(conn net.Conn, dev tun.Device) {
 			peer.q.Enqueue(keepaliveFlow, frame.New(nextVPNSeq(), nil).Marshal())
 			continue
 		}
+		// Only IPv4 from the client's own tunnel address goes out. Without
+		// this a client could send packets with someone else's source IP
+		// out of the VPS (spoofing for reflection attacks).
+		if !fromClient(f.Payload, vn.clientIP) {
+			if !spoofLogged {
+				spoofLogged = true
+				log.Printf("vpn: dropping packets from %q with a source address other than %s", name, vn.clientIP)
+			}
+			continue
+		}
 		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)
 		}
 	}
+}
+
+// fromClient reports if pkt is IPv4 with source address clientIP.
+func fromClient(pkt []byte, clientIP net.IP) bool {
+	return len(pkt) >= 20 && pkt[0]>>4 == 4 && bytes.Equal(pkt[12:16], clientIP.To4())
 }
 
 // On Linux wireguard-go's TUN wants a 10 byte virtio header before the

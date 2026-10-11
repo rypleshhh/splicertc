@@ -238,6 +238,34 @@ Verify: `ping 1.1.1.1`, `curl https://example.com`,
 `curl -UseBasicParsing https://api.ipify.org` (should return the
 server's IP, not your own).
 
+`setup-vpn-route.ps1` takes the server IP from `-ServerIP` (the tray
+passes it, from `vpn_addr`), or without it from `vpn_addr` in
+`client-config.json` next to the script. No need to edit the script
+for your server any more.
+
+### Limits of the vpn channel
+
+- **One client at a time.** The server TUN has one client address
+  (`10.66.0.2`). A reconnect of the same client (same key) replaces the
+  old connection; a different client is refused (`vpn: refusing ... vpn
+  channel is used by ...`) while the first one is connected. So every
+  person and every device needs its own key: two devices with one key
+  kick each other out.
+- **Own source address only.** The server forwards only IPv4 packets
+  with source `10.66.0.2`. Packets with another source are dropped
+  (logged once: `vpn: dropping packets ... with a source address other
+  than ...`), otherwise the VPS could be used to send spoofed packets.
+- **The VPS itself isn't reachable through the tunnel.** `iptables -I
+  INPUT -i dormvpn0 -j DROP` blocks sshd, Xray and everything else
+  listening on the server from the tunnel, and `-d 169.254.0.0/16 -j
+  DROP` blocks the cloud metadata service. The tunnel only forwards to
+  the internet. The reliable channel (`socks5`) doesn't connect to the
+  server's loopback and link-local addresses either.
+- **IPv6 and DNS.** The tunnel is IPv4 only. If the dorm network has
+  IPv6, IPv6 traffic bypasses the tunnel; Windows may also send DNS
+  queries through the normal interface. Doesn't matter for gaming,
+  matters for privacy.
+
 ### Latency under load
 
 All non-game traffic rides inside one TCP connection, and TCP has one
@@ -318,6 +346,14 @@ connections as dead and reconnecting.
 The server cleans up after itself: UDP sockets to game servers with no
 packets for 2 minutes are closed, sessions with no paths for 2 minutes
 are removed.
+
+Limits, so one client (or a bug in it) can't eat all server resources:
+at most 512 UDP flows per session, 8 paths per session and 256 glue
+sessions in total. A session belongs to the client that created it:
+another key can't join it. A connection that doesn't finish TLS, the
+key check and the session ID within 15 seconds is closed. Docker logs
+are capped (3 files of 10 MB, see `docker-compose.yml`), and websites
+from the reliable channel are not logged.
 
 ### Selective multipath for games (optional)
 

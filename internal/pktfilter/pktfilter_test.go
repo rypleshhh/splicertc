@@ -81,3 +81,27 @@ func TestShortPacketRejected(t *testing.T) {
 		t.Error("expected Parse to reject a too-short packet")
 	}
 }
+
+// Fragments carry no usable ports or payload, and the payload of a whole
+// datagram ends at the UDP length, not at the end of the buffer.
+func TestParseFragmentsAndUDPLength(t *testing.T) {
+	pkt := BuildIPv4UDP([4]byte{10, 0, 0, 2}, [4]byte{1, 2, 3, 4}, 5000, 27015, []byte("hello"))
+	padded := append(append([]byte(nil), pkt...), 0, 0, 0)
+	info, ok := Parse(padded)
+	if !ok || string(info.Payload) != "hello" || info.Fragment {
+		t.Fatalf("whole datagram: ok=%v payload=%q fragment=%v", ok, info.Payload, info.Fragment)
+	}
+
+	frag := append([]byte(nil), pkt...)
+	frag[6] |= 0x20 // MF
+	info, ok = Parse(frag)
+	if !ok || !info.Fragment || info.Payload != nil || info.SrcPort != 0 {
+		t.Fatalf("fragment: ok=%v fragment=%v payload=%q port=%d", ok, info.Fragment, info.Payload, info.SrcPort)
+	}
+
+	bad := append([]byte(nil), pkt...)
+	bad[0] = 0x44 // IHL 16 bytes, invalid
+	if _, ok := Parse(bad); ok {
+		t.Fatal("packet with IHL < 20 was accepted")
+	}
+}
