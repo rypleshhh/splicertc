@@ -44,10 +44,10 @@ func handleConn(conn net.Conn) {
 	}
 }
 
-// targetDialer refuses to connect to the server itself (loopback) and to
-// link-local addresses (cloud metadata at 169.254.169.254). The check is
-// done on the resolved IP, so a hostname pointing to 127.0.0.1 doesn't
-// get through either.
+// targetDialer only connects where the egress policy allows: not to the
+// server itself (loopback or its own public IP), not to private networks
+// and cloud metadata. The check is done on the resolved IP right before
+// connect(), so a hostname pointing to 127.0.0.1 doesn't get through.
 var targetDialer = net.Dialer{
 	Timeout: 10 * time.Second,
 	Control: func(network, address string, _ syscall.RawConn) error {
@@ -55,20 +55,11 @@ var targetDialer = net.Dialer{
 		if err != nil {
 			return err
 		}
-		if !tcpTargetAllowed(net.ParseIP(host)) {
-			return fmt.Errorf("target %s is not allowed", host)
+		if ok, reason := destinations.Allowed(net.ParseIP(host)); !ok {
+			return fmt.Errorf("target %s is not allowed: %s", host, reason)
 		}
 		return nil
 	},
-}
-
-func tcpTargetAllowed(ip net.IP) bool {
-	return ip != nil &&
-		!ip.IsLoopback() &&
-		!ip.IsLinkLocalUnicast() &&
-		!ip.IsLinkLocalMulticast() &&
-		!ip.IsMulticast() &&
-		!ip.IsUnspecified()
 }
 
 func handleStream(s *smux.Stream) {

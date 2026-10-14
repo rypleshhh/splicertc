@@ -41,25 +41,6 @@ func TestClaimVPN(t *testing.T) {
 	}
 }
 
-func TestTCPTargetAllowed(t *testing.T) {
-	for _, c := range []struct {
-		ip   string
-		want bool
-	}{
-		{"1.1.1.1", true},
-		{"10.0.0.5", true},
-		{"127.0.0.1", false},
-		{"::1", false},
-		{"169.254.169.254", false},
-		{"0.0.0.0", false},
-		{"224.0.0.1", false},
-	} {
-		if got := tcpTargetAllowed(net.ParseIP(c.ip)); got != c.want {
-			t.Errorf("tcpTargetAllowed(%s) = %v, want %v", c.ip, got, c.want)
-		}
-	}
-}
-
 // The resolved address is checked, so "localhost" doesn't get through.
 func TestTargetDialerRefusesLoopback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

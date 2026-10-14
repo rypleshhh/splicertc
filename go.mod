@@ -11,8 +11,8 @@ require (
 
 require (
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e // indirect
-	github.com/sirupsen/logrus v1.8.1 // indirect
-	github.com/stretchr/testify v1.3.0 // indirect
+	github.com/sirupsen/logrus v1.8.3 // indirect
+	github.com/stretchr/testify v1.7.0 // indirect
 	golang.org/x/net v0.15.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/Knetic/govaluate.v3 v3.0.0 // indirect

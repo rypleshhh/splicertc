@@ -112,8 +112,13 @@ func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
 
 // AcceptSeq only checks for duplicates, not age. Used for ping frames,
 // where we want to see late replies too.
+//
+// seq is uint32 and wraps around after 4294967295 -> 0, so "newer" is
+// decided like TCP does (RFC 1982): the difference as int32 must be
+// positive. A plain f.Seq <= lastSeq would reject every frame after
+// the wrap (after ~390 days at 128 frames/s).
 func (r *Receiver) AcceptSeq(f Frame) (deliver bool, reason string) {
-	if r.haveLastSeq && f.Seq <= r.lastSeq {
+	if r.haveLastSeq && int32(f.Seq-r.lastSeq) <= 0 {
 		return false, "superseded"
 	}
 	r.lastSeq = f.Seq

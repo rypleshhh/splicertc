@@ -99,3 +99,28 @@ func TestMarshalRoundTrip(t *testing.T) {
 		t.Errorf("payload mismatch: got %q want %q", got.Payload, original.Payload)
 	}
 }
+
+// seq wraps from 4294967295 to 0: frames after the wrap must still be
+// accepted, and old frames from before it must still be rejected.
+func TestSeqWrapAround(t *testing.T) {
+	r := NewReceiver(time.Second)
+	const last = ^uint32(0) - 1 // 4294967294
+	for _, seq := range []uint32{last, last + 1} {
+		if ok, reason := r.AcceptSeq(Frame{Seq: seq}); !ok {
+			t.Fatalf("seq %d rejected: %s", seq, reason)
+		}
+	}
+	// 4294967295 -> 0 -> 1
+	for _, seq := range []uint32{0, 1} {
+		if ok, reason := r.AcceptSeq(Frame{Seq: seq}); !ok {
+			t.Fatalf("seq %d after the wrap rejected: %s", seq, reason)
+		}
+	}
+	// a late duplicate from before the wrap
+	if ok, _ := r.AcceptSeq(Frame{Seq: last + 1}); ok {
+		t.Fatal("old frame from before the wrap was accepted")
+	}
+	if ok, _ := r.AcceptSeq(Frame{Seq: 1}); ok {
+		t.Fatal("duplicate after the wrap was accepted")
+	}
+}

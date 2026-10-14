@@ -255,12 +255,15 @@ for your server any more.
   with source `10.66.0.2`. Packets with another source are dropped
   (logged once: `vpn: dropping packets ... with a source address other
   than ...`), otherwise the VPS could be used to send spoofed packets.
-- **The VPS itself isn't reachable through the tunnel.** `iptables -I
-  INPUT -i dormvpn0 -j DROP` blocks sshd, Xray and everything else
-  listening on the server from the tunnel, and `-d 169.254.0.0/16 -j
-  DROP` blocks the cloud metadata service. The tunnel only forwards to
-  the internet. The reliable channel (`socks5`) doesn't connect to the
-  server's loopback and link-local addresses either.
+- **The VPS and the networks behind it aren't reachable through the
+  tunnel.** `iptables -I INPUT -i dormvpn0 -j DROP` blocks sshd, Xray
+  and everything else listening on the server, `-d 169.254.0.0/16 -j
+  DROP` the cloud metadata service, and DROP rules for `10/8`,
+  `172.16/12`, `192.168/16`, `100.64/10` the cloud's internal and
+  docker networks (unless `allow_private_destinations` is on). The
+  reliable and glue channels check the same in code
+  (`internal/egress`): no loopback, link-local, private networks or
+  the server's own addresses, including its public IP.
 - **IPv6 and DNS.** The tunnel is IPv4 only. If the dorm network has
   IPv6, IPv6 traffic bypasses the tunnel; Windows may also send DNS
   queries through the normal interface. Doesn't matter for gaming,
@@ -510,9 +513,11 @@ really crashed — check `tray.log` then.
 
 ## Authentication
 
-Without `authorized_keys_file` in the config, the server accepts
-connections from anyone who finds its IP:port — an open proxy and an
-open UDP/IP relay. There are two independent things going on here:
+Without `authorized_keys_file` the server refuses to start: otherwise
+it would be an open proxy and UDP/IP relay for anyone who finds its
+IP:port. For a local test without keys there's `-allow-unauthenticated`
+(a command line flag only, it can't be switched on in the config, so
+it can't happen by accident). There are two independent things going on here:
 **who's allowed to connect** (the client proves its identity to the
 server) and **is this actually the right server** (the client checks it
 hasn't connected to an interceptor).
@@ -785,16 +790,18 @@ a new interface into anything.
 
 | Field | Flag | Default | What it does |
 |---|---|---|---|
-| `addr` | `-addr` | `:8443` | reliable channel address (SOCKS5-style) |
-| `drop_addr` | `-drop-addr` | `:8444` | droppable channel address |
-| `glue_addr` | `-glue-addr` | `:8446` | glue channel address (real UDP) |
-| `vpn_addr` | `-vpn-addr` | `:8447` | full-tunnel VPN channel address |
+| `addr` | `-addr` | `:8443` | reliable channel address (SOCKS5-style), `"off"` disables it |
+| `drop_addr` | `-drop-addr` | `:8444` | droppable channel address, `"off"` disables it |
+| `glue_addr` | `-glue-addr` | `:8446` | glue channel address (real UDP), `"off"` disables it |
+| `vpn_addr` | `-vpn-addr` | `:8447` | full-tunnel VPN channel address, `"off"` disables it: then no TUN is created, iptables isn't touched, and `NET_ADMIN`/`/dev/net/tun` in `docker-compose.yml` aren't needed |
 | `vpn_tun_name` | `-vpn-tun-name` | `dormvpn0` | server-side TUN interface name |
 | `vpn_tun_mtu` | `-vpn-tun-mtu` | `1400` | server-side TUN MTU |
 | `vpn_subnet` | `-vpn-subnet` | `10.66.0.0/24` | private VPN subnet (server = `.1`, client = `.2`) |
 | `egress_iface` | `-egress-iface` | auto-detect | interface to MASQUERADE internet egress out of |
 | `cert` / `key` | `-cert` / `-key` | `devcerts/dev.crt` / `dev.key` | TLS certificate |
-| `authorized_keys_file` | `-authorized-keys-file` | empty (auth disabled) | path to `authorized_keys.json` — the list of public keys allowed to connect |
+| `authorized_keys_file` | `-authorized-keys-file` | empty — the server won't start | path to `authorized_keys.json` — the list of public keys allowed to connect |
+| — | `-allow-unauthenticated` | off | start without keys, for local tests only |
+| `allow_private_destinations` | `-allow-private-destinations` | `false` | let clients reach private networks behind the VPS (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`). By default they're blocked for reliable, glue and vpn |
 | `vpn_down_mbps` | `-vpn-down-mbps` | `0` (no cap) | cap the server→client rate in Mbit/s, slightly below the real download speed (see "Latency under load") |
 
 ### `client-config.json`

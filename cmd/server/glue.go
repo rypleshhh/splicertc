@@ -305,6 +305,10 @@ func handleGlueConn(conn net.Conn) {
 			continue
 		}
 
+		if ok, reason := destinations.Allowed(dst); !ok {
+			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
+			continue
+		}
 		if ok, reason := glue.DestinationAllowed(dst, dstPort); !ok {
 			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
 			continue
