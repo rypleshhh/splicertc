@@ -113,7 +113,10 @@ func main() {
 			"set it in server-config.json (see authorized_keys.example.json), or pass -allow-unauthenticated for a local test")
 	}
 
-	destinations = egress.New(*allowPrivate)
+	destinations, err = egress.New(*allowPrivate)
+	if err != nil {
+		log.Fatalf("egress policy: %v", err)
+	}
 	if *allowPrivate {
 		log.Println("WARNING: allow_private_destinations is on, clients can reach private networks through the tunnel")
 	}
@@ -186,6 +189,9 @@ func janitor() {
 		cleanupGlue(now)
 		cleanupDrop(now)
 		cleanupAuthFailures(now)
-		destinations.Refresh() // own addresses can change (DHCP)
+		// own addresses can change (DHCP); on error the old list stays
+		if err := destinations.Refresh(); err != nil {
+			log.Printf("egress: %v", err)
+		}
 	}
 }

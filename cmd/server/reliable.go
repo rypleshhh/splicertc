@@ -16,6 +16,22 @@ import (
 // reliable channel: SOCKS5 on the client, every TCP connection is one
 // smux stream inside one TLS connection, the server dials the target.
 
+// Limits per client connection. smux.DefaultConfig has no limit on the
+// number of streams, and every stream is an outgoing TCP connection of
+// the server, so one client could use up all file descriptors.
+const (
+	maxStreamsPerSession = 256
+	smuxReceiveBuffer    = 4 << 20  // bytes for all streams of a session
+	smuxStreamBuffer     = 64 << 10 // bytes per stream
+)
+
+func smuxConfig() *smux.Config {
+	c := smux.DefaultConfig()
+	c.MaxReceiveBuffer = smuxReceiveBuffer
+	c.MaxStreamBuffer = smuxStreamBuffer
+	return c
+}
+
 // handleConn serves one reliable-channel client.
 func handleConn(conn net.Conn) {
 	defer conn.Close()
@@ -27,20 +43,36 @@ func handleConn(conn net.Conn) {
 	endHandshake(conn)
 	log.Printf("client connected: %s (%q)", conn.RemoteAddr(), name)
 
-	sess, err := smux.Server(conn, nil)
+	sess, err := smux.Server(conn, smuxConfig())
 	if err != nil {
 		log.Printf("smux server: %v", err)
 		return
 	}
 	defer sess.Close()
 
+	slots := make(chan struct{}, maxStreamsPerSession)
+	limitLogged := false
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
 			log.Printf("session closed: %v", err)
 			return
 		}
-		go handleStream(stream)
+		select {
+		case slots <- struct{}{}:
+		default:
+			if !limitLogged {
+				limitLogged = true
+				log.Printf("client %q: more than %d streams at once, refusing new ones", name, maxStreamsPerSession)
+			}
+			stream.Write([]byte{0x01}) // "could not connect"
+			stream.Close()
+			continue
+		}
+		go func() {
+			defer func() { <-slots }()
+			handleStream(stream)
+		}()
 	}
 }
 

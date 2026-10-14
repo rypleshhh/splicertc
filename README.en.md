@@ -183,7 +183,7 @@ writes it into its own TUN and NATs it out through the Linux kernel
   "vpn_addr": "<SERVER_IP>:587",
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key from cmd/genkey>"
 }
 ```
@@ -550,11 +550,13 @@ local user via `/proc/<pid>/cmdline`, so keep the key in the config
 
 ### Checking the server is real: `insecure`, `pin_file`, `server_pin`
 
-Without a pin, `insecure: true` accepts ANY certificate from anyone — a
-TLS-intercepting middlebox on the network can present its own
-certificate and read all traffic in the clear, and the client-key check
-won't catch it (it just passes straight through to the real server via
-the interceptor).
+Without a pin, `insecure: true` accepts ANY certificate. An interceptor
+can't relay the login to the real server: the key signature is bound
+to the TLS session and fails there. But it can pretend to be the
+server itself, accept any key and get all the traffic. That's why
+`insecure` is gone from the examples and the client logs a warning
+without a pin. With `pin_file` or `server_pin` set, `insecure` does
+nothing.
 
 **Recommended: `pin_file`** (already set up in the example config). On
 the first connection the client accepts whatever certificate the server
@@ -641,7 +643,7 @@ Administrator/TUN.
   "mode": "socks5",
   "listen": "127.0.0.1:1080",
   "server": "<SERVER_IP>:8443",
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key from cmd/genkey>"
 }
 ```
@@ -668,7 +670,7 @@ channel, with optional duplication across multiple paths.
   "tun_paths": 1,
   "tun_measure": true,
   "tun_measure_interval": "33ms",
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key from cmd/genkey>"
 }
 ```
@@ -705,7 +707,7 @@ loopback to inject real loss.
   "drop_count": 300,
   "drop_interval": "33ms",
   "drop_paths": 3,
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key from cmd/genkey>"
 }
 ```
@@ -716,7 +718,9 @@ sudo tc qdisc add dev lo root netem loss 20% delay 40ms 15ms
 sudo tc qdisc del dev lo root
 ```
 
-`insecure: true` skips TLS cert verification — dev/testing only.
+`pin_file` remembers the server certificate on the first connect and
+checks it after that. `insecure: true` without a pin checks nothing,
+local tests only.
 
 ## Diagnostics
 

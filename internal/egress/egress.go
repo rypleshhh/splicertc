@@ -5,6 +5,7 @@
 package egress
 
 import (
+	"fmt"
 	"net"
 	"sync"
 )
@@ -39,27 +40,37 @@ type Policy struct {
 	own map[string]bool // addresses of this host
 }
 
-// New loads the host's own addresses. Call Refresh from time to time if
-// addresses can change (DHCP, new interfaces).
-func New(allowPrivate bool) *Policy {
+// New loads the host's own addresses. It fails if they can't be read:
+// without them the server's own public IP would not be blocked.
+// Call Refresh from time to time, addresses can change (DHCP).
+func New(allowPrivate bool) (*Policy, error) {
 	p := &Policy{AllowPrivate: allowPrivate}
-	p.Refresh()
-	return p
+	if err := p.Refresh(); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
-// Refresh reloads the addresses of all local interfaces.
-func (p *Policy) Refresh() {
+// Refresh reloads the addresses of all local interfaces. On error the
+// previous list is kept, so a temporary failure doesn't unblock them.
+func (p *Policy) Refresh() error {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("read interface addresses: %w", err)
+	}
 	own := make(map[string]bool)
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok {
-				own[ipn.IP.String()] = true
-			}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			own[ipn.IP.String()] = true
 		}
+	}
+	if len(own) == 0 {
+		return fmt.Errorf("no interface addresses found")
 	}
 	p.mu.Lock()
 	p.own = own
 	p.mu.Unlock()
+	return nil
 }
 
 // Allowed reports if the server may connect to ip, with a reason if not.

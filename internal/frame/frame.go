@@ -16,7 +16,7 @@ import (
 const headerSize = 4 + 8 + 2 // seq + timestamp ms + payload length
 
 // MaxPayload is the biggest payload a frame can carry (the length field
-// is 16 bit). Callers must check it, Marshal can't report an error.
+// is 16 bit).
 const MaxPayload = 65535
 
 type Frame struct {
@@ -30,7 +30,14 @@ func New(seq uint32, payload []byte) Frame {
 	return Frame{Seq: seq, TimestampMS: time.Now().UnixMilli(), Payload: payload}
 }
 
+// Marshal returns the frame as bytes, or nil if the payload is bigger
+// than MaxPayload: the 16 bit length would wrap around and the receiver
+// would read the rest of the stream shifted. Writing nil sends nothing,
+// so an oversized frame is just dropped.
 func (f Frame) Marshal() []byte {
+	if len(f.Payload) > MaxPayload {
+		return nil
+	}
 	buf := make([]byte, headerSize+len(f.Payload))
 	binary.BigEndian.PutUint32(buf[0:4], f.Seq)
 	binary.BigEndian.PutUint64(buf[4:12], uint64(f.TimestampMS))

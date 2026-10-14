@@ -170,6 +170,11 @@ func main() {
 		}
 	}
 
+	if pin == nil && *insecure {
+		log.Println("WARNING: insecure without server_pin/pin_file: any certificate is accepted, " +
+			"a man in the middle can pretend to be the server. Set pin_file (see client-config.example.json)")
+	}
+
 	if *mode == "tun" {
 		runTunMode(*glueAddr, *insecure, pin, *tunName, *tunMTU, *tunPaths, *tunMeasure, *tunMeasureInterval, key)
 		return
