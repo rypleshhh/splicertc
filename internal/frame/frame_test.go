@@ -124,3 +124,14 @@ func TestSeqWrapAround(t *testing.T) {
 		t.Fatal("duplicate after the wrap was accepted")
 	}
 }
+
+// A payload that doesn't fit the 16 bit length must not produce a frame
+// with a wrapped length.
+func TestMarshalRefusesOversizedPayload(t *testing.T) {
+	if b := New(1, make([]byte, MaxPayload+1)).Marshal(); b != nil {
+		t.Fatalf("got %d bytes for an oversized payload", len(b))
+	}
+	if b := New(1, make([]byte, MaxPayload)).Marshal(); len(b) != headerSize+MaxPayload {
+		t.Fatalf("max-size payload: got %d bytes", len(b))
+	}
+}

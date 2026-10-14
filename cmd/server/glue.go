@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tcp-dormtun/internal/frame"
@@ -55,10 +56,16 @@ const (
 // A game uses a handful of flows; every flow is a socket, a goroutine and
 // a 64 KB read buffer.
 const (
-	maxFlowsPerSession = 512
-	maxGlueSessions    = 256
-	maxPathsPerSession = 8
+	maxFlowsPerSession   = 512
+	maxGlueSessions      = 256
+	maxSessionsPerClient = 4
+	maxPathsPerSession   = 8
+	// all sessions together: 4096 sockets and at most 256 MB of buffers
+	maxTotalFlows = 4096
 )
+
+// totalFlows counts open flow sockets of all sessions.
+var totalFlows atomic.Int64
 
 // Cleanup: flows with no packets either way and sessions with no paths
 // are removed after this long.
@@ -82,6 +89,10 @@ func attachGluePath(id, owner string, conn net.Conn, w *sched.PathWriter) (s *gl
 	defer glueSessions.mu.Unlock()
 	s, exists := glueSessions.m[id]
 	if !exists {
+		if !makeRoomForSession(owner) {
+			log.Printf("glue: %q already has %d active sessions, rejecting %s", owner, maxSessionsPerClient, conn.RemoteAddr())
+			return nil, 0, false
+		}
 		if len(glueSessions.m) >= maxGlueSessions {
 			log.Printf("glue: too many sessions (%d), rejecting %s", maxGlueSessions, conn.RemoteAddr())
 			return nil, 0, false
@@ -107,6 +118,54 @@ func attachGluePath(id, owner string, conn net.Conn, w *sched.PathWriter) (s *gl
 	s.paths[conn] = w
 	s.emptySince = time.Time{}
 	return s, len(s.paths), true
+}
+
+// makeRoomForSession checks the per-client session limit. Sessions of a
+// restarted client linger for glueSessionIdle without paths; those are
+// removed first to make room. Called with glueSessions.mu held.
+func makeRoomForSession(owner string) bool {
+	var count int
+	var oldestID string
+	var oldest *glueSession
+	var oldestSince time.Time
+	for id, s := range glueSessions.m {
+		if s.owner != owner {
+			continue
+		}
+		count++
+		s.mu.Lock()
+		empty := len(s.paths) == 0
+		since := s.emptySince
+		s.mu.Unlock()
+		if empty && (oldest == nil || since.Before(oldestSince)) {
+			oldestID, oldest, oldestSince = id, s, since
+		}
+	}
+	if count < maxSessionsPerClient {
+		return true
+	}
+	if oldest == nil {
+		return false // all of them are in use
+	}
+	oldest.mu.Lock()
+	oldest.closeAllFlowsLocked()
+	oldest.mu.Unlock()
+	delete(glueSessions.m, oldestID)
+	return true
+}
+
+// closeFlowLocked closes one flow socket (its reader goroutine ends).
+// Called with s.mu held.
+func (s *glueSession) closeFlowLocked(flowID uint16, f *udpFlow) {
+	f.conn.Close()
+	delete(s.udpFlows, flowID)
+	totalFlows.Add(-1)
+}
+
+func (s *glueSession) closeAllFlowsLocked() {
+	for id, f := range s.udpFlows {
+		s.closeFlowLocked(id, f)
+	}
 }
 
 func (s *glueSession) detachPath(conn net.Conn) {
@@ -135,13 +194,12 @@ func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16
 			return f.conn, nil
 		}
 		log.Printf("glue: flow %d moved %s -> %s (session %s)", flowID, f.dst, key, sid)
-		f.conn.Close()
-		delete(s.udpFlows, flowID)
+		s.closeFlowLocked(flowID, f)
 	}
-	if len(s.udpFlows) >= maxFlowsPerSession {
+	if len(s.udpFlows) >= maxFlowsPerSession || totalFlows.Load() >= maxTotalFlows {
 		if !s.flowLimitLogged {
 			s.flowLimitLogged = true
-			log.Printf("glue: session %s hit the limit of %d flows, new flows are dropped", sid, maxFlowsPerSession)
+			log.Printf("glue: session %s hit the flow limit (%d per session, %d in total), new flows are dropped", sid, maxFlowsPerSession, maxTotalFlows)
 		}
 		return nil, errTooManyFlows
 	}
@@ -152,6 +210,7 @@ func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16
 	}
 	f := &udpFlow{conn: uc, dst: key, lastSeen: now}
 	s.udpFlows[flowID] = f
+	totalFlows.Add(1)
 	log.Printf("glue: new flow %d -> %s (session %s)", flowID, key, sid)
 
 	// read replies for this flow until the socket is closed
@@ -212,16 +271,12 @@ func cleanupGlue(now time.Time) {
 		s.mu.Lock()
 		for flowID, f := range s.udpFlows {
 			if now.Sub(f.lastSeen) > glueFlowIdle {
-				f.conn.Close()
-				delete(s.udpFlows, flowID)
+				s.closeFlowLocked(flowID, f)
 			}
 		}
 		gone := len(s.paths) == 0 && !s.emptySince.IsZero() && now.Sub(s.emptySince) > glueSessionIdle
 		if gone {
-			for _, f := range s.udpFlows {
-				f.conn.Close()
-			}
-			s.udpFlows = map[uint16]*udpFlow{}
+			s.closeAllFlowsLocked()
 		}
 		s.mu.Unlock()
 		if gone {

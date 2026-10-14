@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -142,4 +143,72 @@ func TestGlueFlowLimit(t *testing.T) {
 		t.Fatalf("expected errTooManyFlows, got %v", err)
 	}
 	cleanupGlue(time.Now().Add(glueFlowIdle + time.Second))
+}
+
+// A client gets a few sessions; sessions left over from a restart (no
+// paths) make room for new ones, sessions in use don't.
+func TestSessionsPerClient(t *testing.T) {
+	var conns []net.Conn
+	attach := func(id string) bool {
+		a, b := net.Pipe()
+		conns = append(conns, a, b)
+		w := sched.NewPathWriter(a, 4, 0)
+		_, _, ok := attachGluePath(id, "per-client", a, w)
+		return ok
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+		glueSessions.mu.Lock()
+		for id, s := range glueSessions.m {
+			if s.owner == "per-client" {
+				delete(glueSessions.m, id)
+			}
+		}
+		glueSessions.mu.Unlock()
+	}()
+
+	for i := 0; i < maxSessionsPerClient; i++ {
+		if !attach(fmt.Sprintf("pc-%d", i)) {
+			t.Fatalf("session %d refused", i)
+		}
+	}
+	if attach("pc-extra") {
+		t.Fatal("more sessions than the limit while all are in use")
+	}
+
+	// session pc-0 loses its path (client restarted)
+	glueSessions.mu.Lock()
+	s0 := glueSessions.m["pc-0"]
+	glueSessions.mu.Unlock()
+	for c := range s0.paths {
+		s0.detachPath(c)
+	}
+	if !attach("pc-new") {
+		t.Fatal("an empty leftover session did not make room")
+	}
+	glueSessions.mu.Lock()
+	_, still := glueSessions.m["pc-0"]
+	glueSessions.mu.Unlock()
+	if still {
+		t.Fatal("the leftover session was not removed")
+	}
+}
+
+func TestTotalFlowsCounter(t *testing.T) {
+	s, _ := testSession(t, "count")
+	l := udpListener(t)
+	port := uint16(l.LocalAddr().(*net.UDPAddr).Port)
+	before := totalFlows.Load()
+	if _, err := s.flow("count", 1, net.IPv4(127, 0, 0, 1), port); err != nil {
+		t.Fatal(err)
+	}
+	if totalFlows.Load() != before+1 {
+		t.Fatal("new flow not counted")
+	}
+	cleanupGlue(time.Now().Add(glueFlowIdle + time.Second))
+	if totalFlows.Load() != before {
+		t.Fatal("closed flow not uncounted")
+	}
 }

@@ -206,7 +206,6 @@ func writeClientConfigFromConnection(c connection) error {
 			"mode":         "vpn",
 			"vpn_tun_name": "dormvpn0",
 			"vpn_tun_mtu":  1400,
-			"insecure":     true,
 			"pin_file":     "known_server.pin",
 		}
 	}

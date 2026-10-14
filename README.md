@@ -181,7 +181,7 @@ go build -o client.exe .\cmd\client
   "vpn_addr": "<SERVER_IP>:587",
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key из cmd/genkey>"
 }
 ```
@@ -552,11 +552,13 @@ go run ./cmd/genkey -name "friend1"
 
 ### Проверка того, что сервер настоящий: `insecure`, `pin_file`, `server_pin`
 
-Без пина `insecure: true` принимает ЛЮБОЙ сертификат от кого угодно —
-TLS-перехватывающий middlebox в сети может подставить свой сертификат
-и читать весь трафик в открытом виде, а проверка ключа клиента это не
-поймает (она просто пройдёт насквозь через перехватчика к настоящему
-серверу).
+Без пина `insecure: true` принимает ЛЮБОЙ сертификат. Переслать вход
+к настоящему серверу перехватчик не сможет: подпись ключа привязана к
+TLS-сессии, и на сервере она не пройдёт. Но он может сам притвориться
+сервером, принять любой ключ и получать весь трафик. Поэтому
+`insecure` убран из примеров, а клиент без пина пишет в лог
+предупреждение. Если задан `pin_file` или `server_pin`, `insecure`
+ничего не делает.
 
 **Рекомендуемый способ — `pin_file`** (уже настроен в примере конфига).
 При первом подключении клиент примет тот сертификат, что показал
@@ -643,7 +645,7 @@ UDP ASSOCIATE) — не годится для игр, зато не требуе
   "mode": "socks5",
   "listen": "127.0.0.1:1080",
   "server": "<SERVER_IP>:8443",
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key из cmd/genkey>"
 }
 ```
@@ -670,7 +672,7 @@ UDP ASSOCIATE) — не годится для игр, зато не требуе
   "tun_paths": 1,
   "tun_measure": true,
   "tun_measure_interval": "33ms",
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key из cmd/genkey>"
 }
 ```
@@ -707,7 +709,7 @@ route add <GAME_SERVER_IP> mask 255.255.255.255 10.99.0.1
   "drop_count": 300,
   "drop_interval": "33ms",
   "drop_paths": 3,
-  "insecure": true,
+  "pin_file": "known_server.pin",
   "client_key": "<client_key из cmd/genkey>"
 }
 ```
@@ -718,8 +720,9 @@ sudo tc qdisc add dev lo root netem loss 20% delay 40ms 15ms
 sudo tc qdisc del dev lo root
 ```
 
-`insecure: true` пропускает проверку TLS-сертификата — только для
-разработки/тестирования.
+`pin_file` при первом подключении запоминает сертификат сервера и
+дальше проверяет его. `insecure: true` без пина не проверяет ничего,
+только для локальных тестов.
 
 ## Диагностика
 

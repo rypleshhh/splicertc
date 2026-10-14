@@ -49,7 +49,10 @@ func TestAllowPrivate(t *testing.T) {
 
 // New must find at least the loopback address of the test machine.
 func TestNewLoadsOwnAddresses(t *testing.T) {
-	p := New(false)
+	p, err := New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if !p.own["127.0.0.1"] && !p.own["::1"] {
