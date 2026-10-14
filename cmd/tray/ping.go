@@ -72,28 +72,34 @@ func onPingCheck() {
 	}()
 }
 
-// savedPin returns the server cert fingerprint client.exe would check:
-// server_pin from client-config.json, or the contents of its pin_file.
-// nil if there's none yet.
-func savedPin() []byte {
+// pinConfig returns server_pin and the full path of pin_file from
+// client-config.json (either can be empty).
+func pinConfig() (serverPin, pinPath string) {
 	data, err := os.ReadFile(configPath())
 	if err != nil {
-		return nil
+		return "", ""
 	}
 	var cfg struct {
 		ServerPin string `json:"server_pin"`
 		PinFile   string `json:"pin_file"`
 	}
 	if json.Unmarshal(data, &cfg) != nil {
-		return nil
+		return "", ""
 	}
-	hexPin := cfg.ServerPin
-	if hexPin == "" && cfg.PinFile != "" {
-		path := cfg.PinFile
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(exeDir, path) // client.exe runs with exeDir as its directory
-		}
-		raw, err := os.ReadFile(path)
+	pinPath = cfg.PinFile
+	if pinPath != "" && !filepath.IsAbs(pinPath) {
+		pinPath = filepath.Join(exeDir, pinPath) // client.exe runs with exeDir as its directory
+	}
+	return cfg.ServerPin, pinPath
+}
+
+// savedPin returns the server cert fingerprint client.exe would check:
+// server_pin from client-config.json, or the contents of its pin_file.
+// nil if there's none yet.
+func savedPin() []byte {
+	hexPin, pinPath := pinConfig()
+	if hexPin == "" && pinPath != "" {
+		raw, err := os.ReadFile(pinPath)
 		if err != nil {
 			return nil
 		}
