@@ -1,7 +1,7 @@
 # ---- build stage ----
 # Compiles a fully static server binary. Pinned Go version so the build
 # is reproducible regardless of what's on the host.
-FROM golang:1.23-alpine AS build
+FROM golang:1.27-alpine AS build
 
 WORKDIR /src
 
@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
 RUN cd /out && ./gencert
 
 # ---- runtime stage ----
-FROM alpine:3.20
+FROM alpine:3.22
 
 # iptables/iproute2: the full-tunnel VPN channel creates its own TUN
 # device and needs `ip`/`iptables` on the server to address it, enable

@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/tailscale/wireguard-go/tun"
+
+	"tcp-dormtun/internal/egress"
 )
 
 // vpnNet is the address plan of the vpn channel: server is .1, the
@@ -21,7 +23,7 @@ type vpnNet struct {
 
 // setupVPNTun creates and configures the server TUN device and the NAT
 // rules. Linux only.
-func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (tun.Device, vpnNet, error) {
+func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string, allowPrivate bool) (tun.Device, vpnNet, error) {
 	_, ipnet, err := net.ParseCIDR(subnetCIDR)
 	if err != nil {
 		return nil, vpnNet{}, fmt.Errorf("parse -vpn-subnet %q: %w", subnetCIDR, err)
@@ -72,7 +74,7 @@ func setupVPNTun(name string, mtu int, subnetCIDR, egressIface string) (tun.Devi
 		log.Printf("vpn: auto-detected egress interface: %s", egressIface)
 	}
 
-	if err := ensureIptables(subnetCIDR, egressIface, actualName); err != nil {
+	if err := ensureIptables(subnetCIDR, egressIface, actualName, allowPrivate); err != nil {
 		return fail(fmt.Errorf("iptables setup: %w", err))
 	}
 
@@ -105,7 +107,7 @@ type iptablesRule struct {
 
 // ensureIptables adds NAT, FORWARD and MSS clamp rules if they're not
 // there yet.
-func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
+func ensureIptables(subnetCIDR, egressIface, tunIface string, allowPrivate bool) error {
 	// without MASQUERADE nothing works, the other rules are optional
 	masquerade := iptablesRule{
 		check: []string{"-t", "nat", "-C", "POSTROUTING", "-s", subnetCIDR, "-o", egressIface, "-j", "MASQUERADE"},
@@ -165,6 +167,25 @@ func ensureIptables(subnetCIDR, egressIface, tunIface string) error {
 		}
 		if err := run("iptables", r.add...); err != nil {
 			log.Printf("vpn: WARNING: iptables %v failed (%v), traffic on %s may be dropped", r.add, err, tunIface)
+		}
+	}
+
+	// Private networks behind the VPS (cloud VPC, docker networks) are
+	// not reachable from the tunnel unless allow_private_destinations is
+	// on. Inserted last = on top of both chains.
+	for _, chain := range []string{"FORWARD", "DOCKER-USER"} {
+		for _, cidr := range egress.PrivateCIDRs {
+			rule := []string{chain, "-i", tunIface, "-d", cidr, "-j", "DROP"}
+			exists := run("iptables", append([]string{"-C"}, rule...)...) == nil
+			switch {
+			case !allowPrivate && !exists:
+				if err := run("iptables", append([]string{"-I", chain, "1"}, rule[1:]...)...); err != nil {
+					log.Printf("vpn: WARNING: could not block %s in %s: %v", cidr, chain, err)
+				}
+			case allowPrivate && exists:
+				// switched on after an earlier run without it
+				_ = run("iptables", append([]string{"-D"}, rule...)...)
+			}
 		}
 	}
 	return nil
