@@ -20,7 +20,14 @@ const (
 	atypIPv6   = 0x04
 )
 
-// Handshake does method negotiation. Always picks "no auth".
+const (
+	methodNoAuth       = 0x00
+	methodNoAcceptable = 0xFF
+)
+
+// Handshake does method negotiation. Only "no auth" is supported (the
+// proxy listens on localhost); a client that doesn't offer it gets
+// "no acceptable methods" (RFC 1928, section 3).
 func Handshake(conn net.Conn) error {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -36,8 +43,14 @@ func Handshake(conn net.Conn) error {
 		return err
 	}
 
-	_, err := conn.Write([]byte{version5, 0x00})
-	return err
+	for _, m := range methods {
+		if m == methodNoAuth {
+			_, err := conn.Write([]byte{version5, methodNoAuth})
+			return err
+		}
+	}
+	_, _ = conn.Write([]byte{version5, methodNoAcceptable})
+	return fmt.Errorf("client doesn't offer the no-auth method")
 }
 
 // ReadRequest parses a SOCKS5 CONNECT request and returns "host:port".
@@ -94,13 +107,10 @@ func ReadRequest(conn net.Conn) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
-// WriteReply sends the reply. Bound address is just zeros.
-func WriteReply(conn net.Conn, success bool) error {
-	rep := byte(0x00)
-	if !success {
-		rep = 0x01 // general failure
-	}
-	reply := []byte{version5, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
+// WriteReply sends the reply with a SOCKS5 reply code (0 = success).
+// Bound address is just zeros.
+func WriteReply(conn net.Conn, code byte) error {
+	reply := []byte{version5, code, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
 	_, err := conn.Write(reply)
 	return err
 }

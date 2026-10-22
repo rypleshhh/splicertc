@@ -59,3 +59,33 @@ func TestNewLoadsOwnAddresses(t *testing.T) {
 		t.Fatalf("no loopback in own addresses: %v", p.own)
 	}
 }
+
+// Private and loopback IPv4 can't be reached by wrapping them in IPv6.
+func TestEmbeddedIPv4IsChecked(t *testing.T) {
+	p := &Policy{}
+	for _, ip := range []string{
+		"64:ff9b::7f00:1",   // NAT64 of 127.0.0.1
+		"64:ff9b::a00:5",    // NAT64 of 10.0.0.5
+		"2002:a9fe:a9fe::1", // 6to4 of 169.254.169.254
+		"::ffff:127.0.0.1",  // IPv4-mapped
+	} {
+		if ok, _ := p.Allowed(net.ParseIP(ip)); ok {
+			t.Errorf("%s allowed", ip)
+		}
+	}
+	if ok, reason := p.Allowed(net.ParseIP("64:ff9b::101:101")); !ok { // 1.1.1.1
+		t.Errorf("NAT64 of a public address refused: %s", reason)
+	}
+}
+
+func TestAddOwnBlocksPublicIP(t *testing.T) {
+	p := &Policy{}
+	ip := net.ParseIP("203.0.113.50")
+	if ok, _ := p.Allowed(ip); !ok {
+		t.Fatal("public IP refused before AddOwn")
+	}
+	p.AddOwn(ip)
+	if ok, _ := p.Allowed(ip); ok {
+		t.Fatal("own public IP allowed after AddOwn")
+	}
+}

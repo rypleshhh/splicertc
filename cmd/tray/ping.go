@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,10 +15,13 @@ import (
 	"tcp-dormtun/internal/transport"
 )
 
-// onPingCheck connects to the server and does the auth handshake with
-// the key from the fields, so it checks that the key is accepted, not
-// just that the port is open. Runs on the GUI thread, the network part
-// runs in a goroutine.
+const pingTimeout = 6 * time.Second
+
+// onPingCheck measures the plain TCP connect (one round trip) and then
+// the full TLS + auth handshake with the key from the fields, so it
+// shows both the latency and that the key is accepted. The certificate
+// is checked the way client.exe would check it. Runs on the GUI thread,
+// the network part runs in a goroutine.
 func onPingCheck() {
 	addr := strings.TrimSpace(vpnAddrEdit.Text())
 	keyStr := strings.TrimSpace(clientKeyEdit.Text())
@@ -31,83 +34,100 @@ func onPingCheck() {
 		walk.MsgBox(mainWin, "splicertc", "Не удалось разобрать ключ: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
 		return
 	}
-	pin := savedPin()
+	dc, unverified := pingDialConfig()
 
 	setStatus("проверка пинга...")
 	go func() {
-		type pingResult struct {
-			ms  int64
-			err error
-		}
-		resCh := make(chan pingResult, 1)
-		start := time.Now()
-		go func() {
-			// with a saved pin the server cert is checked like client.exe
-			// does; without one (first connect) any cert is accepted
-			conn, err := transport.Dial(addr, true, pin)
-			if err != nil {
-				resCh <- pingResult{err: err}
-				return
-			}
-			defer conn.Close()
-			_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
-			if err := auth.ClientHandshake(conn, seed); err != nil {
-				resCh <- pingResult{err: fmt.Errorf("сервер ответил, но ключ не подошёл: %w", err)}
-				return
-			}
-			resCh <- pingResult{ms: time.Since(start).Milliseconds()}
-		}()
-
+		resCh := make(chan string, 1)
+		go func() { resCh <- ping(addr, dc, seed, unverified) }()
 		select {
 		case r := <-resCh:
-			if r.err != nil {
-				setStatus("пинг не прошёл: " + r.err.Error())
-			} else {
-				setStatus(fmt.Sprintf("пинг: %d мс, ключ принят", r.ms))
-			}
-		case <-time.After(6 * time.Second):
-			// the goroutine above will finish by itself (deadline)
-			setStatus("пинг: сервер не ответил за 6 секунд")
+			setStatus(r)
+		case <-time.After(pingTimeout):
+			// the goroutine above will finish by itself (deadlines)
+			setStatus(fmt.Sprintf("пинг: сервер не ответил за %d секунд", int(pingTimeout.Seconds())))
 		}
 	}()
+}
+
+// ping returns the status line for one check.
+func ping(addr string, dc transport.DialConfig, seed []byte, unverified string) string {
+	start := time.Now()
+	raw, err := net.DialTimeout("tcp", addr, pingTimeout)
+	if err != nil {
+		return "пинг не прошёл: " + err.Error()
+	}
+	tcpTime := time.Since(start)
+	raw.Close()
+
+	start = time.Now()
+	conn, err := transport.Dial(addr, dc)
+	if err != nil {
+		return fmt.Sprintf("TCP %d мс, но TLS не прошёл: %v", tcpTime.Milliseconds(), err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(pingTimeout))
+	if err := auth.ClientHandshake(conn, seed); err != nil {
+		return fmt.Sprintf("TCP %d мс, сервер ответил, но ключ не подошёл: %v", tcpTime.Milliseconds(), err)
+	}
+	s := fmt.Sprintf("TCP %d мс, вход %d мс, ключ принят", tcpTime.Milliseconds(), time.Since(start).Milliseconds())
+	if unverified != "" {
+		s += ", " + unverified
+	}
+	return s
+}
+
+// clientTLSConfig is the part of client-config.json about checking the
+// server certificate.
+type clientTLSConfig struct {
+	ServerPin  string `json:"server_pin"`
+	PinFile    string `json:"pin_file"`
+	ServerName string `json:"server_name"`
+	Insecure   bool   `json:"insecure"`
+}
+
+func readClientTLSConfig() clientTLSConfig {
+	var cfg clientTLSConfig
+	if data, err := os.ReadFile(configPath()); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	if cfg.PinFile != "" && !filepath.IsAbs(cfg.PinFile) {
+		cfg.PinFile = filepath.Join(exeDir, cfg.PinFile) // client.exe runs with exeDir as its directory
+	}
+	return cfg
 }
 
 // pinConfig returns server_pin and the full path of pin_file from
 // client-config.json (either can be empty).
 func pinConfig() (serverPin, pinPath string) {
-	data, err := os.ReadFile(configPath())
-	if err != nil {
-		return "", ""
-	}
-	var cfg struct {
-		ServerPin string `json:"server_pin"`
-		PinFile   string `json:"pin_file"`
-	}
-	if json.Unmarshal(data, &cfg) != nil {
-		return "", ""
-	}
-	pinPath = cfg.PinFile
-	if pinPath != "" && !filepath.IsAbs(pinPath) {
-		pinPath = filepath.Join(exeDir, pinPath) // client.exe runs with exeDir as its directory
-	}
-	return cfg.ServerPin, pinPath
+	cfg := readClientTLSConfig()
+	return cfg.ServerPin, cfg.PinFile
 }
 
-// savedPin returns the server cert fingerprint client.exe would check:
-// server_pin from client-config.json, or the contents of its pin_file.
-// nil if there's none yet.
-func savedPin() []byte {
-	hexPin, pinPath := pinConfig()
-	if hexPin == "" && pinPath != "" {
-		raw, err := os.ReadFile(pinPath)
-		if err != nil {
-			return nil
+// pingDialConfig checks the certificate like client.exe: against the
+// saved pin; without one, against server_name with the normal CA check,
+// unless the client would accept anything anyway (pin_file not created
+// yet, or insecure). Then unverified says so.
+func pingDialConfig() (dc transport.DialConfig, unverified string) {
+	cfg := readClientTLSConfig()
+	dc.ServerName = cfg.ServerName
+	hexPin := cfg.ServerPin
+	if hexPin == "" && cfg.PinFile != "" {
+		if raw, err := os.ReadFile(cfg.PinFile); err == nil {
+			hexPin = string(raw)
 		}
-		hexPin = strings.TrimSpace(string(raw))
 	}
-	pin, err := hex.DecodeString(hexPin)
-	if err != nil || len(pin) == 0 {
-		return nil
+	if pin, err := transport.ParsePin(hexPin); err == nil {
+		dc.Pin = pin
+		return dc, ""
 	}
-	return pin
+	switch {
+	case cfg.PinFile != "":
+		dc.Insecure = true
+		return dc, "сертификат не проверен (пина ещё нет)"
+	case cfg.Insecure:
+		dc.Insecure = true
+		return dc, "сертификат не проверен (insecure)"
+	}
+	return dc, ""
 }

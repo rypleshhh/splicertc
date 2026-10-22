@@ -63,21 +63,62 @@ func TestToleratesClockSkew(t *testing.T) {
 	}
 }
 
-func TestDropsSupersededSeq(t *testing.T) {
-	r := NewReceiver(time.Second)
+// Duplicates are dropped, frames that arrive out of order are not.
+func TestAcceptSeqWindow(t *testing.T) {
+	tests := []struct {
+		name   string
+		seqs   []uint32
+		want   bool
+		reason string
+	}{
+		{"in order", []uint32{1, 2, 3}, true, ""},
+		{"duplicate", []uint32{5, 5}, false, "duplicate"},
+		{"reordered", []uint32{5, 7, 6}, true, ""},
+		{"reordered duplicate", []uint32{5, 7, 6, 6}, false, "duplicate"},
+		{"too old", []uint32{1, 1 + seqWindow, 1}, false, "too old"},
+		{"just inside the window", []uint32{1, seqWindow, 1 + 1}, true, ""},
+		{"big jump forgets the window", []uint32{3, 3 + 5*seqWindow, 3 + 5*seqWindow - 1}, true, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewReceiver(time.Second)
+			var ok bool
+			var reason string
+			for _, s := range tt.seqs {
+				ok, reason = r.AcceptSeq(Frame{Seq: s})
+			}
+			if ok != tt.want || reason != tt.reason {
+				t.Fatalf("last frame: got (%v, %q), want (%v, %q)", ok, reason, tt.want, tt.reason)
+			}
+		})
+	}
+}
 
-	f5 := New(5, []byte("newer"))
-	if ok, reason := r.Accept(f5); !ok {
-		t.Fatalf("expected seq 5 to be accepted, got reason=%q", reason)
+// After a route change the delay stays higher: frames are dropped for a
+// short time, then the new delay becomes the baseline.
+func TestRebaselineAfterDelayGrows(t *testing.T) {
+	now := time.Now()
+	r := NewReceiver(150 * time.Millisecond)
+	r.now = func() time.Time { return now }
+	send := func(seq uint32, delay time.Duration) bool {
+		ok, _ := r.Accept(Frame{Seq: seq, TimestampMS: now.Add(-delay).UnixMilli()})
+		return ok
 	}
 
-	f3 := New(3, []byte("older, arrived late"))
-	ok, reason := r.Accept(f3)
-	if ok {
-		t.Fatalf("expected seq 3 to be dropped as superseded")
+	if !send(1, 20*time.Millisecond) {
+		t.Fatal("first frame dropped")
 	}
-	if reason != "superseded" {
-		t.Fatalf("expected reason 'superseded', got %q", reason)
+	// the delay jumps by 300ms and stays there
+	if send(2, 320*time.Millisecond) {
+		t.Fatal("frame right after the jump should still count as late")
+	}
+	now = now.Add(rebaselineAfter + 100*time.Millisecond)
+	if !send(3, 320*time.Millisecond) {
+		t.Fatal("still dropping after rebaselineAfter: the new delay was not taken as baseline")
+	}
+	now = now.Add(20 * time.Millisecond)
+	if !send(4, 330*time.Millisecond) {
+		t.Fatal("frame at the new normal delay dropped")
 	}
 }
 

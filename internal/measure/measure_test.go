@@ -66,3 +66,50 @@ func TestSamplesAreBounded(t *testing.T) {
 		t.Fatalf("received counter = %d", sum.Received)
 	}
 }
+
+// A ping sent just now is neither sent nor lost yet.
+func TestInFlightNotCountedAsLoss(t *testing.T) {
+	s := New()
+	s.OnSend(1)
+	s.OnRecv(1)
+	s.OnSend(2) // in flight
+
+	sum := s.Snapshot(time.Hour)
+	if sum.Sent != 1 || sum.Received != 1 || sum.LossPct != 0 {
+		t.Fatalf("got sent=%d recv=%d loss=%.1f, want 1/1/0", sum.Sent, sum.Received, sum.LossPct)
+	}
+
+	// once it's older than the timeout it is lost
+	time.Sleep(10 * time.Millisecond)
+	sum = s.Snapshot(5 * time.Millisecond)
+	if sum.Sent != 2 || sum.LossPct != 50 {
+		t.Fatalf("got sent=%d loss=%.1f, want 2/50", sum.Sent, sum.LossPct)
+	}
+}
+
+// Unanswered pings must not pile up when Snapshot is never called.
+func TestPendingBoundedWithoutSnapshot(t *testing.T) {
+	s := New()
+	for i := uint64(0); i < 10*minScanAt; i++ {
+		s.OnSend(i)
+		s.sentAt[i] = time.Now().Add(-2 * maxPendingAge) // never answered
+	}
+	if n := len(s.sentAt); n > minScanAt {
+		t.Fatalf("%d pings pending, want at most %d", n, minScanAt)
+	}
+	sum := s.Snapshot(time.Second)
+	if sum.Sent != 10*minScanAt || sum.LossPct != 100 {
+		t.Fatalf("got sent=%d loss=%.1f", sum.Sent, sum.LossPct)
+	}
+}
+
+// Recent pending pings are kept, the scan just gets rarer.
+func TestPendingRecentKept(t *testing.T) {
+	s := New()
+	for i := uint64(0); i < 3*minScanAt; i++ {
+		s.OnSend(i)
+	}
+	if n := len(s.sentAt); n != 3*minScanAt {
+		t.Fatalf("recent pings were dropped: %d pending", n)
+	}
+}

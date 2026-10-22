@@ -17,21 +17,19 @@ import (
 
 // runDropTest sends a few frames with artificial delays. Delays over
 // 150ms should show up as drops on the server.
-func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure, pin)
+func runDropTest(srv endpoint, key []byte) {
+	conn, err := transport.Dial(srv.addr, srv.dc)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
-	if key != nil {
-		if err := auth.ClientHandshake(conn, key); err != nil {
-			log.Fatalf("auth: %v", err)
-		}
+	if err := auth.ClientHandshake(conn, key); err != nil {
+		log.Fatalf("auth: %v", err)
 	}
 	if err := sendNewSessionID(conn); err != nil {
 		log.Fatalf("send session id: %v", err)
 	}
-	log.Printf("connected to droppable channel %s", dropAddr)
+	log.Printf("connected to droppable channel %s", srv.addr)
 
 	delays := []time.Duration{0, 0, 300 * time.Millisecond, 0, 400 * time.Millisecond, 0}
 	for i, d := range delays {
@@ -52,21 +50,19 @@ func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
 
 // runDropStress sends count frames every interval. Use with tc netem on
 // the server and check the server log for drops.
-func runDropStress(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure, pin)
+func runDropStress(srv endpoint, key []byte, count int, interval time.Duration) {
+	conn, err := transport.Dial(srv.addr, srv.dc)
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
 	defer conn.Close()
-	if key != nil {
-		if err := auth.ClientHandshake(conn, key); err != nil {
-			log.Fatalf("auth: %v", err)
-		}
+	if err := auth.ClientHandshake(conn, key); err != nil {
+		log.Fatalf("auth: %v", err)
 	}
 	if err := sendNewSessionID(conn); err != nil {
 		log.Fatalf("send session id: %v", err)
 	}
-	log.Printf("connected to droppable channel %s, sending %d frames every %v", dropAddr, count, interval)
+	log.Printf("connected to droppable channel %s, sending %d frames every %v", srv.addr, count, interval)
 
 	sent := 0
 	for i := 0; i < count; i++ {
@@ -94,7 +90,7 @@ func sendNewSessionID(conn net.Conn) error {
 
 // runDropMultipath sends every frame over several connections with the
 // same session ID. A frame is lost only if it's lost on all of them.
-func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, paths int, key []byte) {
+func runDropMultipath(srv endpoint, key []byte, count int, interval time.Duration, paths int) {
 	sid := make([]byte, 8)
 	if _, err := rand.Read(sid); err != nil {
 		log.Fatalf("generate session id: %v", err)
@@ -103,14 +99,12 @@ func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, int
 
 	conns := make([]net.Conn, paths)
 	for i := 0; i < paths; i++ {
-		conn, err := transport.Dial(dropAddr, insecure, pin)
+		conn, err := transport.Dial(srv.addr, srv.dc)
 		if err != nil {
 			log.Fatalf("dial path %d: %v", i, err)
 		}
-		if key != nil {
-			if err := auth.ClientHandshake(conn, key); err != nil {
-				log.Fatalf("auth on path %d: %v", i, err)
-			}
+		if err := auth.ClientHandshake(conn, key); err != nil {
+			log.Fatalf("auth on path %d: %v", i, err)
 		}
 		if _, err := conn.Write(sid); err != nil {
 			log.Fatalf("send session id on path %d: %v", i, err)

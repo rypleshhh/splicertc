@@ -62,11 +62,19 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	return Frame{Seq: seq, TimestampMS: ts, Payload: payload}, nil
 }
 
-// Receiver decides if an incoming frame should still be delivered.
+// Receiver decides if an incoming frame should still be delivered: not
+// a duplicate (multipath sends every frame several times) and not too
+// late compared to the best delay seen.
 type Receiver struct {
-	maxAge      time.Duration
-	lastSeq     uint32
-	haveLastSeq bool
+	maxAge time.Duration
+	now    func() time.Time // time.Now, replaced in tests
+
+	// Duplicates are found with a window of the last seqWindow sequence
+	// numbers (like IPsec anti-replay, RFC 4303): a frame that arrives
+	// out of order but wasn't seen yet is still delivered.
+	haveTop bool
+	top     uint32 // highest seq accepted so far
+	seen    [seqWindow / 64]uint64
 
 	// Client and server clocks are not in sync, so recv-send time includes
 	// the clock difference. We keep the minimum (recv-send) seen and count
@@ -76,21 +84,30 @@ type Receiver struct {
 	prevMinOffset time.Duration
 	curMinOffset  time.Duration
 	windowStart   time.Time
+	// first frame of the current run of late frames, zero if the last
+	// frame was on time
+	lateSince time.Time
 }
 
-const offsetWindow = 5 * time.Second
+const (
+	offsetWindow = 5 * time.Second
+	seqWindow    = 1024
+	// If every frame is late for this long, the delay itself has grown
+	// (new route): take the current delay as the new baseline instead of
+	// dropping everything until the minimum window rolls over.
+	rebaselineAfter = time.Second
+)
 
 // NewReceiver drops frames that are more than maxAge late compared to
 // the best delay seen so far.
 func NewReceiver(maxAge time.Duration) *Receiver {
-	return &Receiver{maxAge: maxAge}
+	return &Receiver{maxAge: maxAge, now: time.Now}
 }
 
-// Accept reports if f should be delivered. Call it once per frame, in
-// the order frames were read. The first frame is always accepted since
-// there's nothing to compare it with yet.
+// Accept reports if f should be delivered. The first frame is always
+// accepted since there's nothing to compare it with yet.
 func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
-	now := time.Now()
+	now := r.now()
 	raw := now.Sub(time.UnixMilli(f.TimestampMS))
 
 	switch {
@@ -106,29 +123,59 @@ func (r *Receiver) Accept(f Frame) (deliver bool, reason string) {
 		r.windowStart = now
 	}
 
-	baseline := r.prevMinOffset
-	if r.curMinOffset < baseline {
-		baseline = r.curMinOffset
+	baseline := min(r.prevMinOffset, r.curMinOffset)
+	if raw-baseline > r.maxAge {
+		if r.lateSince.IsZero() {
+			r.lateSince = now
+		}
+		if now.Sub(r.lateSince) < rebaselineAfter {
+			return false, "ttl exceeded"
+		}
+		r.prevMinOffset, r.curMinOffset = raw, raw
+		r.windowStart = now
 	}
-
-	if age := raw - baseline; age > r.maxAge {
-		return false, "ttl exceeded"
-	}
+	r.lateSince = time.Time{}
 	return r.AcceptSeq(f)
 }
 
 // AcceptSeq only checks for duplicates, not age. Used for ping frames,
 // where we want to see late replies too.
 //
-// seq is uint32 and wraps around after 4294967295 -> 0, so "newer" is
-// decided like TCP does (RFC 1982): the difference as int32 must be
-// positive. A plain f.Seq <= lastSeq would reject every frame after
-// the wrap (after ~390 days at 128 frames/s).
+// seq is uint32 and wraps around after 4294967295 -> 0, so distances are
+// computed as int32 (RFC 1982), like TCP does.
 func (r *Receiver) AcceptSeq(f Frame) (deliver bool, reason string) {
-	if r.haveLastSeq && int32(f.Seq-r.lastSeq) <= 0 {
-		return false, "superseded"
+	if !r.haveTop {
+		r.haveTop = true
+		r.top = f.Seq
+		r.mark(f.Seq)
+		return true, ""
 	}
-	r.lastSeq = f.Seq
-	r.haveLastSeq = true
-	return true, ""
+	d := int32(f.Seq - r.top)
+	switch {
+	case d > 0:
+		// newer than everything: slide the window, forget what fell out
+		if d >= seqWindow {
+			r.seen = [seqWindow / 64]uint64{}
+		} else {
+			for i := uint32(1); i <= uint32(d); i++ {
+				r.unmark(r.top + i)
+			}
+		}
+		r.top = f.Seq
+		r.mark(f.Seq)
+		return true, ""
+	case -d >= seqWindow:
+		return false, "too old"
+	case r.marked(f.Seq):
+		return false, "duplicate"
+	default:
+		r.mark(f.Seq) // arrived out of order, but it's new
+		return true, ""
+	}
+}
+
+func (r *Receiver) mark(seq uint32)   { r.seen[seq%seqWindow/64] |= 1 << (seq % 64) }
+func (r *Receiver) unmark(seq uint32) { r.seen[seq%seqWindow/64] &^= 1 << (seq % 64) }
+func (r *Receiver) marked(seq uint32) bool {
+	return r.seen[seq%seqWindow/64]&(1<<(seq%64)) != 0
 }

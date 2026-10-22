@@ -36,8 +36,23 @@ func mustCIDRs(cidrs ...string) []*net.IPNet {
 type Policy struct {
 	AllowPrivate bool
 
-	mu  sync.RWMutex
-	own map[string]bool // addresses of this host
+	mu    sync.RWMutex
+	own   map[string]bool // addresses of local interfaces
+	extra map[string]bool // own addresses not on an interface (1:1 NAT)
+}
+
+// AddOwn adds addresses of this server that are not on any interface:
+// in clouds with 1:1 NAT (AWS, GCP, Yandex Cloud, Oracle) the public IP
+// only exists in the provider's NAT, so New can't find it.
+func (p *Policy) AddOwn(ips ...net.IP) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.extra == nil {
+		p.extra = make(map[string]bool)
+	}
+	for _, ip := range ips {
+		p.extra[ip.String()] = true
+	}
 }
 
 // New loads the host's own addresses. It fails if they can't be read:
@@ -73,8 +88,32 @@ func (p *Policy) Refresh() error {
 	return nil
 }
 
+// Translated IPv6 forms of IPv4 addresses: NAT64 (RFC 6052) carries the
+// IPv4 address in the last 4 bytes, 6to4 (RFC 3056) in bytes 2..5.
+var (
+	nat64Prefix = mustCIDRs("64:ff9b::/96")[0]
+	sixToFour   = mustCIDRs("2002::/16")[0]
+)
+
+// embeddedIPv4 returns the IPv4 address inside a NAT64 or 6to4 address,
+// so 64:ff9b::7f00:1 is checked as 127.0.0.1.
+func embeddedIPv4(ip net.IP) net.IP {
+	switch {
+	case nat64Prefix.Contains(ip):
+		return net.IP(ip[12:16])
+	case sixToFour.Contains(ip):
+		return net.IP(ip[2:6])
+	}
+	return nil
+}
+
 // Allowed reports if the server may connect to ip, with a reason if not.
 func (p *Policy) Allowed(ip net.IP) (bool, string) {
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		if ok, reason := p.Allowed(v4); !ok {
+			return false, reason + " (inside an IPv6 address)"
+		}
+	}
 	switch {
 	case ip == nil:
 		return false, "not an IP address"
@@ -88,7 +127,7 @@ func (p *Policy) Allowed(ip net.IP) (bool, string) {
 		return false, "multicast/broadcast address"
 	}
 	p.mu.RLock()
-	own := p.own[ip.String()]
+	own := p.own[ip.String()] || p.extra[ip.String()]
 	p.mu.RUnlock()
 	if own {
 		return false, "address of the server itself"

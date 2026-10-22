@@ -10,7 +10,10 @@ func TestOutboundRoundTrip(t *testing.T) {
 	dst := net.IPv4(10, 99, 0, 77)
 	payload := []byte("hello game server")
 
-	wire := EncodeOutbound(4242, dst, 27015, payload)
+	wire, err := EncodeOutbound(4242, dst, 27015, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	flowID, gotDst, dstPort, gotPayload, err := DecodeOutbound(wire)
 	if err != nil {
 		t.Fatalf("DecodeOutbound: %v", err)
@@ -69,5 +72,11 @@ func TestPathPingRoundTrip(t *testing.T) {
 	}
 	if _, ok := DecodePathPing(EncodePing(1)); ok {
 		t.Fatal("regular ping decoded as path ping")
+	}
+}
+
+func TestEncodeOutboundRefusesIPv6(t *testing.T) {
+	if _, err := EncodeOutbound(1, net.ParseIP("2001:db8::1"), 443, nil); err == nil {
+		t.Fatal("IPv6 destination encoded (it would be sent to 0.0.0.0)")
 	}
 }

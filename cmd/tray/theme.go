@@ -68,5 +68,5 @@ func solidIcon(c color.RGBA) (*walk.Icon, error) {
 			}
 		}
 	}
-	return walk.NewIconFromImage(img)
+	return walk.NewIconFromImageForDPI(img, 96)
 }

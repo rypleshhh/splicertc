@@ -86,7 +86,7 @@ func TestDialAcceptsPinnedCert(t *testing.T) {
 	certA := selfSignedCert(t)
 	addr := listenWith(t, certA)
 
-	conn, err := Dial(addr, false, fingerprintOf(certA))
+	conn, err := Dial(addr, DialConfig{Pin: fingerprintOf(certA)})
 	if err != nil {
 		t.Fatalf("expected Dial to succeed against the pinned cert, got: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestDialRejectsWrongCert(t *testing.T) {
 	certB := selfSignedCert(t) // MITM cert
 	addrB := listenWith(t, certB)
 
-	_, err := Dial(addrB, false, fingerprintOf(certA))
+	_, err := Dial(addrB, DialConfig{Pin: fingerprintOf(certA)})
 	if err == nil {
 		t.Fatal("expected Dial to reject a connection presenting a certificate that doesn't match the pin, but it succeeded")
 	}
@@ -110,7 +110,7 @@ func TestDialInsecureWithoutPinAcceptsAnything(t *testing.T) {
 	certB := selfSignedCert(t)
 	addrB := listenWith(t, certB)
 
-	conn, err := Dial(addrB, true, nil)
+	conn, err := Dial(addrB, DialConfig{Insecure: true})
 	if err != nil {
 		t.Fatalf("expected insecure Dial with no pin to accept any cert, got: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestResolvePinSavesOnFirstUse(t *testing.T) {
 	addr := listenWith(t, cert)
 	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
 
-	pin, err := ResolvePin(addr, pinFile)
+	pin, err := ResolvePin(addr, "", pinFile)
 	if err != nil {
 		t.Fatalf("ResolvePin: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestResolvePinReadsSavedFileWithoutRedialing(t *testing.T) {
 	}
 
 	unreachable := "127.0.0.1:1" // nothing listens here
-	pin, err := ResolvePin(unreachable, pinFile)
+	pin, err := ResolvePin(unreachable, "", pinFile)
 	if err != nil {
 		t.Fatalf("expected ResolvePin to read the saved file without dialing, got: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestResolvePinThenDialDetectsCertChange(t *testing.T) {
 	addrA := listenWith(t, certA)
 	pinFile := filepath.Join(t.TempDir(), "known_server.pin")
 
-	pin, err := ResolvePin(addrA, pinFile)
+	pin, err := ResolvePin(addrA, "", pinFile)
 	if err != nil {
 		t.Fatalf("ResolvePin (first use): %v", err)
 	}
@@ -175,7 +175,36 @@ func TestResolvePinThenDialDetectsCertChange(t *testing.T) {
 	certB := selfSignedCert(t)
 	addrB := listenWith(t, certB)
 
-	if _, err := Dial(addrB, false, pin); err == nil {
+	if _, err := Dial(addrB, DialConfig{Pin: pin}); err == nil {
 		t.Fatal("expected Dial to reject a certificate that changed after trust-on-first-use, but it succeeded")
+	}
+}
+
+func TestParsePin(t *testing.T) {
+	good := hex.EncodeToString(make([]byte, 32))
+	tests := []struct {
+		name, in string
+		ok       bool
+	}{
+		{"valid", good, true},
+		{"newline from a file", good + "\n", true},
+		{"not hex", "zz", false},
+		{"too short", "abcd", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParsePin(tt.in); (err == nil) != tt.ok {
+				t.Fatalf("ParsePin(%q) err = %v, want ok=%v", tt.in, err, tt.ok)
+			}
+		})
+	}
+}
+
+// Without a pin and without insecure the certificate must be valid for
+// the server name; a self-signed one isn't.
+func TestDialWithoutPinVerifiesCertificate(t *testing.T) {
+	addr := listenWith(t, selfSignedCert(t))
+	if _, err := Dial(addr, DialConfig{ServerName: "example.com"}); err == nil {
+		t.Fatal("self-signed certificate accepted without pin or insecure")
 	}
 }

@@ -362,3 +362,52 @@ func TestPathWriterClosesStuckPath(t *testing.T) {
 		t.Fatal("stuck path was not closed after the write timeout")
 	}
 }
+
+func TestDequeueBatchTakesQueuedPackets(t *testing.T) {
+	s := New(Config{})
+	for i := 0; i < 5; i++ {
+		s.Enqueue(FlowKey{Proto: 17, SrcPort: uint16(i)}, make([]byte, 100))
+	}
+	batch, ok := s.DequeueBatch(nil, 350)
+	if !ok {
+		t.Fatal("closed")
+	}
+	// stops once the total reaches maxBytes
+	if len(batch) != 4 {
+		t.Fatalf("got %d packets, want 4 (100 bytes each, limit 350)", len(batch))
+	}
+	batch, _ = s.DequeueBatch(batch, 350)
+	if len(batch) != 1 {
+		t.Fatalf("second batch: got %d packets, want 1", len(batch))
+	}
+}
+
+func TestDequeueBatchReturnsAfterClose(t *testing.T) {
+	s := New(Config{})
+	done := make(chan bool)
+	go func() {
+		_, ok := s.DequeueBatch(nil, 1000)
+		done <- ok
+	}()
+	time.Sleep(10 * time.Millisecond)
+	s.Close()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("DequeueBatch returned ok after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DequeueBatch did not wake up on Close")
+	}
+}
+
+// Many different flows must not make the flow map grow without bound.
+func TestFlowsAreBucketed(t *testing.T) {
+	s := New(Config{LimitBytes: 1 << 30})
+	for i := 0; i < 20000; i++ {
+		s.Enqueue(FlowKey{Proto: 17, SrcPort: uint16(i), DstPort: uint16(i >> 16)}, []byte{1})
+	}
+	if n := s.Stats().ActiveFlows; n > flowBuckets {
+		t.Fatalf("%d flow queues, want at most %d", n, flowBuckets)
+	}
+}

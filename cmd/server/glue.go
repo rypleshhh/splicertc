@@ -193,7 +193,7 @@ func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16
 			f.lastSeen = now
 			return f.conn, nil
 		}
-		log.Printf("glue: flow %d moved %s -> %s (session %s)", flowID, f.dst, key, sid)
+		log.Printf("glue: flow %d changed its destination (session %s)", flowID, sid)
 		s.closeFlowLocked(flowID, f)
 	}
 	if len(s.udpFlows) >= maxFlowsPerSession || totalFlows.Load() >= maxTotalFlows {
@@ -211,7 +211,8 @@ func (s *glueSession) flow(sid string, flowID uint16, dst net.IP, dstPort uint16
 	f := &udpFlow{conn: uc, dst: key, lastSeen: now}
 	s.udpFlows[flowID] = f
 	totalFlows.Add(1)
-	log.Printf("glue: new flow %d -> %s (session %s)", flowID, key, sid)
+	// no address in the log: it shouldn't be a list of the client's servers
+	log.Printf("glue: new flow %d (session %s)", flowID, sid)
 
 	// read replies for this flow until the socket is closed
 	go func() {
@@ -361,11 +362,11 @@ func handleGlueConn(conn net.Conn) {
 		}
 
 		if ok, reason := destinations.Allowed(dst); !ok {
-			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
+			log.Printf("glue: refusing to relay flow %d (session %s): %s", flowID, sid, reason)
 			continue
 		}
 		if ok, reason := glue.DestinationAllowed(dst, dstPort); !ok {
-			log.Printf("glue: refusing to relay to %s:%d (%s)", dst, dstPort, reason)
+			log.Printf("glue: refusing to relay flow %d (session %s): %s", flowID, sid, reason)
 			continue
 		}
 
@@ -374,11 +375,20 @@ func handleGlueConn(conn net.Conn) {
 			continue // already logged
 		}
 		if err != nil {
-			log.Printf("glue: dial UDP %s:%d for flow %d: %v", dst, dstPort, flowID, err)
+			log.Printf("glue: dial UDP for flow %d: %v", flowID, withoutAddr(err))
 			continue
 		}
 		if _, err := udpConn.Write(payload); err != nil {
-			log.Printf("glue: write to UDP target for flow %d: %v", flowID, err)
+			log.Printf("glue: write to UDP target for flow %d: %v", flowID, withoutAddr(err))
 		}
 	}
+}
+
+// withoutAddr strips the "dial udp 1.2.3.4:27015:" part net errors carry.
+func withoutAddr(err error) error {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Err
+	}
+	return err
 }
