@@ -108,7 +108,7 @@ func (g *gluePaths) start(n int) error {
 
 // dialServer connects one path: TLS, auth, session ID.
 func (g *gluePaths) dialServer() (net.Conn, error) {
-	c, err := transport.Dial(g.addr, g.insecure, g.pin)
+	c, err := transport.Dial(g.addr, transport.DialConfig{Insecure: g.insecure, Pin: g.pin})
 	if err != nil {
 		return nil, err
 	}

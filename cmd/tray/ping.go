@@ -44,7 +44,7 @@ func onPingCheck() {
 		go func() {
 			// with a saved pin the server cert is checked like client.exe
 			// does; without one (first connect) any cert is accepted
-			conn, err := transport.Dial(addr, true, pin)
+			conn, err := transport.Dial(addr, transport.DialConfig{Insecure: true, Pin: pin})
 			if err != nil {
 				resCh <- pingResult{err: err}
 				return

@@ -42,7 +42,7 @@ func isPermanentDialError(err error) bool {
 }
 
 func dialVPN(addr string, insecure bool, pin, key []byte) (net.Conn, error) {
-	c, err := transport.Dial(addr, insecure, pin)
+	c, err := transport.Dial(addr, transport.DialConfig{Insecure: insecure, Pin: pin})
 	if err != nil {
 		return nil, err
 	}

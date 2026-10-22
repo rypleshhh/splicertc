@@ -17,7 +17,7 @@ import (
 // smux stream inside a single TLS connection to the server.
 
 func runSocksMode(serverAddr, listenAddr string, insecure bool, pin, key []byte) {
-	conn, err := transport.Dial(serverAddr, insecure, pin)
+	conn, err := transport.Dial(serverAddr, transport.DialConfig{Insecure: insecure, Pin: pin})
 	if err != nil {
 		log.Fatalf("dial server: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -61,13 +62,23 @@ const DialTimeout = 10 * time.Second
 // our server at all.
 var ErrPinMismatch = errors.New("server certificate does not match pinned fingerprint")
 
+// DialConfig says how the client checks the server.
+type DialConfig struct {
+	// ServerName is sent as SNI and, without Pin, is the name the
+	// certificate must be valid for (a normal CA certificate, e.g. Let's
+	// Encrypt). Empty means the host part of the address.
+	ServerName string
+	// Pin is the SHA-256 of the server certificate. When set, only the
+	// pin is checked (self-signed certificates work).
+	Pin []byte
+	// Insecure accepts any certificate when there's no pin. Tests only.
+	Insecure bool
+}
+
 // Dial connects with TLS. Nagle is disabled because we send lots of
 // small packets and don't want them delayed (tls.Dial doesn't let us
 // set it, so the TCP connection is created manually).
-//
-// If pin is set, the server cert's SHA-256 must match it, otherwise the
-// handshake fails. insecureSkipVerify is only used when pin is nil.
-func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
+func Dial(addr string, dc DialConfig) (net.Conn, error) {
 	rawConn, err := net.DialTimeout("tcp", addr, DialTimeout)
 	if err != nil {
 		return nil, err
@@ -78,22 +89,28 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 		tuneSocket(tcpConn)
 	}
 
-	cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-	if pin != nil {
-		// we check the cert ourselves below
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: dc.ServerName}
+	if cfg.ServerName == "" {
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			cfg.ServerName = host // Go doesn't send an IP as SNI, but checks it against the cert
+		}
+	}
+	switch {
+	case dc.Pin != nil:
+		// the chain isn't checked, only the fingerprint below
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("no certificate presented")
 			}
 			sum := sha256.Sum256(rawCerts[0])
-			if !bytes.Equal(sum[:], pin) {
+			if !bytes.Equal(sum[:], dc.Pin) {
 				return ErrPinMismatch
 			}
 			return nil
 		}
-	} else {
-		cfg.InsecureSkipVerify = insecureSkipVerify
+	case dc.Insecure:
+		cfg.InsecureSkipVerify = true
 	}
 
 	tlsConn := tls.Client(rawConn, cfg)
@@ -103,6 +120,18 @@ func Dial(addr string, insecureSkipVerify bool, pin []byte) (net.Conn, error) {
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 	return tlsConn, nil
+}
+
+// ParsePin decodes a hex SHA-256 fingerprint (server_pin, pin file).
+func ParsePin(s string) ([]byte, error) {
+	pin, err := hex.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex: %w", err)
+	}
+	if len(pin) != sha256.Size {
+		return nil, fmt.Errorf("expected %d bytes (SHA-256), got %d", sha256.Size, len(pin))
+	}
+	return pin, nil
 }
 
 // tcpConnOf returns the TCP connection under c (c can be a *tls.Conn).
@@ -133,11 +162,11 @@ func SetNotSentLowat(c net.Conn, bytes int) {
 // exists, the saved fingerprint is returned. Otherwise it connects once,
 // saves the server's cert fingerprint to pinFile and returns it.
 // Delete pinFile to trust a new server cert.
-func ResolvePin(addr, pinFile string) ([]byte, error) {
+func ResolvePin(addr, serverName, pinFile string) ([]byte, error) {
 	if data, err := os.ReadFile(pinFile); err == nil {
-		pin, err := hex.DecodeString(strings.TrimSpace(string(data)))
+		pin, err := ParsePin(string(data))
 		if err != nil {
-			return nil, fmt.Errorf("pin file %s: invalid hex: %w", pinFile, err)
+			return nil, fmt.Errorf("pin file %s: %w", pinFile, err)
 		}
 		return pin, nil
 	} else if !os.IsNotExist(err) {
@@ -154,6 +183,7 @@ func ResolvePin(addr, pinFile string) ([]byte, error) {
 	var fingerprint []byte
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
+		ServerName:         serverName,
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
@@ -169,10 +199,31 @@ func ResolvePin(addr, pinFile string) ([]byte, error) {
 		return nil, fmt.Errorf("trust-on-first-use handshake with %s: %w", addr, err)
 	}
 
-	if err := os.WriteFile(pinFile, []byte(hex.EncodeToString(fingerprint)), 0600); err != nil {
+	if err := writeFileAtomic(pinFile, []byte(hex.EncodeToString(fingerprint)), 0600); err != nil {
 		return nil, fmt.Errorf("save pin file %s: %w", pinFile, err)
 	}
 	return fingerprint, nil
+}
+
+// writeFileAtomic writes to a temp file and renames it, so a crash in the
+// middle never leaves a half-written file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // LoadCertFingerprint returns SHA-256 of the certificate in a PEM file.
