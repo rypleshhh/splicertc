@@ -37,10 +37,16 @@ type flowTable struct {
 	ids   map[flowKey]uint16
 	flows map[uint16]*flowEntry
 	next  uint16
+	// number of flows per destination IP, see hasDst
+	dsts map[[4]byte]int
 }
 
 func newFlowTable() *flowTable {
-	return &flowTable{ids: make(map[flowKey]uint16), flows: make(map[uint16]*flowEntry)}
+	return &flowTable{
+		ids:   make(map[flowKey]uint16),
+		flows: make(map[uint16]*flowEntry),
+		dsts:  make(map[[4]byte]int),
+	}
 }
 
 // id returns the flow ID for fi, giving it a new one if needed. ok is
@@ -60,6 +66,7 @@ func (t *flowTable) id(fi flowInfo, now time.Time) (id uint16, ok bool) {
 		}
 		t.ids[key] = t.next
 		t.flows[t.next] = &flowEntry{info: fi, lastSeen: now}
+		t.dsts[fi.origDst]++
 		return t.next, true
 	}
 	return 0, false
@@ -86,14 +93,20 @@ func (t *flowTable) sweep(now time.Time, idle time.Duration) int {
 		if now.Sub(e.lastSeen) > idle {
 			delete(t.flows, id)
 			delete(t.ids, flowKeyOf(e.info))
+			dst := e.info.origDst
+			t.dsts[dst]--
+			if t.dsts[dst] == 0 {
+				delete(t.dsts, dst)
+			}
 			n++
 		}
 	}
 	return n
 }
 
-func (t *flowTable) len() int {
+// hasDst reports whether some flow goes to dst.
+func (t *flowTable) hasDst(dst [4]byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return len(t.flows)
+	return t.dsts[dst] > 0
 }
