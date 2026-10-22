@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -14,7 +15,9 @@ import (
 // droppable channel: a test channel to see how frames get late or lost
 // on the real network. Nothing is relayed, the server only logs.
 
-// Don't remember more than this many frame numbers per session.
+// Don't remember more than this many frame numbers per session. Frames
+// with other numbers after that are not counted at all, so the summary
+// stays consistent (delivered <= seen).
 const maxDropSeen = 100000
 
 // dropSession is shared by all connections with the same session ID,
@@ -26,6 +29,8 @@ type dropSession struct {
 	accepted   int
 	ttlDropped int // counts copies, not real loss with multipath
 	duplicates int
+	// frames with new numbers came after seen was full
+	capHit     bool
 	paths      int
 	lastActive time.Time
 }
@@ -96,39 +101,59 @@ func handleDroppableConn(conn net.Conn) {
 	for {
 		f, err := frame.ReadFrame(conn)
 		if err != nil {
-			sess.mu.Lock()
-			a, t, d, total := sess.accepted, sess.ttlDropped, sess.duplicates, len(sess.seen)
-			sess.mu.Unlock()
-			lost := total - a
-			lossPct := 0.0
-			if total > 0 {
-				lossPct = 100 * float64(lost) / float64(total)
-			}
-			log.Printf("droppable path closed (session %s): %v. summary: %d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
-				sid, err, a, total, lost, lossPct, t, d)
+			log.Printf("droppable path closed (session %s): %v. summary: %s", sid, err, sess.summary())
 			return
 		}
 		age := time.Since(time.UnixMilli(f.TimestampMS))
-
-		sess.mu.Lock()
-		if len(sess.seen) < maxDropSeen {
-			sess.seen[f.Seq] = struct{}{}
-		}
-		ok, reason := sess.recv.Accept(f)
-		switch {
-		case ok:
-			sess.accepted++
-		case reason == "ttl exceeded":
-			sess.ttlDropped++
-		default:
-			sess.duplicates++
-		}
-		sess.mu.Unlock()
-
+		ok, reason := sess.record(f)
 		if ok {
 			log.Printf("[session %s] frame %d accepted (age %v) via %s", sid, f.Seq, age, conn.RemoteAddr())
 		} else {
 			log.Printf("[session %s] frame %d dropped (%s, age %v) via %s", sid, f.Seq, reason, age, conn.RemoteAddr())
 		}
 	}
+}
+
+// record runs f through the receiver and counts the result. Only frames
+// whose number is (or fits) in seen are counted.
+func (s *dropSession) record(f frame.Frame) (ok bool, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, known := s.seen[f.Seq]
+	counted := known || len(s.seen) < maxDropSeen
+	if counted {
+		s.seen[f.Seq] = struct{}{}
+	} else {
+		s.capHit = true
+	}
+	ok, reason = s.recv.Accept(f)
+	if !counted {
+		return ok, reason
+	}
+	switch {
+	case ok:
+		s.accepted++
+	case reason == "ttl exceeded":
+		s.ttlDropped++
+	default:
+		s.duplicates++
+	}
+	return ok, reason
+}
+
+func (s *dropSession) summary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := len(s.seen)
+	lost := total - s.accepted
+	lossPct := 0.0
+	if total > 0 {
+		lossPct = 100 * float64(lost) / float64(total)
+	}
+	out := fmt.Sprintf("%d/%d unique frames delivered (%d never delivered = %.1f%% real loss); %d TTL-drop events, %d duplicate-suppressed copies",
+		s.accepted, total, lost, lossPct, s.ttlDropped, s.duplicates)
+	if s.capHit {
+		out += fmt.Sprintf(" (only the first %d frame numbers were counted)", maxDropSeen)
+	}
+	return out
 }
