@@ -75,22 +75,36 @@ func handleConn(conn net.Conn) {
 	}
 }
 
+// SMTP spam sent through the tunnel would get the VPS banned by the
+// hoster, so outgoing mail is not relayed.
+const smtpPort = "25"
+
 // targetDialer only connects where the egress policy allows: not to the
 // server itself (loopback or its own public IP), not to private networks
-// and cloud metadata. The check is done on the resolved IP right before
-// connect(), so a hostname pointing to 127.0.0.1 doesn't get through.
+// and cloud metadata, not to port 25. The check is done on the resolved
+// IP right before connect(), so a hostname pointing to 127.0.0.1 doesn't
+// get through.
 var targetDialer = net.Dialer{
 	Timeout: 10 * time.Second,
 	Control: func(network, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return err
-		}
-		if ok, reason := destinations.Allowed(net.ParseIP(host)); !ok {
-			return fmt.Errorf("%w: %s: %s", proto.ErrNotAllowed, host, reason)
-		}
-		return nil
+		return checkTarget(address)
 	},
+}
+
+// checkTarget checks a resolved "ip:port". Errors wrap
+// proto.ErrNotAllowed, so the client gets "not allowed by ruleset".
+func checkTarget(address string) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if port == smtpPort {
+		return fmt.Errorf("%w: port 25 (SMTP) is blocked", proto.ErrNotAllowed)
+	}
+	if ok, reason := destinations.Allowed(net.ParseIP(host)); !ok {
+		return fmt.Errorf("%w: %s: %s", proto.ErrNotAllowed, host, reason)
+	}
+	return nil
 }
 
 func handleStream(s *smux.Stream) {
