@@ -1,9 +1,13 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/xtaci/smux"
 
@@ -16,39 +20,148 @@ import (
 // socks5 mode: a local SOCKS5 proxy, every TCP connection becomes one
 // smux stream inside a single TLS connection to the server.
 
-func runSocksMode(serverAddr, listenAddr string, insecure bool, pin, key []byte) {
-	conn, err := transport.Dial(serverAddr, transport.DialConfig{Insecure: insecure, Pin: pin})
+// smux limits, the same as on the server. The default has no limit on
+// the receive buffer.
+const (
+	smuxReceiveBuffer = 4 << 20  // bytes for all streams of a session
+	smuxStreamBuffer  = 64 << 10 // bytes per stream
+)
+
+func smuxConfig() *smux.Config {
+	c := smux.DefaultConfig()
+	c.MaxReceiveBuffer = smuxReceiveBuffer
+	c.MaxStreamBuffer = smuxStreamBuffer
+	return c
+}
+
+// runSocksMode returns only on an error: the first connect failed, the
+// listener couldn't start, or a reconnect failed permanently.
+func runSocksMode(srv endpoint, listenAddr string, key []byte) error {
+	stop := make(chan error, 1)
+	s := &socksSession{
+		dial: func() (*smux.Session, error) { return dialSocks(srv, key) },
+		onFatal: func(err error) {
+			select {
+			case stop <- err:
+			default:
+			}
+		},
+	}
+	sess, err := s.dial()
 	if err != nil {
-		log.Fatalf("dial server: %v", err)
+		return fmt.Errorf("dial server: %w", err)
 	}
-	if key != nil {
-		if err := auth.ClientHandshake(conn, key); err != nil {
-			log.Fatalf("auth: %v", err)
-		}
-	}
-	sess, err := smux.Client(conn, nil)
-	if err != nil {
-		log.Fatalf("smux client: %v", err)
-	}
-	log.Printf("connected to tunnel server %s", serverAddr)
+	s.sess = sess
+	defer s.close()
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("socks5 listen: %v", err)
+		return fmt.Errorf("socks5 listen: %w", err)
 	}
+	defer ln.Close()
 	log.Printf("SOCKS5 proxy listening on %s", listenAddr)
 
-	for {
-		appConn, err := ln.Accept()
-		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
+	go func() {
+		for {
+			appConn, err := ln.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				log.Printf("accept: %v", err)
+				continue
+			}
+			go handleApp(appConn, s)
 		}
-		go handleApp(appConn, sess)
+	}()
+	return <-stop
+}
+
+func dialSocks(srv endpoint, key []byte) (*smux.Session, error) {
+	conn, err := transport.Dial(srv.addr, srv.dc)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(transport.DialTimeout))
+	if err := auth.ClientHandshake(conn, key); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("auth: %w", err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	sess, err := smux.Client(conn, smuxConfig())
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("smux client: %w", err)
+	}
+	log.Printf("connected to tunnel server %s", srv.addr)
+	return sess, nil
+}
+
+// socksSession is the smux session to the server. When it's lost, the
+// next app connection dials a new one. While the server can't be
+// reached, app connections fail right away instead of waiting.
+type socksSession struct {
+	dial func() (*smux.Session, error)
+	// onFatal gets errors that reconnecting won't fix (wrong key or
+	// certificate). After that no more dials are made.
+	onFatal func(error)
+
+	mu       sync.Mutex
+	sess     *smux.Session // nil after it was lost
+	backoff  time.Duration
+	nextDial time.Time
+	fatal    error
+}
+
+func (s *socksSession) openStream() (*smux.Stream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sess != nil && !s.sess.IsClosed() {
+		stream, err := s.sess.OpenStream()
+		if err == nil {
+			return stream, nil
+		}
+	}
+	if s.sess != nil {
+		log.Printf("socks: connection to the server lost, reconnecting")
+		s.sess.Close()
+		s.sess = nil
+	}
+
+	if s.fatal != nil {
+		return nil, s.fatal
+	}
+	if wait := time.Until(s.nextDial); wait > 0 {
+		return nil, fmt.Errorf("server unreachable, next try in %v", wait.Round(time.Millisecond))
+	}
+	sess, err := s.dial()
+	if err != nil {
+		// a wrong key would only get this IP banned if retried
+		if isPermanentDialError(err) {
+			s.fatal = fmt.Errorf("socks: reconnect: %w", err)
+			if s.onFatal != nil {
+				s.onFatal(s.fatal)
+			}
+			return nil, s.fatal
+		}
+		s.backoff = min(max(2*s.backoff, redialMin), redialMax)
+		s.nextDial = time.Now().Add(s.backoff)
+		return nil, err
+	}
+	s.backoff = 0
+	s.sess = sess
+	return sess.OpenStream()
+}
+
+func (s *socksSession) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sess != nil {
+		s.sess.Close()
 	}
 }
 
-func handleApp(appConn net.Conn, sess *smux.Session) {
+func handleApp(appConn net.Conn, s *socksSession) {
 	defer appConn.Close()
 
 	if err := socks5.Handshake(appConn); err != nil {
@@ -61,7 +174,7 @@ func handleApp(appConn net.Conn, sess *smux.Session) {
 		return
 	}
 
-	stream, err := sess.OpenStream()
+	stream, err := s.openStream()
 	if err != nil {
 		log.Printf("open stream: %v", err)
 		socks5.WriteReply(appConn, proto.StatusFailure)

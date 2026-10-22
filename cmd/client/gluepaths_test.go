@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
+	"tcp-dormtun/internal/transport"
 )
 
 // fakeGlueServer serves one path. If echo is false it reads everything
@@ -37,7 +41,7 @@ func fakeGlueServer(c net.Conn, echo bool, got chan<- []byte) {
 
 func TestGluePathsRedialDeadPath(t *testing.T) {
 	var dials atomic.Int32
-	g := newGluePaths("", false, nil, nil, func(frame.Frame) {})
+	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, nil)
 	g.dial = func() (net.Conn, error) {
 		client, server := net.Pipe()
 		// the first connection never answers pings, later ones do
@@ -68,7 +72,7 @@ func TestGluePathsRedialDeadPath(t *testing.T) {
 func TestGluePathsSendAndReceive(t *testing.T) {
 	got := make(chan []byte, 16)
 	recv := make(chan frame.Frame, 16)
-	g := newGluePaths("", false, nil, nil, func(f frame.Frame) { recv <- f })
+	g := newGluePaths(endpoint{}, nil, func(f frame.Frame) { recv <- f }, nil)
 	var servers []net.Conn
 	g.dial = func() (net.Conn, error) {
 		client, server := net.Pipe()
@@ -106,7 +110,7 @@ func TestGluePathsSendAndReceive(t *testing.T) {
 }
 
 func TestGluePathsStartFailsWhenNothingConnects(t *testing.T) {
-	g := newGluePaths("", false, nil, nil, func(frame.Frame) {})
+	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, nil)
 	g.dial = func() (net.Conn, error) { return nil, errors.New("refused") }
 	if err := g.start(3); err == nil {
 		t.Fatal("expected an error when no path can connect")
@@ -154,5 +158,102 @@ func TestVPNLinkReconnects(t *testing.T) {
 	case <-servers:
 	case <-time.After(3 * time.Second):
 		t.Fatal("silent connection was not dropped")
+	}
+}
+
+// A wrong key stops the path (retrying gets the IP banned) and reports
+// to onFatal instead of exiting the process.
+func TestGluePathsPermanentErrorStops(t *testing.T) {
+	var dials atomic.Int32
+	fatal := make(chan error, 4)
+	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, func(err error) { fatal <- err })
+	g.dial = func() (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("auth: %w", auth.ErrRejected)
+	}
+	if err := g.start(2); !errors.Is(err, auth.ErrRejected) {
+		t.Fatalf("start: got %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-fatal:
+			if !strings.Contains(err.Error(), "server rejected the client key") {
+				t.Fatalf("onFatal got %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("onFatal not called")
+		}
+	}
+	time.Sleep(2 * redialMin)
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("%d dials, want one per path", n)
+	}
+}
+
+// run returns a permanent reconnect error instead of exiting, with the
+// text the tray looks for.
+func TestVPNLinkPermanentErrorReturns(t *testing.T) {
+	var dials atomic.Int32
+	l := &vpnLink{
+		onPacket:    func([]byte) {},
+		readTimeout: time.Second,
+		dial: func() (net.Conn, error) {
+			dials.Add(1)
+			return nil, transport.ErrPinMismatch
+		},
+	}
+	client, server := net.Pipe()
+	server.Close()
+	done := make(chan error, 1)
+	go func() { done <- l.run(client) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, transport.ErrPinMismatch) ||
+			!strings.Contains(err.Error(), "server certificate does not match pinned fingerprint") {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not return on a permanent error")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("%d dials after a permanent error, want 1", n)
+	}
+}
+
+// close stops run without reconnecting.
+func TestVPNLinkClose(t *testing.T) {
+	var dials atomic.Int32
+	l := &vpnLink{
+		onPacket:    func([]byte) {},
+		readTimeout: time.Minute,
+		dial: func() (net.Conn, error) {
+			dials.Add(1)
+			c, _ := net.Pipe()
+			return c, nil
+		},
+	}
+	client, _ := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- l.run(client) }()
+	for {
+		l.mu.Lock()
+		up := l.conn != nil
+		l.mu.Unlock()
+		if up {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	l.close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not return after close")
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("%d dials after close", n)
 	}
 }
