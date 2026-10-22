@@ -13,34 +13,30 @@ RUN go mod download
 COPY . .
 
 # CGO disabled -> a truly static binary that runs on scratch/alpine with
-# no libc. GOFLAGS=-mod=mod lets go update go.sum if it needs to.
-RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
+# no libc. -mod=readonly: the build uses go.mod/go.sum as committed and
+# fails instead of quietly changing dependencies.
+RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=readonly \
     go build -o /out/server ./cmd/server
 
-# Generate a fallback cert at build time so the image still works
-# standalone (e.g. `docker run` without docker-compose.yml's volumes).
-# docker-compose.yml mounts a persistent ./devcerts over this by default —
-# that mount is what real deployments should rely on, since baking a
-# fresh cert into the image on every rebuild changes its fingerprint
-# every time, breaking every client's server_pin/pin_file until updated.
-RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
-    go build -o /out/gencert ./cmd/gencert
-RUN cd /out && ./gencert
+# No TLS cert in the image: a private key in an image layer leaks to
+# anyone who gets the image. The cert comes from the ./devcerts volume
+# (see docker-compose.yml), made once on the host with `go run ./cmd/gencert`.
 
 # ---- runtime stage ----
 FROM alpine:3.22
 
 # iptables/iproute2: the full-tunnel VPN channel creates its own TUN
-# device and needs `ip`/`iptables` on the server to address it, enable
-# forwarding, and set up NAT — see cmd/server/vpn.go.
-RUN apk add --no-cache iptables iproute2
+# device and needs `ip`/`iptables` on the server to address it and set up
+# NAT, see cmd/server/vpn_setup.go. Both iptables backends (nft and
+# legacy) are installed, the server picks the one the host already uses.
+RUN apk add --no-cache iptables iptables-legacy iproute2
 
 WORKDIR /app
 COPY --from=build /out/server /app/server
-COPY --from=build /out/devcerts /app/devcerts
 
-# reliable, droppable, glue, vpn channels
-EXPOSE 8443 8444 8446 8447
+# No EXPOSE: docker-compose.yml uses host networking, the ports are
+# whatever server-config.json says (defaults: reliable 8443, glue 8446,
+# vpn 8447; droppable is off).
 
 # No flags baked in — the server reads server-config.json (mounted at
 # /app/server-config.json by docker-compose.yml) for everything: ports,
