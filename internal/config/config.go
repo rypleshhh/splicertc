@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,7 +18,11 @@ func Load(path string, v any) (found bool, err error) {
 		}
 		return false, fmt.Errorf("read config %s: %w", path, err)
 	}
-	if err := json.Unmarshal(data, v); err != nil {
+	// unknown fields are an error: a typo in a field name would otherwise
+	// silently leave the default (e.g. a security option that stays off)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
 		return false, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return true, nil
@@ -29,6 +34,9 @@ func FindFlag(args []string, name string) string {
 	long := "--" + name
 	short := "-" + name
 	for i, a := range args {
+		if a == "--" {
+			break // the rest are not flags
+		}
 		if a == short || a == long {
 			if i+1 < len(args) {
 				return args[i+1]
