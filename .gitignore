@@ -1,28 +1,15 @@
-# Real configs hold a live IP and (optionally) the client's private key
-# inline — never commit these. Commit *.example.json instead.
+# Real configs and keys: never commit them, commit *.example.json instead.
 server-config.json
 client-config.json
-
-# cmd/tray's saved connection list — same reasoning as client-config.json
-# above, one or more client_key values inline. Commit
-# connections.example.json instead.
 connections.json
-
-# The server's real list of who's allowed to connect (names + public
-# keys — not secret by themselves, but personal/deployment-specific,
-# same reasoning as the configs above). Commit authorized_keys.example.json
-# instead. Any *.key file holding a raw private key printed by
-# cmd/genkey, if saved to disk instead of pasted into a config.
 authorized_keys.json
 *.key
 
-# Throwaway dev certs (regenerated via `go run ./cmd/gencert`, or baked
-# fresh into the Docker image).
+# TLS cert of the server, made once with `go run ./cmd/gencert` and
+# mounted into the container.
 devcerts/
 
-# Trust-on-first-use pin files (pin_file config field) — not secret (just
-# a public cert fingerprint), but local, machine-generated state, same
-# reason ssh's known_hosts isn't checked into a repo either.
+# Trust-on-first-use pin files (pin_file), local machine state.
 *.pin
 
 # Build output
@@ -30,20 +17,8 @@ devcerts/
 *.exe~
 /server
 /client
-tunprobe.exe
 portprobe-linux
 
-# cmd/tray's runtime log (see its own -config/tray.log, next to the exe
-# — this repo-root one only shows up if someone runs it from here).
+# cmd/tray's log
 tray.log
 tray.log.old
-
-# Reference-project scratch folders (other people's codebases dropped
-# here for study, not part of this project) and the running notes taken
-# on them — local-only, never pushed.
-slorc/
-owenlivkit/
-IDEAS.md
-
-# Code walkthrough and review notes, local only (like IDEAS.md).
-docs/
