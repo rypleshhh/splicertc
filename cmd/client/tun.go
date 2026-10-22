@@ -110,7 +110,10 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 				continue // all flow IDs in use
 			}
 
-			envelope := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+			envelope, err := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+			if err != nil {
+				continue // only IPv4 gets here
+			}
 			wire := frame.New(nextSeq(), envelope).Marshal()
 			writeAllPaths(wire)
 		}

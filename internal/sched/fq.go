@@ -2,6 +2,8 @@ package sched
 
 import (
 	"container/list"
+	"encoding/binary"
+	"hash/maphash"
 	"math"
 	"sync"
 	"time"
@@ -24,6 +26,10 @@ const (
 
 	// CoDel never drops when only about one packet is queued.
 	maxPacket = 1514
+
+	// Flows are hashed into this many queues (RFC 8290 uses 1024 too), so
+	// memory and the overflow scan don't grow with the number of flows.
+	flowBuckets = 1024
 )
 
 type Stats struct {
@@ -44,7 +50,8 @@ type Scheduler struct {
 	cfg  Config
 	now  func() time.Time
 
-	flows    map[FlowKey]*flow
+	flows    map[uint32]*flow // by bucket
+	seed     maphash.Seed     // random per scheduler, so collisions can't be planned
 	newFlows list.List
 	oldFlows list.List
 	total    int
@@ -58,7 +65,7 @@ type packet struct {
 }
 
 type flow struct {
-	key     FlowKey
+	bucket  uint32
 	q       []packet
 	bytes   int
 	deficit int
@@ -88,7 +95,7 @@ func New(cfg Config) *Scheduler {
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultInterval
 	}
-	s := &Scheduler{cfg: cfg, now: time.Now, flows: make(map[FlowKey]*flow)}
+	s := &Scheduler{cfg: cfg, now: time.Now, flows: make(map[uint32]*flow), seed: maphash.MakeSeed()}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
@@ -101,10 +108,11 @@ func (s *Scheduler) Enqueue(key FlowKey, data []byte) {
 	if s.closed {
 		return
 	}
-	f := s.flows[key]
+	b := s.bucketOf(key)
+	f := s.flows[b]
 	if f == nil {
-		f = &flow{key: key}
-		s.flows[key] = f
+		f = &flow{bucket: b}
+		s.flows[b] = f
 	}
 	f.q = append(f.q, packet{data: data, enq: s.now()})
 	f.bytes += len(data)
@@ -133,6 +141,46 @@ func (s *Scheduler) Dequeue() (data []byte, ok bool) {
 		}
 		s.cond.Wait()
 	}
+}
+
+// DequeueBatch waits for at least one packet, then takes more while they
+// are queued and the total stays within maxBytes. Writing them with one
+// Write call makes one TLS record and one syscall instead of one per
+// packet. Returns false after Close.
+func (s *Scheduler) DequeueBatch(batch [][]byte, maxBytes int) ([][]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch = batch[:0]
+	for len(batch) == 0 {
+		if s.closed {
+			return nil, false
+		}
+		if data, ok := s.dequeueLocked(); ok {
+			batch = append(batch, data)
+			break
+		}
+		s.cond.Wait()
+	}
+	size := len(batch[0])
+	for size < maxBytes {
+		data, ok := s.dequeueLocked()
+		if !ok {
+			break
+		}
+		batch = append(batch, data)
+		size += len(data)
+	}
+	return batch, true
+}
+
+func (s *Scheduler) bucketOf(k FlowKey) uint32 {
+	var b [1 + 4 + 4 + 2 + 2]byte
+	b[0] = k.Proto
+	copy(b[1:5], k.Src[:])
+	copy(b[5:9], k.Dst[:])
+	binary.BigEndian.PutUint16(b[9:11], k.SrcPort)
+	binary.BigEndian.PutUint16(b[11:13], k.DstPort)
+	return uint32(maphash.Bytes(s.seed, b[:]) % flowBuckets)
 }
 
 func (s *Scheduler) Close() {
@@ -197,7 +245,7 @@ func (s *Scheduler) moveToOld(f *flow) {
 func (s *Scheduler) deactivate(f *flow) {
 	s.unlink(f)
 	f.elem = nil
-	delete(s.flows, f.key)
+	delete(s.flows, f.bucket)
 }
 
 func (s *Scheduler) unlink(f *flow) {

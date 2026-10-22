@@ -183,7 +183,10 @@ func runVPNMode(vpnAddr string, insecure bool, pin []byte, tunName string, mtu i
 					if !ok {
 						continue // all flow IDs in use
 					}
-					envelope := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+					envelope, err := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+					if err != nil {
+						continue // only IPv4 gets here
+					}
 					paths.send(frame.New(glueSeq.Add(1), envelope).Marshal())
 					continue
 				}

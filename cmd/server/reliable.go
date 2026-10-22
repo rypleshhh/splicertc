@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"syscall"
@@ -88,7 +87,7 @@ var targetDialer = net.Dialer{
 			return err
 		}
 		if ok, reason := destinations.Allowed(net.ParseIP(host)); !ok {
-			return fmt.Errorf("target %s is not allowed: %s", host, reason)
+			return fmt.Errorf("%w: %s: %s", proto.ErrNotAllowed, host, reason)
 		}
 		return nil
 	},
@@ -103,28 +102,16 @@ func handleStream(s *smux.Stream) {
 		return
 	}
 
-	// targets are not logged on success, the log shouldn't be a browsing history
 	outConn, err := targetDialer.Dial("tcp", target)
 	if err != nil {
-		log.Printf("stream %d: dial %s failed: %v", s.ID(), target, err)
-		s.Write([]byte{0x01})
+		// the client gets the SOCKS5 error code; targets are not logged,
+		// the log shouldn't be a browsing history
+		s.Write([]byte{proto.DialStatus(err)})
 		return
 	}
-	defer outConn.Close()
-
-	if _, err := s.Write([]byte{0x00}); err != nil {
-		log.Printf("stream %d: write status: %v", s.ID(), err)
+	if _, err := s.Write([]byte{proto.StatusOK}); err != nil {
+		outConn.Close()
 		return
 	}
-
-	relay(s, outConn)
-}
-
-// relay copies both ways until one side is done. The caller closes both
-// connections, which also stops the other copy.
-func relay(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
+	proto.Relay(s, outConn)
 }

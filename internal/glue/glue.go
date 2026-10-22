@@ -56,16 +56,20 @@ func IsPing(b []byte) bool {
 	return len(b) >= 1 && b[0] == msgPing
 }
 
-// EncodeOutbound builds a client->server envelope. IPv4 only for now.
-func EncodeOutbound(flowID uint16, dst net.IP, dstPort uint16, payload []byte) []byte {
+// EncodeOutbound builds a client->server envelope. The format has room
+// for an IPv4 address only.
+func EncodeOutbound(flowID uint16, dst net.IP, dstPort uint16, payload []byte) ([]byte, error) {
 	dst4 := dst.To4()
+	if dst4 == nil {
+		return nil, fmt.Errorf("glue: %s is not an IPv4 address", dst)
+	}
 	buf := make([]byte, 1+2+4+2+len(payload))
 	buf[0] = msgOutbound
 	binary.BigEndian.PutUint16(buf[1:3], flowID)
 	copy(buf[3:7], dst4)
 	binary.BigEndian.PutUint16(buf[7:9], dstPort)
 	copy(buf[9:], payload)
-	return buf
+	return buf, nil
 }
 
 // payload points into b.

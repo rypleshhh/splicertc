@@ -9,7 +9,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"flag"
 	"log"
 	"os"
@@ -140,7 +139,7 @@ func main() {
 	var pin []byte
 	switch {
 	case *serverPin != "":
-		p, err := hex.DecodeString(*serverPin)
+		p, err := transport.ParsePin(*serverPin)
 		if err != nil {
 			log.Fatalf("server-pin: invalid hex: %v", err)
 		}
@@ -158,7 +157,7 @@ func main() {
 		}
 		_, statErr := os.Stat(*pinFile)
 		existed := statErr == nil
-		p, err := transport.ResolvePin(probeAddr, *pinFile)
+		p, err := transport.ResolvePin(probeAddr, "", *pinFile)
 		if err != nil {
 			log.Fatalf("resolve server pin: %v", err)
 		}

@@ -18,7 +18,7 @@ import (
 // runDropTest sends a few frames with artificial delays. Delays over
 // 150ms should show up as drops on the server.
 func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure, pin)
+	conn, err := transport.Dial(dropAddr, transport.DialConfig{Insecure: insecure, Pin: pin})
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
@@ -53,7 +53,7 @@ func runDropTest(dropAddr string, insecure bool, pin []byte, key []byte) {
 // runDropStress sends count frames every interval. Use with tc netem on
 // the server and check the server log for drops.
 func runDropStress(dropAddr string, insecure bool, pin []byte, count int, interval time.Duration, key []byte) {
-	conn, err := transport.Dial(dropAddr, insecure, pin)
+	conn, err := transport.Dial(dropAddr, transport.DialConfig{Insecure: insecure, Pin: pin})
 	if err != nil {
 		log.Fatalf("dial droppable: %v", err)
 	}
@@ -103,7 +103,7 @@ func runDropMultipath(dropAddr string, insecure bool, pin []byte, count int, int
 
 	conns := make([]net.Conn, paths)
 	for i := 0; i < paths; i++ {
-		conn, err := transport.Dial(dropAddr, insecure, pin)
+		conn, err := transport.Dial(dropAddr, transport.DialConfig{Insecure: insecure, Pin: pin})
 		if err != nil {
 			log.Fatalf("dial path %d: %v", i, err)
 		}
