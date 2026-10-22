@@ -60,41 +60,29 @@ func handleApp(appConn net.Conn, sess *smux.Session) {
 		log.Printf("socks5 request: %v", err)
 		return
 	}
-	log.Printf("app requested %s", target)
 
 	stream, err := sess.OpenStream()
 	if err != nil {
 		log.Printf("open stream: %v", err)
-		socks5.WriteReply(appConn, false)
+		socks5.WriteReply(appConn, proto.StatusFailure)
 		return
 	}
 	defer stream.Close()
 
 	if err := proto.WriteTarget(stream, target); err != nil {
 		log.Printf("send target: %v", err)
-		socks5.WriteReply(appConn, false)
+		socks5.WriteReply(appConn, proto.StatusFailure)
 		return
 	}
 
+	// the server answers with a SOCKS5 reply code
 	status := make([]byte, 1)
-	if _, err := io.ReadFull(stream, status); err != nil || status[0] != 0 {
-		log.Printf("server could not reach %s: %v", target, err)
-		socks5.WriteReply(appConn, false)
+	if _, err := io.ReadFull(stream, status); err != nil {
+		socks5.WriteReply(appConn, proto.StatusFailure)
 		return
 	}
-
-	if err := socks5.WriteReply(appConn, true); err != nil {
-		log.Printf("socks5 reply: %v", err)
+	if err := socks5.WriteReply(appConn, status[0]); err != nil || status[0] != proto.StatusOK {
 		return
 	}
-
-	relay(appConn, stream)
-	log.Printf("%s: closed", target)
-}
-
-func relay(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
+	proto.Relay(appConn, stream)
 }
