@@ -1,11 +1,12 @@
 {
   "addr": "0.0.0.0:8443",
-  "drop_addr": "0.0.0.0:8444",
+  "drop_addr": "off",
   "glue_addr": "0.0.0.0:8446",
   "vpn_addr": "0.0.0.0:587",
   "vpn_tun_name": "dormvpn0",
   "vpn_tun_mtu": 1400,
   "vpn_subnet": "10.66.0.0/24",
   "egress_iface": "",
+  "public_ips": [],
   "authorized_keys_file": "authorized_keys.json"
 }

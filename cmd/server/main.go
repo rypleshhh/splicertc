@@ -2,7 +2,7 @@
 // TLS ports, one per channel (any of them can be set to "off"):
 //
 //	reliable  (addr)      SOCKS5-style TCP streams over smux    reliable.go
-//	droppable (drop_addr) test channel, frames are only logged  drop.go
+//	droppable (drop_addr) test channel, frames are only logged  drop.go (off by default)
 //	glue      (glue_addr) game UDP, multipath + dedup           glue.go
 //	vpn       (vpn_addr)  whole IP packets into a TUN + NAT     vpn.go, vpn_setup.go
 //
@@ -11,10 +11,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"tcp-dormtun/internal/auth"
@@ -42,6 +49,9 @@ type Config struct {
 	// let clients reach private networks (10/8, 172.16/12, 192.168/16,
 	// 100.64/10) through the tunnel; off by default
 	AllowPrivateDestinations bool `json:"allow_private_destinations,omitempty"`
+	// public IPs of this server that are not on any interface (clouds
+	// with 1:1 NAT), so clients can't reach the server through them
+	PublicIPs []string `json:"public_ips,omitempty"`
 }
 
 // channelOff as a listen address disables that channel.
@@ -64,7 +74,8 @@ func main() {
 	}
 
 	addr := flag.String("addr", config.Str(cfg.Addr, ":8443"), "reliable channel listen address (\"off\" disables it)")
-	dropAddr := flag.String("drop-addr", config.Str(cfg.DropAddr, ":8444"), "droppable channel listen address (\"off\" disables it)")
+	// a debug channel that logs every frame, so only on when asked for
+	dropAddr := flag.String("drop-addr", config.Str(cfg.DropAddr, channelOff), "droppable test channel listen address, e.g. :8444 (\"off\" by default)")
 	glueAddr := flag.String("glue-addr", config.Str(cfg.GlueAddr, ":8446"), "glue channel listen address, real captured UDP traffic (\"off\" disables it)")
 	vpnAddr := flag.String("vpn-addr", config.Str(cfg.VPNAddr, ":8447"), "full-tunnel VPN channel listen address (\"off\" disables it, then no TUN/iptables are needed)")
 	vpnTunName := flag.String("vpn-tun-name", config.Str(cfg.VPNTunName, "dormvpn0"), "server-side TUN interface name for full-tunnel mode")
@@ -76,6 +87,7 @@ func main() {
 	authorizedKeysFile := flag.String("authorized-keys-file", cfg.AuthorizedKeysFile, "path to authorized_keys.json, empty = no auth")
 	vpnDownMbps := flag.Float64("vpn-down-mbps", cfg.VPNDownMbps, "cap the vpn channel's server->client rate in Mbit/s, a bit below the client's real download speed (0 = no cap)")
 	allowPrivate := flag.Bool("allow-private-destinations", cfg.AllowPrivateDestinations, "let clients reach private networks (10/8, 172.16/12, 192.168/16, 100.64/10) through the tunnel")
+	publicIPs := flag.String("public-ips", strings.Join(cfg.PublicIPs, ","), "comma-separated public IPs of this server that are not on any interface (1:1 NAT clouds), clients are not let through to them")
 	// only a command line flag on purpose, so it can't be switched on by
 	// a config file by accident
 	allowUnauth := flag.Bool("allow-unauthenticated", false, "start without authorized_keys_file (anyone can use the server as a proxy!), for local tests only")
@@ -90,6 +102,9 @@ func main() {
 		log.Printf("vpn: shaping server->client to %.1f Mbit/s", vpnDownRate)
 	}
 
+	if err := checkCertFiles(*cert, *key); err != nil {
+		log.Fatal(err)
+	}
 	if fp, err := transport.LoadCertFingerprint(*cert); err != nil {
 		log.Printf("could not compute cert fingerprint for pinning: %v", err)
 	} else {
@@ -120,43 +135,104 @@ func main() {
 	if *allowPrivate {
 		log.Println("WARNING: allow_private_destinations is on, clients can reach private networks through the tunnel")
 	}
+	ownIPs, err := parseIPList(*publicIPs)
+	if err != nil {
+		log.Fatalf("public_ips: %v", err)
+	}
+	if len(ownIPs) > 0 {
+		destinations.AddOwn(ownIPs...)
+		log.Printf("egress: also blocking own public IPs %s", *publicIPs)
+	}
 
-	go janitor()
-	var running []func()
+	// stop on docker stop / Ctrl+C, so the iptables rules get removed
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
+	// listen on everything first: a failure here must not leave
+	// iptables rules behind
+	type channel struct {
+		name   string
+		ln     net.Listener
+		handle func(net.Conn)
+	}
+	var channels []channel
+	add := func(name, addr string, handle func(net.Conn)) {
+		if addr == channelOff {
+			log.Printf("%s channel is off", name)
+			return
+		}
+		channels = append(channels, channel{name, listen(name, addr, *cert, *key), handle})
+	}
+	add("reliable", *addr, handleConn)
+	add("droppable", *dropAddr, handleDroppableConn)
+	add("glue", *glueAddr, handleGlueConn)
+	var vpnLn net.Listener
 	if *vpnAddr != channelOff {
-		vpnLn := listen("vpn", *vpnAddr, *cert, *key)
-		vpnDev, vpnNetwork, err := setupVPNTun(*vpnTunName, *vpnTunMTU, *vpnSubnet, *egressIface, *allowPrivate)
+		vpnLn = listen("vpn", *vpnAddr, *cert, *key)
+	}
+	if len(channels) == 0 && vpnLn == nil {
+		log.Fatalf("all channels are off, nothing to do")
+	}
+
+	vpnCleanup := func() {}
+	if vpnLn != nil {
+		dev, vn, cleanup, err := setupVPNTun(vpnSetup{
+			tunName:      *vpnTunName,
+			mtu:          *vpnTunMTU,
+			subnet:       *vpnSubnet,
+			egressIface:  *egressIface,
+			allowPrivate: *allowPrivate,
+			publicIPs:    ownIPs,
+		})
 		if err != nil {
 			log.Fatalf("vpn tun setup: %v", err)
 		}
-		go vpnTunReader(vpnDev)
-		running = append(running, func() {
-			acceptLoop("vpn", vpnLn, func(c net.Conn) { handleVPNConn(c, vpnDev, vpnNetwork) })
-		})
+		vpnCleanup = cleanup
+		go vpnTunReader(dev)
+		channels = append(channels, channel{"vpn", vpnLn, func(c net.Conn) { handleVPNConn(c, dev, vn) }})
 	}
-	running = addChannel(running, "reliable", *addr, *cert, *key, handleConn)
-	running = addChannel(running, "droppable", *dropAddr, *cert, *key, handleDroppableConn)
-	running = addChannel(running, "glue", *glueAddr, *cert, *key, handleGlueConn)
 
-	if len(running) == 0 {
-		log.Fatalf("all channels are off, nothing to do")
+	go janitor()
+	for _, ch := range channels {
+		go acceptLoop(ch.name, ch.ln, ch.handle)
 	}
-	for _, run := range running[1:] {
-		go run()
+
+	<-ctx.Done()
+	log.Printf("shutting down")
+	for _, ch := range channels {
+		ch.ln.Close()
 	}
-	running[0]() // the first accept loop keeps main alive
+	vpnCleanup()
 }
 
-// addChannel starts listening unless addr is "off" and returns the list
-// of accept loops with this one added.
-func addChannel(running []func(), name, addr, cert, key string, handle func(net.Conn)) []func() {
-	if addr == channelOff {
-		log.Printf("%s channel is off", name)
-		return running
+// checkCertFiles gives a hint instead of a bare "no such file" when the
+// TLS cert is missing (it's not in the image, it must be mounted).
+func checkCertFiles(files ...string) error {
+	for _, f := range files {
+		if _, err := os.Stat(f); errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("TLS cert/key %s not found: run `go run ./cmd/gencert` once on the host "+
+				"(it writes devcerts/dev.crt and devcerts/dev.key), and in docker make sure devcerts/ is mounted "+
+				"to /app/devcerts (see docker-compose.yml)", f)
+		}
 	}
-	ln := listen(name, addr, cert, key)
-	return append(running, func() { acceptLoop(name, ln, handle) })
+	return nil
+}
+
+// parseIPList parses a comma-separated list of IP addresses.
+func parseIPList(s string) ([]net.IP, error) {
+	var ips []net.IP
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ip := net.ParseIP(part)
+		if ip == nil {
+			return nil, fmt.Errorf("%q is not an IP address", part)
+		}
+		ips = append(ips, ip)
+	}
+	return ips, nil
 }
 
 func listen(name, addr, cert, key string) net.Listener {
@@ -172,6 +248,9 @@ func listen(name, addr, cert, key string) net.Listener {
 func acceptLoop(name string, ln net.Listener, handle func(net.Conn)) {
 	for {
 		conn, err := ln.Accept()
+		if errors.Is(err, net.ErrClosed) {
+			return // shutdown
+		}
 		if err != nil {
 			log.Printf("%s accept: %v", name, err)
 			// e.g. out of file descriptors, don't spin at 100% CPU
