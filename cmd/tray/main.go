@@ -1,19 +1,23 @@
 // Command tray is a small GUI for vpn mode: a list of saved connections
-// and a tray icon to connect/disconnect. It just runs client.exe and
-// setup-vpn-route.ps1, same as run-vpn.ps1.
+// and a tray icon to connect/disconnect. It runs client.exe and the
+// route script (setup-vpn-route.ps1, built in), same as run-vpn.ps1.
 //
-// Connections are saved in connections.json. Before connecting, the
-// selected one is written to client-config.json. client.exe,
-// setup-vpn-route.ps1 and wintun.dll must be next to tray.exe.
+// Connections are saved in connections.json, keys encrypted with DPAPI.
+// Before connecting, the selected one is written to client-config.json
+// (without the key, client.exe gets it from the environment).
+// client.exe and wintun.dll must be next to tray.exe.
 //
 // Files:
 //
 //	main.go         window, tray menu, global state
-//	connections.go  connections.json, the fields, save/delete
+//	connections.go  connections.json, the fields, save/delete, new key
 //	client.go       starting/stopping client.exe, status
+//	routes.go       the built-in route script and its parameters
+//	dpapi.go        encryption of the keys
+//	job.go          job object that kills client.exe with the tray
 //	ping.go         the "Пинг" button
 //	theme.go        dark theme and icons
-//	winapi.go       UAC, message box, log file
+//	winapi.go       UAC, message box, log file, install folder check
 //
 // walk is not thread safe: everything that touches a widget from a
 // goroutine has to go through ui().
@@ -48,6 +52,8 @@ var (
 	// set when connect() finished, after that client lines about
 	// reconnects change the status
 	tunnelUp atomic.Bool
+	// bumped by disconnect(), so a connect in progress knows to stop
+	connGen atomic.Uint64
 
 	connections []connection
 	// name of the connection shown in the fields ("" = new one),
@@ -107,8 +113,8 @@ func runApp() error {
 	if err := (MainWindow{
 		AssignTo:   &mainWin,
 		Title:      "splicertc",
-		Size:       Size{Width: 300, Height: 410},
-		MinSize:    Size{Width: 280, Height: 390},
+		Size:       Size{Width: 360, Height: 410},
+		MinSize:    Size{Width: 340, Height: 390},
 		Visible:    false,
 		Background: SolidColorBrush{Color: darkWindowBg},
 		Layout:     VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
@@ -146,6 +152,7 @@ func runApp() error {
 					PushButton{Text: "Новое", OnClicked: onNew},
 					PushButton{Text: "Сохранить", OnClicked: onSaveConnection},
 					PushButton{Text: "Удалить", OnClicked: onDeleteConnection},
+					PushButton{Text: "Новый ключ", ToolTipText: "создать ключ и скопировать строку для authorized_keys.json", OnClicked: onNewKey},
 				},
 			},
 			Composite{
@@ -192,7 +199,7 @@ func runApp() error {
 
 	connectAction = walk.NewAction()
 	_ = connectAction.SetText("Подключиться")
-	connectAction.Triggered().Attach(func() { go connect() })
+	connectAction.Triggered().Attach(onWindowConnect)
 	_ = ni.ContextMenu().Actions().Add(connectAction)
 
 	disconnectAction = walk.NewAction()
@@ -205,7 +212,13 @@ func runApp() error {
 	logAction := walk.NewAction()
 	_ = logAction.SetText("Открыть журнал")
 	logAction.Triggered().Attach(func() {
-		_ = exec.Command("notepad.exe", filepath.Join(exeDir, "tray.log")).Start()
+		// Not notepad directly: it would run as admin and its Open dialog
+		// is an admin shell. explorer hands the file to the user's already
+		// running (not elevated) shell, which opens the usual viewer.
+		path := filepath.Join(exeDir, "tray.log")
+		if err := exec.Command(windowsExe("explorer.exe"), path).Start(); err != nil {
+			logger.Println("open log:", err)
+		}
 	})
 	_ = ni.ContextMenu().Actions().Add(logAction)
 	_ = ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
@@ -223,9 +236,20 @@ func runApp() error {
 		return fmt.Errorf("show notify icon: %w", err)
 	}
 
-	// a crash or a power loss last time could have left IPv6 blocked
-	go teardownRoutes()
+	if err := createClientJob(); err != nil {
+		logger.Println("job object (client.exe will outlive a crashed tray):", err)
+	}
 
+	// a crash or a power loss last time could have left IPv6 blocked;
+	// under connectMu so it can't remove the block of a connect started
+	// right away
+	connectMu.Lock()
+	go func() {
+		defer connectMu.Unlock()
+		teardownRoutes()
+	}()
+
+	warnIfNotInstalled()
 	loadConnections()
 	refreshConnList()
 	if len(connections) == 0 {

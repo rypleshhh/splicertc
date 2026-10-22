@@ -13,98 +13,54 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-func TestScanForConnectedDetectsMarker(t *testing.T) {
-	r := strings.NewReader("loaded config from client-config.json\nconnected to vpn channel 1.2.3.4:587\nsome later noise\n")
-	ch := make(chan bool, 1)
-	scanForConnected(r, ch)
-
-	select {
-	case ok := <-ch:
-		if !ok {
-			t.Fatal("expected true (marker seen) before the stream ended")
-		}
-	default:
-		t.Fatal("expected a result on connectedCh, got none")
-	}
-}
-
-func TestScanForConnectedReportsFalseWhenStreamEndsFirst(t *testing.T) {
-	r := strings.NewReader("loaded config from client-config.json\ndial server: connection refused\n")
-	ch := make(chan bool, 1)
-	scanForConnected(r, ch)
-
-	select {
-	case ok := <-ch:
-		if ok {
-			t.Fatal("expected false, there was no marker")
-		}
-	default:
-		t.Fatal("expected a result on connectedCh, got none")
-	}
-}
-
-func TestScanForConnectedIgnoresPartialMatchAcrossLines(t *testing.T) {
-	// marker split over two lines should not match
-	r := strings.NewReader("connected to vpn\nchannel 1.2.3.4:587\n")
-	ch := make(chan bool, 1)
-	scanForConnected(r, ch)
-
-	select {
-	case ok := <-ch:
-		if ok {
-			t.Fatal("expected false, marker is split over two lines")
-		}
-	default:
-		t.Fatal("expected a result on connectedCh, got none")
-	}
-}
-
-func TestContainsConnected(t *testing.T) {
+func TestScanForConnected(t *testing.T) {
 	cases := []struct {
-		line string
-		want bool
+		name   string
+		output string
+		want   string
 	}{
-		{"2026/09/22 12:00:00 connected to vpn channel 1.2.3.4:587", true},
-		{"connected to vpn channel", true},
-		{"connected to glue channel 1.2.3.4:993 over 3 path(s) for: deadlock.exe", false},
-		{"", false},
-		{"dial server: connection refused", false},
+		{"marker", "loaded config from client-config.json\nconnected to vpn channel 1.2.3.4:587\nsome later noise\n",
+			"connected to vpn channel 1.2.3.4:587"},
+		{"CRLF output", "starting\r\nconnected to vpn channel 1.2.3.4:587\r\n", "connected to vpn channel 1.2.3.4:587"},
+		{"stream ends first", "loaded config from client-config.json\ndial server: connection refused\n", ""},
+		// marker split over two lines must not match
+		{"split marker", "connected to vpn\nchannel 1.2.3.4:587\n", ""},
+		// lines after the first connect go to onClientLine; with the
+		// tunnel not up yet (no GUI here) it must not touch anything
+		{"reconnect lines", "connected to vpn channel 1.2.3.4:587\nvpn: connection lost (EOF), reconnecting\nconnected to vpn channel 1.2.3.4:587\n",
+			"connected to vpn channel 1.2.3.4:587"},
 	}
 	for _, c := range cases {
-		if got := containsConnected([]byte(c.line)); got != c.want {
-			t.Errorf("containsConnected(%q) = %v, want %v", c.line, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			ch := make(chan string, 1)
+			scanForConnected(strings.NewReader(c.output), ch)
+			select {
+			case got := <-ch:
+				if got != c.want {
+					t.Fatalf("got %q, want %q", got, c.want)
+				}
+			default:
+				t.Fatal("expected a result on connectedCh, got none")
+			}
+		})
 	}
 }
 
-// scanForConnected must not block if nobody reads the channel.
-func TestScanForConnectedDoesNotBlockOnUnbufferedChannel(t *testing.T) {
-	r := strings.NewReader("connected to vpn channel 1.2.3.4:587\n")
-	ch := make(chan bool, 1)
+// scanForConnected must not block when nobody reads the channel (two
+// scanners share it, only one result is taken).
+func TestScanForConnectedDoesNotBlockOnFullChannel(t *testing.T) {
+	ch := make(chan string, 1)
+	ch <- "already full"
 
 	done := make(chan struct{})
 	go func() {
-		scanForConnected(r, ch)
+		scanForConnected(strings.NewReader("connected to vpn channel 1.2.3.4:587\n"), ch)
 		close(done)
 	}()
-
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("scanForConnected blocked")
-	}
-}
-
-// Lines after the first connect go to onClientLine; with the tunnel not
-// up yet (as here, no GUI) it must not touch anything.
-func TestScanForConnectedHandlesReconnectLines(t *testing.T) {
-	r := strings.NewReader("connected to vpn channel 1.2.3.4:587\n" +
-		"vpn: connection lost (EOF), reconnecting\n" +
-		"connected to vpn channel 1.2.3.4:587\n")
-	ch := make(chan bool, 1)
-	scanForConnected(r, ch)
-	if ok := <-ch; !ok {
-		t.Fatal("expected the first marker to be reported")
 	}
 }
 
@@ -116,17 +72,16 @@ func TestNoteClientLine(t *testing.T) {
 	}{
 		{"2026/10/14 vpn: reconnect: server certificate does not match pinned fingerprint", errPinMismatch},
 		{"dial vpn channel: server rejected the client key (is its public key in the server's authorized_keys.json?)", errKeyRejected},
+		{"vpn: connection lost (EOF), reconnecting", errNone},
 	}
 	for _, c := range cases {
-		lastClientErr.Store(int32(errNone))
-		noteClientLine([]byte(c.line))
-		if got := clientErrKind(lastClientErr.Load()); got != c.want {
-			t.Errorf("%q: got %d, want %d", c.line, got, c.want)
-		}
+		t.Run(c.line, func(t *testing.T) {
+			lastClientErr.Store(int32(errNone))
+			noteClientLine(c.line)
+			if got := clientErrKind(lastClientErr.Load()); got != c.want {
+				t.Errorf("got %d, want %d", got, c.want)
+			}
+		})
 	}
 	lastClientErr.Store(int32(errNone))
-	noteClientLine([]byte("vpn: connection lost (EOF), reconnecting"))
-	if lastClientErr.Load() != int32(errNone) {
-		t.Error("an ordinary line was taken for a fatal error")
-	}
 }

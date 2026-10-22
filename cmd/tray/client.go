@@ -1,21 +1,28 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
 )
 
-// Everything here is called from goroutines, so widget access goes
+// client.exe reads its key from this variable before the config, so the
+// key never has to be written to client-config.json.
+const clientKeyEnv = "SPLICERTC_CLIENT_KEY"
+
+// connectMu is held while a connect is in progress. The button, the tray
+// menu and double-click all start one, a second click must not start a
+// second client.exe with its own TUN.
+var connectMu sync.Mutex
+
+// Everything below is called from goroutines, so widget access goes
 // through ui().
 
 func setStatus(text string) {
@@ -25,7 +32,12 @@ func setStatus(text string) {
 			_ = statusLabel.SetText("Статус: " + text)
 		}
 		if notifyIcon != nil {
-			_ = notifyIcon.SetToolTip("splicertc - " + text)
+			// the tooltip is limited to 128 characters
+			tip := []rune("splicertc - " + text)
+			if len(tip) > 127 {
+				tip = tip[:127]
+			}
+			_ = notifyIcon.SetToolTip(string(tip))
 		}
 	})
 }
@@ -38,19 +50,22 @@ func setIcon(icon *walk.Icon) {
 	})
 }
 
-func setConnected(connected bool) {
+// setActive switches the buttons between "can connect" and "connecting
+// or connected" (then only disconnect is enabled, it also cancels a
+// connect in progress).
+func setActive(active bool) {
 	ui(func() {
 		if connectAction != nil {
-			_ = connectAction.SetEnabled(!connected)
+			_ = connectAction.SetEnabled(!active)
 		}
 		if disconnectAction != nil {
-			_ = disconnectAction.SetEnabled(connected)
+			_ = disconnectAction.SetEnabled(active)
 		}
 		if connectBtn != nil {
-			connectBtn.SetEnabled(!connected)
+			connectBtn.SetEnabled(!active)
 		}
 		if disconnectBtn != nil {
-			disconnectBtn.SetEnabled(connected)
+			disconnectBtn.SetEnabled(active)
 		}
 	})
 }
@@ -60,38 +75,60 @@ func fail(text string) {
 	logger.Println("error:", text)
 	setStatus(text)
 	setIcon(iconRed)
-	setConnected(false)
+	setActive(false)
 }
 
-// connect starts client.exe, waits until it's connected and runs the
-// routing script. It uses whatever is in client-config.json now.
-func connect() {
-	// a second click must not start a second client.exe with its own TUN
+// startConnect writes c to client-config.json and connects in the
+// background. Called on the GUI thread; a click while a connect is
+// still running is ignored.
+func startConnect(c connection) {
+	if !connectMu.TryLock() {
+		setStatus("уже подключаюсь...")
+		return
+	}
+	if err := writeClientConfigFromConnection(c); err != nil {
+		connectMu.Unlock()
+		walk.MsgBox(mainWin, "splicertc", "Не удалось записать конфиг: "+err.Error(), walk.MsgBoxOK|walk.MsgBoxIconError)
+		return
+	}
+	go func() {
+		defer connectMu.Unlock()
+		connect(c.ClientKey)
+	}()
+}
+
+// connect starts client.exe with the key, waits until it's connected and
+// runs the route script. Only called by startConnect.
+func connect(key string) {
 	tunnelUp.Store(false)
 	stopClient()
 	lastClientErr.Store(int32(errNone))
+	// disconnect() bumps connGen; then this connect must stop and not
+	// report anything
+	gen := connGen.Load()
+	cancelled := func() bool { return connGen.Load() != gen }
 
-	setConnected(false)
+	setActive(true)
 	setStatus("подключение...")
 	setIcon(iconGray)
 
 	clientExe := filepath.Join(exeDir, "client.exe")
 	cfgPath := configPath()
-	scriptPath := filepath.Join(exeDir, "setup-vpn-route.ps1")
-	for _, p := range []string{clientExe, cfgPath, scriptPath} {
+	for _, p := range []string{clientExe, cfgPath} {
 		if _, err := os.Stat(p); err != nil {
 			fail(filepath.Base(p) + " не найден рядом с tray.exe")
 			return
 		}
 	}
-	serverIP, err := serverIPFromConfig(cfgPath)
+	tc, err := loadTunConfig()
 	if err != nil {
-		fail("адрес сервера: " + err.Error())
+		fail("client-config.json: " + err.Error())
 		return
 	}
 
 	c := exec.Command(clientExe, "-config", cfgPath)
 	c.Dir = exeDir
+	c.Env = append(os.Environ(), clientKeyEnv+"="+key)
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	stdout, err := c.StdoutPipe()
 	if err != nil {
@@ -107,12 +144,22 @@ func connect() {
 		fail("не удалось запустить client.exe: " + err.Error())
 		return
 	}
+	if err := addToClientJob(c.Process.Pid); err != nil {
+		// not fatal: only matters if the tray itself dies
+		logger.Println("client.exe: add to job object:", err)
+	}
 
 	mu.Lock()
+	if cancelled() {
+		mu.Unlock()
+		_ = c.Process.Kill()
+		_ = c.Wait()
+		return
+	}
 	clientCmd = c
 	mu.Unlock()
 
-	connectedCh := make(chan bool, 1)
+	connectedCh := make(chan string, 1)
 	go scanForConnected(stdout, connectedCh)
 	go scanForConnected(stderr, connectedCh)
 	go func() {
@@ -131,23 +178,45 @@ func connect() {
 		}
 	}()
 
+	var line string
 	select {
-	case ok := <-connectedCh:
-		if !ok {
-			return
+	case line = <-connectedCh:
+		if line == "" {
+			return // exited before connecting, the Wait goroutine reports it
 		}
 	case <-time.After(connectTimeout):
-		fail("клиент не подключился за " + connectTimeout.String() + ", смотри tray.log")
+		if !cancelled() {
+			fail("клиент не подключился за " + connectTimeout.String() + ", смотри tray.log")
+			stopClient()
+		}
+		return
+	}
+	if cancelled() {
+		return
+	}
+
+	serverIP, err := serverIPFromLine(line)
+	if err != nil {
+		fail("IP сервера из лога клиента: " + err.Error())
+		stopClient()
+		return
+	}
+	args, err := setupArgs(serverIP, tc)
+	if err != nil {
+		fail("параметры маршрутов: " + err.Error())
 		stopClient()
 		return
 	}
 
 	setStatus("настройка маршрутов...")
-	rc := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, "-ServerIP", serverIP)
-	rc.Dir = exeDir
-	rc.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
-	out, err := rc.CombinedOutput()
-	logger.Println("setup-vpn-route.ps1 output:\n" + string(out))
+	out, err := runRouteScript(args)
+	logger.Println("route script output:\n" + string(out))
+	if cancelled() {
+		// disconnect() ran while the script was working and may have
+		// removed the IPv6 block before the script added it
+		teardownRoutes()
+		return
+	}
 	if err != nil {
 		fail("не удалось настроить маршрутизацию, смотри tray.log")
 		stopClient()
@@ -157,59 +226,28 @@ func connect() {
 
 	setStatus("подключено")
 	setIcon(iconGreen)
-	setConnected(true)
 	tunnelUp.Store(true)
-}
-
-// serverIPFromConfig returns the IPv4 address of vpn_addr. The routing
-// script needs it for the route that keeps the tunnel's own connection
-// on the real gateway.
-func serverIPFromConfig(cfgPath string) (string, error) {
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		return "", err
-	}
-	var cfg struct {
-		VPNAddr string `json:"vpn_addr"`
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "", err
-	}
-	host, _, err := net.SplitHostPort(cfg.VPNAddr)
-	if err != nil {
-		return "", fmt.Errorf("vpn_addr %q: %w", cfg.VPNAddr, err)
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return "", err
-	}
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 != nil {
-			return ip4.String(), nil
-		}
-	}
-	return "", fmt.Errorf("%s has no IPv4 address", host)
 }
 
 // onClientLine updates the status when client.exe loses the connection
 // and gets it back (it reconnects by itself, the routes stay).
-func onClientLine(line []byte) {
+func onClientLine(line string) {
 	if !tunnelUp.Load() {
 		return
 	}
 	switch {
-	case strings.Contains(string(line), "vpn: connection lost"):
+	case strings.Contains(line, "vpn: connection lost"):
 		setStatus("переподключение...")
 		setIcon(iconGray)
-	case containsConnected(line):
+	case strings.Contains(line, connectedMarker):
 		setStatus("подключено")
 		setIcon(iconGreen)
 	}
 }
 
-// scanForConnected writes client output to the log and sends true when
-// it sees "connected to vpn channel", or false if the output ends first.
-func scanForConnected(r io.Reader, connectedCh chan<- bool) {
+// scanForConnected writes client output to the log and sends the first
+// "connected to vpn channel" line, or "" if the output ends first.
+func scanForConnected(r io.Reader, connectedCh chan<- string) {
 	buf := make([]byte, 4096)
 	var line []byte
 	seen := false
@@ -217,21 +255,22 @@ func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 		n, err := r.Read(buf)
 		if n > 0 {
 			for _, b := range buf[:n] {
-				if b == '\n' {
-					logger.Println("client:", string(line))
-					noteClientLine(line)
-					if !seen && containsConnected(line) {
-						seen = true
-						select {
-						case connectedCh <- true:
-						default:
-						}
-					} else if seen {
-						onClientLine(line)
-					}
-					line = line[:0]
-				} else {
+				if b != '\n' {
 					line = append(line, b)
+					continue
+				}
+				s := strings.TrimRight(string(line), "\r")
+				line = line[:0]
+				logger.Println("client:", s)
+				noteClientLine(s)
+				if !seen && strings.Contains(s, connectedMarker) {
+					seen = true
+					select {
+					case connectedCh <- s:
+					default:
+					}
+				} else if seen {
+					onClientLine(s)
 				}
 			}
 		}
@@ -241,7 +280,7 @@ func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 			}
 			if !seen {
 				select {
-				case connectedCh <- false:
+				case connectedCh <- "":
 				default:
 				}
 			}
@@ -250,28 +289,15 @@ func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 	}
 }
 
-func containsConnected(line []byte) bool {
-	const marker = "connected to vpn channel"
-	return len(line) >= len(marker) && indexOf(string(line), marker) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
 func disconnect() {
+	connGen.Add(1)
 	tunnelUp.Store(false)
 	setStatus("отключение...")
 	stopClient()
 	teardownRoutes()
 	setStatus("отключено")
 	setIcon(iconGray)
-	setConnected(false)
+	setActive(false)
 }
 
 func stopClient() {
