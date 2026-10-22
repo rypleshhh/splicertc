@@ -13,7 +13,7 @@ RUN go mod download
 COPY . .
 
 # CGO disabled -> a truly static binary that runs on scratch/alpine with
-# no libc. GOFLAGS=-mod=mod tolerates the replace directives in go.mod.
+# no libc. GOFLAGS=-mod=mod lets go update go.sum if it needs to.
 RUN CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=mod \
     go build -o /out/server ./cmd/server
 

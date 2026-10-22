@@ -73,5 +73,10 @@ Write-Host "`n--- VPN running. Ctrl+C to stop. ---`n" -ForegroundColor Green
 
 # --- 5. block here so the window stays open and shows client.exe's
 #        live log output until it exits (normally via Ctrl+C) ---
-Wait-Process -Id $client.Id -ErrorAction SilentlyContinue
+try {
+    Wait-Process -Id $client.Id -ErrorAction SilentlyContinue
+} finally {
+    # also on Ctrl+C: don't leave IPv6 blocked after the tunnel is gone
+    if (Test-Path .\setup-vpn-route.ps1) { & .\setup-vpn-route.ps1 -Teardown }
+}
 Write-Host "`nclient.exe exited." -ForegroundColor Yellow

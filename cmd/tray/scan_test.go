@@ -107,3 +107,26 @@ func TestScanForConnectedHandlesReconnectLines(t *testing.T) {
 		t.Fatal("expected the first marker to be reported")
 	}
 }
+
+// The fatal errors of client.exe are recognised, so the tray can explain them.
+func TestNoteClientLine(t *testing.T) {
+	cases := []struct {
+		line string
+		want clientErrKind
+	}{
+		{"2026/10/14 vpn: reconnect: server certificate does not match pinned fingerprint", errPinMismatch},
+		{"dial vpn channel: server rejected the client key (is its public key in the server's authorized_keys.json?)", errKeyRejected},
+	}
+	for _, c := range cases {
+		lastClientErr.Store(int32(errNone))
+		noteClientLine([]byte(c.line))
+		if got := clientErrKind(lastClientErr.Load()); got != c.want {
+			t.Errorf("%q: got %d, want %d", c.line, got, c.want)
+		}
+	}
+	lastClientErr.Store(int32(errNone))
+	noteClientLine([]byte("vpn: connection lost (EOF), reconnecting"))
+	if lastClientErr.Load() != int32(errNone) {
+		t.Error("an ordinary line was taken for a fatal error")
+	}
+}

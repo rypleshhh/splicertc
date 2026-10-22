@@ -264,10 +264,19 @@ for your server any more.
   reliable and glue channels check the same in code
   (`internal/egress`): no loopback, link-local, private networks or
   the server's own addresses, including its public IP.
-- **IPv6 and DNS.** The tunnel is IPv4 only. If the dorm network has
-  IPv6, IPv6 traffic bypasses the tunnel; Windows may also send DNS
-  queries through the normal interface. Doesn't matter for gaming,
-  matters for privacy.
+- **IPv6 and DNS.** The tunnel is IPv4 only. To keep IPv6 from going
+  around it, `setup-vpn-route.ps1` adds the firewall rule `splicertc:
+  block IPv6 outside the tunnel` while connected: outgoing global IPv6
+  (`2000::/3`) is blocked and apps fall back to IPv4. The tray removes
+  the rule on disconnect, exit, client crash and at startup (in case
+  the last run was cut off). By hand: `.\setup-vpn-route.ps1
+  -Teardown`. The TUN gets interface metric 1, so DNS queries go to
+  1.1.1.1 through the tunnel first. Windows doesn't allow ruling out
+  queries to the dorm DNS completely.
+- **Server certificate changed.** If the client exited because of a pin
+  mismatch, the tray asks whether the certificate was regenerated on
+  the server and on "Yes" deletes the saved `pin_file`. If the key is
+  rejected, the tray says exactly that.
 
 ### Latency under load
 

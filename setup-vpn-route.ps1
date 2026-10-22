@@ -7,13 +7,27 @@ auto-detects the dorm gateway instead of needing it typed in by hand.
 
 The server IP comes from -ServerIP (the tray app passes it), otherwise
 from vpn_addr in client-config.json next to this script.
+
+The tunnel is IPv4 only. While it's up, a firewall rule blocks global
+IPv6 (2000::/3), otherwise IPv6 traffic would go around the tunnel.
+Apps fall back to IPv4. "-Teardown" removes the rule again (the tray
+does that on disconnect); the routes go away with the TUN adapter.
 #>
 
 param(
-    [string]$ServerIP = ""
+    [string]$ServerIP = "",
+    [switch]$Teardown
 )
 
 $ErrorActionPreference = "Continue"
+
+$FwRule = "splicertc: block IPv6 outside the tunnel"
+
+if ($Teardown) {
+    Remove-NetFirewallRule -DisplayName $FwRule -ErrorAction SilentlyContinue
+    Write-Host "IPv6 block removed."
+    exit 0
+}
 
 if (-not $ServerIP) {
     $cfgPath = Join-Path $PSScriptRoot "client-config.json"
@@ -88,6 +102,18 @@ route add $ServerIP mask 255.255.255.255 $GatewayIP metric 1 | Out-Null
 #     index so Windows can't misattribute it to another interface ---
 route add 0.0.0.0 mask 0.0.0.0 $TunGateway metric 1 if $idx | Out-Null
 
+# --- lowest interface metric for the TUN: Windows asks the DNS servers
+#     of interfaces in metric order, so 1.1.1.1 on the TUN goes first
+#     instead of the dorm DNS ---
+Set-NetIPInterface -InterfaceIndex $idx -InterfaceMetric 1 -ErrorAction SilentlyContinue
+
+# --- block global IPv6 while the tunnel is up (IPv4-only tunnel, IPv6
+#     would leak around it). Link-local IPv6 is not touched. ---
+Remove-NetFirewallRule -DisplayName $FwRule -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName $FwRule -Direction Outbound -Action Block `
+    -RemoteAddress "2000::/3" -Profile Any | Out-Null
+Write-Host "IPv6 outside the tunnel: blocked (firewall rule '$FwRule')"
+
 Write-Host "`nDefault routes now:"
 route print -4 | Select-String "^\s+0\.0\.0\.0"
 
@@ -107,3 +133,4 @@ try {
 Write-Host "`nTo undo (restore normal internet):" -ForegroundColor Cyan
 Write-Host "  route delete 0.0.0.0 mask 0.0.0.0 $TunGateway"
 Write-Host "  route delete $ServerIP mask 255.255.255.255 $GatewayIP"
+Write-Host "  .\setup-vpn-route.ps1 -Teardown   (removes the IPv6 block)"

@@ -43,13 +43,13 @@ func TestBanAfterMaxFailures(t *testing.T) {
 
 	for i := 0; i < maxAuthFailures-1; i++ {
 		recordAuthFailure(ip)
-		if _, banned := checkAuthBan(ip); banned {
+		if _, banned, _ := checkAuthBan(ip); banned {
 			t.Fatalf("expected no ban after %d failure(s) (threshold is %d)", i+1, maxAuthFailures)
 		}
 	}
 
 	recordAuthFailure(ip)
-	until, banned := checkAuthBan(ip)
+	until, banned, _ := checkAuthBan(ip)
 	if !banned {
 		t.Fatalf("expected a ban after %d failures", maxAuthFailures)
 	}
@@ -68,7 +68,7 @@ func TestBanClearsOnSuccess(t *testing.T) {
 	recordAuthSuccess(ip)
 
 	recordAuthFailure(ip)
-	if _, banned := checkAuthBan(ip); banned {
+	if _, banned, _ := checkAuthBan(ip); banned {
 		t.Error("expected a successful auth to reset the failure count, but the IP is already banned after one more failure")
 	}
 }
@@ -82,7 +82,7 @@ func TestBanExpires(t *testing.T) {
 	authFailures.bannedUntil[ip] = time.Now().Add(-time.Minute)
 	authFailures.mu.Unlock()
 
-	if _, banned := checkAuthBan(ip); banned {
+	if _, banned, _ := checkAuthBan(ip); banned {
 		t.Error("expected an expired ban to no longer report as banned")
 	}
 
@@ -91,5 +91,21 @@ func TestBanExpires(t *testing.T) {
 	authFailures.mu.Unlock()
 	if stillPresent {
 		t.Error("expected checkAuthBan to clear an expired ban's map entry, not just ignore it")
+	}
+}
+
+// A banned IP is logged once per ban, not on every retry.
+func TestBanRejectionLoggedOnce(t *testing.T) {
+	ip := "198.51.100.77"
+	defer recordAuthSuccess(ip)
+	for i := 0; i < maxAuthFailures; i++ {
+		recordAuthFailure(ip)
+	}
+	_, banned, first := checkAuthBan(ip)
+	if !banned || !first {
+		t.Fatalf("first rejection: banned=%v first=%v", banned, first)
+	}
+	if _, _, first := checkAuthBan(ip); first {
+		t.Fatal("second rejection of the same ban was marked as first")
 	}
 }

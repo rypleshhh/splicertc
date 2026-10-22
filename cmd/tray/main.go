@@ -214,6 +214,7 @@ func runApp() error {
 	_ = quitAction.SetText("Выход")
 	quitAction.Triggered().Attach(func() {
 		stopClient()
+		teardownRoutes()
 		walk.App().Exit(0)
 	})
 	_ = ni.ContextMenu().Actions().Add(quitAction)
@@ -221,6 +222,9 @@ func runApp() error {
 	if err := ni.SetVisible(true); err != nil {
 		return fmt.Errorf("show notify icon: %w", err)
 	}
+
+	// a crash or a power loss last time could have left IPv6 blocked
+	go teardownRoutes()
 
 	loadConnections()
 	refreshConnList()

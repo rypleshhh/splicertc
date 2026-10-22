@@ -69,6 +69,7 @@ func connect() {
 	// a second click must not start a second client.exe with its own TUN
 	tunnelUp.Store(false)
 	stopClient()
+	lastClientErr.Store(int32(errNone))
 
 	setConnected(false)
 	setStatus("подключение...")
@@ -125,7 +126,8 @@ func connect() {
 		mu.Unlock()
 		if stillOurs {
 			logger.Println("client.exe exited:", err)
-			fail("клиент неожиданно завершился, смотри tray.log")
+			teardownRoutes()
+			reportClientExit()
 		}
 	}()
 
@@ -149,6 +151,7 @@ func connect() {
 	if err != nil {
 		fail("не удалось настроить маршрутизацию, смотри tray.log")
 		stopClient()
+		teardownRoutes()
 		return
 	}
 
@@ -216,6 +219,7 @@ func scanForConnected(r io.Reader, connectedCh chan<- bool) {
 			for _, b := range buf[:n] {
 				if b == '\n' {
 					logger.Println("client:", string(line))
+					noteClientLine(line)
 					if !seen && containsConnected(line) {
 						seen = true
 						select {
@@ -264,6 +268,7 @@ func disconnect() {
 	tunnelUp.Store(false)
 	setStatus("отключение...")
 	stopClient()
+	teardownRoutes()
 	setStatus("отключено")
 	setIcon(iconGray)
 	setConnected(false)

@@ -30,10 +30,14 @@ var authFailures = struct {
 	count       map[string]int
 	lastFailure map[string]time.Time
 	bannedUntil map[string]time.Time
+	// banned IPs whose rejection was already logged: a scanner retrying
+	// every second would otherwise write a log line every second
+	banLogged map[string]bool
 }{
 	count:       make(map[string]int),
 	lastFailure: make(map[string]time.Time),
 	bannedUntil: make(map[string]time.Time),
+	banLogged:   make(map[string]bool),
 }
 
 // authIP returns the remote IP without the port.
@@ -45,21 +49,25 @@ func authIP(conn net.Conn) string {
 	return host
 }
 
-// checkAuthBan also removes expired bans.
-func checkAuthBan(ip string) (until time.Time, banned bool) {
+// checkAuthBan also removes expired bans. firstReject is true only for
+// the first rejected connection of a ban, so it's logged once.
+func checkAuthBan(ip string) (until time.Time, banned, firstReject bool) {
 	authFailures.mu.Lock()
 	defer authFailures.mu.Unlock()
 	until, banned = authFailures.bannedUntil[ip]
 	if !banned {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	if time.Now().After(until) {
 		delete(authFailures.bannedUntil, ip)
 		delete(authFailures.count, ip)
 		delete(authFailures.lastFailure, ip)
-		return time.Time{}, false
+		delete(authFailures.banLogged, ip)
+		return time.Time{}, false, false
 	}
-	return until, true
+	firstReject = !authFailures.banLogged[ip]
+	authFailures.banLogged[ip] = true
+	return until, true, firstReject
 }
 
 func recordAuthFailure(ip string) {
@@ -80,6 +88,7 @@ func recordAuthSuccess(ip string) {
 	delete(authFailures.count, ip)
 	delete(authFailures.lastFailure, ip)
 	delete(authFailures.bannedUntil, ip)
+	delete(authFailures.banLogged, ip)
 }
 
 // cleanupAuthFailures forgets old failures and expired bans, so the maps
@@ -90,6 +99,7 @@ func cleanupAuthFailures(now time.Time) {
 	for ip, until := range authFailures.bannedUntil {
 		if now.After(until) {
 			delete(authFailures.bannedUntil, ip)
+			delete(authFailures.banLogged, ip)
 		}
 	}
 	for ip, last := range authFailures.lastFailure {
@@ -108,8 +118,10 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 	}
 
 	ip := authIP(conn)
-	if until, banned := checkAuthBan(ip); banned {
-		log.Printf("auth: rejected %s: banned until %s (too many failed attempts)", conn.RemoteAddr(), until.Format(time.RFC3339))
+	if until, banned, first := checkAuthBan(ip); banned {
+		if first {
+			log.Printf("auth: rejecting %s until %s (banned after too many failed attempts; further attempts are not logged)", ip, until.Format(time.RFC3339))
+		}
 		return "", false
 	}
 
