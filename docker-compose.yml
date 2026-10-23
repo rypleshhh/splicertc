@@ -4,7 +4,8 @@ services:
     container_name: dormtun-server
     # Host networking so the container sees real client source addresses
     # and can relay UDP outward without an extra NAT hop. Simplest for a
-    # dedicated test box. Ports in EXPOSE/CMD are used as-is on the host.
+    # dedicated test box. Ports from server-config.json are used as-is on
+    # the host.
     network_mode: host
     restart: unless-stopped
     # Docker keeps container logs forever by default; with a busy tunnel
@@ -16,7 +17,7 @@ services:
         max-file: "3"
     # Needed for the full-tunnel VPN channel: it creates its own TUN
     # device and runs `ip`/`iptables` to address it and NAT its traffic
-    # out (see cmd/server/vpn.go). Not required for the reliable/
+    # out (see cmd/server/vpn_setup.go). Not required for the reliable/
     # droppable/glue channels alone.
     cap_add:
       - NET_ADMIN
@@ -29,13 +30,10 @@ services:
       # directory here instead of the file) — cp
       # authorized_keys.example.json authorized_keys.json first.
       - ./authorized_keys.json:/app/authorized_keys.json:ro
-      # Persists the TLS cert across rebuilds. Without this mount, every
-      # `docker compose up --build` bakes a FRESH self-signed cert into
-      # the image (see Dockerfile), changing its fingerprint every time —
-      # meaning every client's server_pin/pin_file would need updating
-      # after every rebuild. Generate this once with `go run
-      # ./cmd/gencert` (must exist before the first `docker compose up`,
-      # same reason as the mounts above) and it never needs touching
-      # again; the fingerprint stays stable for the container's whole
-      # lifetime, across any number of rebuilds/restarts.
+      # The TLS cert and key. They are not in the image (a private key in
+      # an image layer leaks with the image), so without this mount the
+      # server doesn't start. Generate them once on the host with `go run
+      # ./cmd/gencert` before the first `docker compose up`; the
+      # fingerprint (the clients' server_pin) then stays the same across
+      # any number of rebuilds and restarts.
       - ./devcerts:/app/devcerts:ro

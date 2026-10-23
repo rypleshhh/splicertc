@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -25,6 +27,8 @@ var (
 	vpnMu      sync.Mutex
 	currentVPN *vpnPeer
 	vpnSeq     uint32
+	// set when the TUN failed, the vpn channel then refuses everyone
+	vpnStopped bool
 
 	// Mbit/s, 0 = no limit
 	vpnDownRate float64
@@ -36,6 +40,10 @@ const (
 	vpnReadTimeout  = 30 * time.Second
 	vpnWriteTimeout = 10 * time.Second
 )
+
+// writeLoop sends up to this many bytes of queued frames with one Write:
+// one TLS record and one syscall instead of one per packet.
+const vpnWriteBatch = 16 * 1024
 
 // keepalives get their own flow so they're not stuck behind a download
 var keepaliveFlow = sched.FlowKey{Proto: 255}
@@ -50,14 +58,22 @@ type vpnPeer struct {
 
 func (p *vpnPeer) writeLoop() {
 	shaper := sched.NewShaper(vpnDownRate)
+	var batch [][]byte
+	var buf []byte
 	for {
-		wire, ok := p.q.Dequeue()
+		var ok bool
+		batch, ok = p.q.DequeueBatch(batch, vpnWriteBatch)
 		if !ok {
 			return
 		}
-		shaper.Wait(len(wire))
+		// frames are length-prefixed, so back to back is valid on the wire
+		buf = buf[:0]
+		for _, wire := range batch {
+			buf = append(buf, wire...)
+		}
+		shaper.Wait(len(buf))
 		_ = p.conn.SetWriteDeadline(time.Now().Add(vpnWriteTimeout))
-		if _, err := p.conn.Write(wire); err != nil {
+		if _, err := p.conn.Write(buf); err != nil {
 			log.Printf("vpn: write to client failed: %v", err)
 			p.conn.Close() // handleVPNConn will clean up
 			return
@@ -106,17 +122,12 @@ func vpnTunReader(dev tun.Device) {
 	}
 	sizes := make([]int, batch)
 	for {
+		// packets read before an error are still valid
 		n, err := dev.Read(bufs, sizes, 0)
-		if err != nil {
-			log.Fatalf("vpn TUN read: %v", err)
-		}
 		vpnMu.Lock()
 		peer := currentVPN
 		vpnMu.Unlock()
-		if peer == nil {
-			continue
-		}
-		for i := 0; i < n; i++ {
+		for i := 0; peer != nil && i < n; i++ {
 			pkt := bufs[i][:sizes[i]]
 			if len(pkt) > frame.MaxPayload {
 				continue // doesn't fit in a frame
@@ -124,20 +135,47 @@ func vpnTunReader(dev tun.Device) {
 			// Marshal copies pkt
 			peer.q.Enqueue(sched.FlowOf(pkt), frame.New(nextVPNSeq(), pkt).Marshal())
 		}
+		if errors.Is(err, tun.ErrTooManySegments) {
+			continue // some packets of a big GRO read were lost, the TUN is fine
+		}
+		if err != nil {
+			stopVPN(err)
+			return
+		}
 	}
 }
 
+// stopVPN turns the vpn channel off after a TUN error. Only this
+// channel: reliable and glue don't need the TUN.
+func stopVPN(err error) {
+	vpnMu.Lock()
+	vpnStopped = true
+	peer := currentVPN
+	currentVPN = nil
+	vpnMu.Unlock()
+	log.Printf("vpn: TUN read failed, vpn channel stopped (other channels keep running): %v", err)
+	if peer != nil {
+		peer.conn.Close()
+	}
+}
+
+var errVPNStopped = errors.New("vpn channel is stopped after a TUN error")
+
 // claimVPN makes peer the current client. A reconnect of the same client
-// replaces its old connection, another client gets ok=false.
-func claimVPN(peer *vpnPeer) (old *vpnPeer, ok bool) {
+// replaces its old connection (returned as old), another client gets an
+// error.
+func claimVPN(peer *vpnPeer) (old *vpnPeer, err error) {
 	vpnMu.Lock()
 	defer vpnMu.Unlock()
+	if vpnStopped {
+		return nil, errVPNStopped
+	}
 	old = currentVPN
 	if old != nil && old.name != peer.name {
-		return old, false
+		return nil, fmt.Errorf("vpn channel is used by %q", old.name)
 	}
 	currentVPN = peer
-	return old, true
+	return old, nil
 }
 
 // handleVPNConn handles one vpn client connection.
@@ -151,9 +189,9 @@ func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 	endHandshake(conn)
 
 	peer := &vpnPeer{name: name, conn: conn, q: sched.New(sched.Config{})}
-	old, ok := claimVPN(peer)
-	if !ok {
-		log.Printf("vpn: refusing %s (%q): vpn channel is used by %q", conn.RemoteAddr(), name, old.name)
+	old, err := claimVPN(peer)
+	if err != nil {
+		log.Printf("vpn: refusing %s (%q): %v", conn.RemoteAddr(), name, err)
 		return
 	}
 	if old != nil {
@@ -178,6 +216,7 @@ func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 	}()
 
 	spoofLogged := false
+	var pktBuf []byte
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(vpnReadTimeout))
 		f, err := frame.ReadFrame(conn)
@@ -199,7 +238,8 @@ func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 			}
 			continue
 		}
-		if _, err := dev.Write([][]byte{withVirtioHdr(f.Payload)}, virtioHdrLen); err != nil {
+		pktBuf = withVirtioHdr(pktBuf, f.Payload)
+		if _, err := dev.Write([][]byte{pktBuf}, virtioHdrLen); err != nil {
 			log.Printf("vpn: TUN write: %v", err)
 		}
 	}
@@ -214,8 +254,17 @@ func fromClient(pkt []byte, clientIP net.IP) bool {
 // packet. All zeros = no offload.
 const virtioHdrLen = 10
 
-func withVirtioHdr(payload []byte) []byte {
-	buf := make([]byte, virtioHdrLen+len(payload))
+// withVirtioHdr puts a zero header and payload into buf (grown if too
+// small). dev.Write writes to the TUN fd before it returns, so the
+// caller can reuse buf for the next packet.
+func withVirtioHdr(buf, payload []byte) []byte {
+	n := virtioHdrLen + len(payload)
+	if cap(buf) < n {
+		buf = make([]byte, n)
+	}
+	buf = buf[:n]
+	// the TUN may have written an offload header here last time
+	clear(buf[:virtioHdrLen])
 	copy(buf[virtioHdrLen:], payload)
 	return buf
 }

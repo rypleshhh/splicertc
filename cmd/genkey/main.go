@@ -1,5 +1,7 @@
 // Command genkey makes a key pair for one client: the public key goes to
 // the server's authorized_keys.json, the private one to client-config.json.
+// Best run by the client: then only the public line is sent to the admin
+// and the private key never travels.
 package main
 
 import (
@@ -13,6 +15,16 @@ import (
 func main() {
 	name := flag.String("name", "friend", "label for this identity, just for your own authorized_keys.json bookkeeping")
 	from := flag.String("pub", "", "print the authorized_keys.json entry for an existing client_key instead of making a new pair")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "Usage: genkey [-name NAME] [-pub CLIENT_KEY]")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Makes a key pair for one client. Ideally the CLIENT runs genkey on their own")
+		fmt.Fprintln(out, "machine and sends only the public authorized_keys.json line to the server admin,")
+		fmt.Fprintln(out, "so the private key never leaves their computer.")
+		fmt.Fprintln(out)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *from != "" {
@@ -25,14 +37,14 @@ func main() {
 				return
 			}
 		}
-		fmt.Println("bad client_key:", err)
+		fmt.Fprintln(os.Stderr, "bad client_key:", err)
 		os.Exit(1)
 	}
 
 	pub, seed, err := auth.GenerateKeypair()
 	if err != nil {
-		fmt.Println("generate keypair:", err)
-		return
+		fmt.Fprintln(os.Stderr, "generate keypair:", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("Add this entry to the SERVER's authorized_keys.json (see authorized_keys.example.json):")
