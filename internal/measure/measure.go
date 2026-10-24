@@ -15,10 +15,20 @@ import (
 // grow forever and make every Snapshot slower.
 const maxSamples = 10000
 
+// Pings without a reply for this long are forgotten (counted as lost)
+// even if Snapshot is never called, so sentAt can't grow forever.
+// OnSend checks only when sentAt has grown to scanAt entries, so the
+// check costs nothing per ping on average.
+const (
+	maxPendingAge = 30 * time.Second
+	minScanAt     = 1024
+)
+
 // Stats tracks outstanding pings and completed round trips.
 type Stats struct {
 	mu        sync.Mutex
 	sentAt    map[uint64]time.Time
+	scanAt    int             // len(sentAt) at which OnSend expires old pings
 	rtts      []time.Duration // ring buffer, next points to the oldest
 	next      int
 	sent      int
@@ -29,14 +39,18 @@ type Stats struct {
 }
 
 func New() *Stats {
-	return &Stats{sentAt: make(map[uint64]time.Time)}
+	return &Stats{sentAt: make(map[uint64]time.Time), scanAt: minScanAt}
 }
 
 func (s *Stats) OnSend(nonce uint64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sentAt[nonce] = time.Now()
 	s.sent++
-	s.mu.Unlock()
+	if len(s.sentAt) >= s.scanAt {
+		s.expireOlderThan(maxPendingAge)
+		s.scanAt = max(2*len(s.sentAt), minScanAt)
+	}
 }
 
 // OnRecv records a ping reply. Duplicates from other paths are ignored.
@@ -78,6 +92,7 @@ func (s *Stats) expireOlderThan(d time.Duration) {
 }
 
 type Summary struct {
+	// Sent doesn't include pings still waiting for a reply
 	Sent, Received  int
 	LossPct         float64
 	MinRTT, MaxRTT  time.Duration
@@ -86,16 +101,19 @@ type Summary struct {
 }
 
 // Snapshot returns the current stats. Pings without a reply after
-// lossTimeout count as lost. Sent/received/loss are for the whole run,
-// the RTT numbers for the last maxSamples replies.
+// lossTimeout count as lost; younger ones are still in flight and not
+// counted at all. Sent/received/loss are for the whole run, the RTT
+// numbers for the last maxSamples replies.
 func (s *Stats) Snapshot(lossTimeout time.Duration) Summary {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expireOlderThan(lossTimeout)
 
-	sum := Summary{Sent: s.sent, Received: s.received, JitterMS: s.jitterAcc}
-	if s.sent > 0 {
-		sum.LossPct = 100 * float64(s.sent-s.received) / float64(s.sent)
+	// what's left in sentAt was sent less than lossTimeout ago
+	sent := s.sent - len(s.sentAt)
+	sum := Summary{Sent: sent, Received: s.received, JitterMS: s.jitterAcc}
+	if sent > 0 {
+		sum.LossPct = 100 * float64(sent-s.received) / float64(sent)
 	}
 	if len(s.rtts) == 0 {
 		return sum

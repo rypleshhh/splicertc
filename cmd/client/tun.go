@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"sync/atomic"
 	"time"
@@ -14,14 +15,15 @@ import (
 )
 
 // runTunMode captures UDP from the TUN device, sends it through glue and
-// writes the replies back into the TUN. IPv4 only.
-func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration, key []byte) {
+// writes the replies back into the TUN. IPv4 only. It returns on a
+// permanent error, after closing the TUN device.
+func runTunMode(srv endpoint, key []byte, tunName string, mtu int, paths int, doMeasure bool, measureInterval time.Duration) error {
 	if paths < 1 {
 		paths = 1
 	}
 	dev, err := tun.CreateTUN(tunName, mtu)
 	if err != nil {
-		log.Fatalf("create TUN: %v", err)
+		return fmt.Errorf("create TUN: %w", err)
 	}
 	defer dev.Close()
 	actualName, _ := dev.Name()
@@ -32,20 +34,28 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		stats = measure.New()
 	}
 
+	stop := make(chan error, 1)
+	fail := func(err error) {
+		select {
+		case stop <- err:
+		default:
+		}
+	}
+
 	flows := newFlowTable()
 	var onPing func(uint64)
 	if stats != nil {
 		onPing = stats.OnRecv
 	}
-	gp, err := startGluePaths(glueAddr, insecure, pin, key, paths, glueReplyHandler(flows, func(pkt []byte) {
+	gp, err := startGluePaths(srv, key, paths, glueReplyHandler(flows, func(pkt []byte) {
 		if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
 			log.Printf("TUN write: %v", err)
 		}
-	}, onPing))
+	}, onPing), fail)
 	if err != nil {
-		log.Fatalf("dial glue channel: %v", err)
+		return fmt.Errorf("dial glue channel: %w", err)
 	}
-	log.Printf("connected to glue channel %s over %d path(s)", glueAddr, gp.live())
+	log.Printf("connected to glue channel %s over %d path(s)", srv.addr, gp.live())
 
 	go func() {
 		for now := range time.Tick(2 * time.Second) {
@@ -83,39 +93,43 @@ func runTunMode(glueAddr string, insecure bool, pin []byte, tunName string, mtu 
 		log.Printf("measurement enabled: pinging every %v across %d path(s)", measureInterval, paths)
 	}
 
-	batch := dev.BatchSize()
-	bufs := make([][]byte, batch)
-	for i := range bufs {
-		bufs[i] = make([]byte, mtu+32)
-	}
-	sizes := make([]int, batch)
-
-	for {
-		n, err := dev.Read(bufs, sizes, 0)
-		if err != nil {
-			log.Fatalf("TUN read: %v", err)
+	go func() {
+		batch := dev.BatchSize()
+		bufs := make([][]byte, batch)
+		for i := range bufs {
+			bufs[i] = make([]byte, mtu+32)
 		}
-		for i := 0; i < n; i++ {
-			info, ok := pktfilter.Parse(bufs[i][:sizes[i]])
-			if !ok || info.Noise || info.Version != 4 || info.Proto != 17 || info.Payload == nil {
-				continue
-			}
+		sizes := make([]int, batch)
 
-			fi := flowInfo{origSrcPort: info.SrcPort, origDstPort: info.DstPort}
-			copy(fi.origSrc[:], info.Src.To4())
-			copy(fi.origDst[:], info.Dst.To4())
-
-			flowID, ok := flows.id(fi, time.Now())
-			if !ok {
-				continue // all flow IDs in use
-			}
-
-			envelope, err := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+		for {
+			n, err := dev.Read(bufs, sizes, 0)
 			if err != nil {
-				continue // only IPv4 gets here
+				fail(fmt.Errorf("TUN read: %w", err))
+				return
 			}
-			wire := frame.New(nextSeq(), envelope).Marshal()
-			writeAllPaths(wire)
+			for i := 0; i < n; i++ {
+				info, ok := pktfilter.Parse(bufs[i][:sizes[i]])
+				if !ok || info.Noise || info.Version != 4 || info.Proto != 17 || info.Payload == nil {
+					continue
+				}
+
+				fi := flowInfo{origSrcPort: info.SrcPort, origDstPort: info.DstPort}
+				copy(fi.origSrc[:], info.Src.To4())
+				copy(fi.origDst[:], info.Dst.To4())
+
+				flowID, ok := flows.id(fi, time.Now())
+				if !ok {
+					continue // all flow IDs in use
+				}
+
+				envelope, err := glue.EncodeOutbound(flowID, info.Dst, info.DstPort, info.Payload)
+				if err != nil {
+					continue // only IPv4 gets here
+				}
+				writeAllPaths(frame.New(nextSeq(), envelope).Marshal())
+			}
 		}
-	}
+	}()
+
+	return <-stop
 }

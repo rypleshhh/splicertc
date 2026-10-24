@@ -39,14 +39,15 @@ const (
 // gluePaths keeps N connections to the glue server with the same session
 // ID. Frames are sent on all of them, the server drops the duplicates.
 type gluePaths struct {
-	addr     string
-	insecure bool
-	pin      []byte
-	key      []byte
-	sid      []byte
+	srv endpoint
+	key []byte
+	sid []byte
 	// onFrame gets every frame from the server except path pings. It's
 	// called from several goroutines at once.
 	onFrame func(frame.Frame)
+	// onFatal gets errors that reconnecting won't fix (wrong key or
+	// certificate). The path stops; the caller should shut down.
+	onFatal func(error)
 
 	// can be replaced in tests
 	dial func() (net.Conn, error)
@@ -57,19 +58,18 @@ type gluePaths struct {
 
 // startGluePaths dials n paths. It fails only if none of them could
 // connect; paths that failed are dialed again in the background.
-func startGluePaths(addr string, insecure bool, pin, key []byte, n int, onFrame func(frame.Frame)) (*gluePaths, error) {
-	g := newGluePaths(addr, insecure, pin, key, onFrame)
+func startGluePaths(srv endpoint, key []byte, n int, onFrame func(frame.Frame), onFatal func(error)) (*gluePaths, error) {
+	g := newGluePaths(srv, key, onFrame, onFatal)
 	return g, g.start(n)
 }
 
-func newGluePaths(addr string, insecure bool, pin, key []byte, onFrame func(frame.Frame)) *gluePaths {
+func newGluePaths(srv endpoint, key []byte, onFrame func(frame.Frame), onFatal func(error)) *gluePaths {
 	g := &gluePaths{
-		addr:     addr,
-		insecure: insecure,
-		pin:      pin,
-		key:      key,
-		onFrame:  onFrame,
-		writers:  make(map[int]*sched.PathWriter),
+		srv:     srv,
+		key:     key,
+		onFrame: onFrame,
+		onFatal: onFatal,
+		writers: make(map[int]*sched.PathWriter),
 	}
 	g.dial = g.dialServer
 	return g
@@ -108,16 +108,14 @@ func (g *gluePaths) start(n int) error {
 
 // dialServer connects one path: TLS, auth, session ID.
 func (g *gluePaths) dialServer() (net.Conn, error) {
-	c, err := transport.Dial(g.addr, transport.DialConfig{Insecure: g.insecure, Pin: g.pin})
+	c, err := transport.Dial(g.srv.addr, g.srv.dc)
 	if err != nil {
 		return nil, err
 	}
 	_ = c.SetDeadline(time.Now().Add(transport.DialTimeout))
-	if g.key != nil {
-		if err := auth.ClientHandshake(c, g.key); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("auth: %w", err)
-		}
+	if err := auth.ClientHandshake(c, g.key); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("auth: %w", err)
 	}
 	if _, err := c.Write(g.sid); err != nil {
 		c.Close()
@@ -128,8 +126,9 @@ func (g *gluePaths) dialServer() (net.Conn, error) {
 	return c, nil
 }
 
-// keepPath keeps path i connected forever. The result of the first
-// attempt goes to first.
+// keepPath keeps path i connected. It stops only on a permanent dial
+// error, which goes to onFatal. The result of the first attempt goes to
+// first.
 func (g *gluePaths) keepPath(i int, first chan<- error) {
 	backoff := redialMin
 	for {
@@ -147,7 +146,11 @@ func (g *gluePaths) keepPath(i int, first chan<- error) {
 			first = nil
 		}
 		if err != nil && isPermanentDialError(err) {
-			log.Fatalf("glue: path %d: %v", i, err)
+			// retrying would only get this IP banned
+			if g.onFatal != nil {
+				g.onFatal(fmt.Errorf("glue: path %d: %w", i, err))
+			}
+			return
 		}
 		if err != nil {
 			log.Printf("glue: path %d: connect failed: %v (retry in %v)", i, err, backoff)

@@ -103,3 +103,23 @@ func TestFlowSweepAndReplyActivity(t *testing.T) {
 		t.Fatal("idle flow was not removed")
 	}
 }
+
+// hasDst follows the flows to a destination until the last one expires.
+func TestFlowTableHasDst(t *testing.T) {
+	tab := newFlowTable()
+	start := time.Now()
+	dst := [4]byte{1, 2, 3, 4}
+	tab.id(fi(1, dst, 27015), start)
+	tab.id(fi(2, dst, 27015), start.Add(30*time.Second))
+	if !tab.hasDst(dst) || tab.hasDst([4]byte{5, 6, 7, 8}) {
+		t.Fatal("hasDst wrong after adding flows")
+	}
+	tab.sweep(start.Add(70*time.Second), time.Minute)
+	if !tab.hasDst(dst) {
+		t.Fatal("destination forgotten while a flow to it is active")
+	}
+	tab.sweep(start.Add(2*time.Minute), time.Minute)
+	if tab.hasDst(dst) {
+		t.Fatal("destination kept after all its flows expired")
+	}
+}
