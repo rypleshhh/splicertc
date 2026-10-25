@@ -2,11 +2,9 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/lxn/walk"
 )
@@ -25,8 +23,7 @@ var lastClientErr atomic.Int32
 
 // noteClientLine looks for the fatal errors client.exe prints (see
 // transport.ErrPinMismatch and auth.ErrRejected).
-func noteClientLine(line []byte) {
-	s := string(line)
+func noteClientLine(s string) {
 	switch {
 	case strings.Contains(s, "server certificate does not match pinned fingerprint"):
 		lastClientErr.Store(int32(errPinMismatch))
@@ -83,18 +80,4 @@ func askResetPin() {
 		logger.Println("pin file removed by the user:", pinPath)
 		setStatus("отпечаток сброшен, можно подключаться")
 	})
-}
-
-// teardownRoutes removes what setup-vpn-route.ps1 added outside the TUN
-// adapter (the IPv6 block). Routes on the TUN go away with the adapter.
-func teardownRoutes() {
-	script := filepath.Join(exeDir, "setup-vpn-route.ps1")
-	if _, err := os.Stat(script); err != nil {
-		return
-	}
-	rc := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Teardown")
-	rc.Dir = exeDir
-	rc.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
-	out, err := rc.CombinedOutput()
-	logger.Printf("setup-vpn-route.ps1 -Teardown: %s (err=%v)", strings.TrimSpace(string(out)), err)
 }
