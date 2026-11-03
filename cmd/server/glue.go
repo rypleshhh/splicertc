@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/sched"
@@ -20,8 +21,8 @@ import (
 // udpFlows are the UDP sockets to game servers, paths are the client
 // connections replies are sent to.
 type glueSession struct {
-	// client name from authorized_keys.json, another client can't join
-	owner string
+	// another key can't join, even with the same name
+	owner auth.Peer
 
 	mu       sync.Mutex
 	recv     *frame.Receiver
@@ -84,13 +85,13 @@ var glueSessions = struct {
 // Both happen under glueSessions.mu so the janitor can't delete the
 // session in between. ok is false if the session belongs to another
 // client or a limit is reached.
-func attachGluePath(id, owner string, conn net.Conn, w *sched.PathWriter) (s *glueSession, paths int, ok bool) {
+func attachGluePath(id string, owner auth.Peer, conn net.Conn, w *sched.PathWriter) (s *glueSession, paths int, ok bool) {
 	glueSessions.mu.Lock()
 	defer glueSessions.mu.Unlock()
 	s, exists := glueSessions.m[id]
 	if !exists {
-		if !makeRoomForSession(owner) {
-			log.Printf("glue: %q already has %d active sessions, rejecting %s", owner, maxSessionsPerClient, conn.RemoteAddr())
+		if !makeRoomForSession(owner.KeyID) {
+			log.Printf("glue: %s already has %d active sessions, rejecting %s", owner, maxSessionsPerClient, conn.RemoteAddr())
 			return nil, 0, false
 		}
 		if len(glueSessions.m) >= maxGlueSessions {
@@ -105,8 +106,8 @@ func attachGluePath(id, owner string, conn net.Conn, w *sched.PathWriter) (s *gl
 		}
 		glueSessions.m[id] = s
 	}
-	if s.owner != owner {
-		log.Printf("glue: session %s belongs to %q, rejecting %q from %s", id, s.owner, owner, conn.RemoteAddr())
+	if s.owner.KeyID != owner.KeyID {
+		log.Printf("glue: session %s belongs to %s, rejecting %s from %s", id, s.owner, owner, conn.RemoteAddr())
 		return nil, 0, false
 	}
 	s.mu.Lock()
@@ -123,13 +124,13 @@ func attachGluePath(id, owner string, conn net.Conn, w *sched.PathWriter) (s *gl
 // makeRoomForSession checks the per-client session limit. Sessions of a
 // restarted client linger for glueSessionIdle without paths; those are
 // removed first to make room. Called with glueSessions.mu held.
-func makeRoomForSession(owner string) bool {
+func makeRoomForSession(keyID string) bool {
 	var count int
 	var oldestID string
 	var oldest *glueSession
 	var oldestSince time.Time
 	for id, s := range glueSessions.m {
-		if s.owner != owner {
+		if s.owner.KeyID != keyID {
 			continue
 		}
 		count++
@@ -292,7 +293,7 @@ func cleanupGlue(now time.Time) {
 func handleGlueConn(conn net.Conn) {
 	defer conn.Close()
 	startHandshake(conn)
-	name, ok := checkAuth(conn)
+	peer, ok := checkAuth(conn)
 	if !ok {
 		return
 	}
@@ -307,12 +308,12 @@ func handleGlueConn(conn net.Conn) {
 	transport.SetNotSentLowat(conn, glueNotSentLowat)
 
 	writer := sched.NewPathWriter(conn, gluePathDepth, glueStaleAfter)
-	sess, nPaths, ok := attachGluePath(sid, name, conn, writer)
+	sess, nPaths, ok := attachGluePath(sid, peer, conn, writer)
 	if !ok {
 		writer.Close()
 		return
 	}
-	log.Printf("glue path connected: %s (session %s, client %q, %d path(s) now)", conn.RemoteAddr(), sid, name, nPaths)
+	log.Printf("glue path connected: %s (session %s, client %s, %d path(s) now)", conn.RemoteAddr(), sid, peer, nPaths)
 
 	defer func() {
 		sess.detachPath(conn)

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/sched"
 )
 
@@ -25,7 +26,7 @@ func testSession(t *testing.T, id string) (*glueSession, net.Conn) {
 	t.Cleanup(func() { b.Close() })
 	w := sched.NewPathWriter(a, 4, 0)
 	t.Cleanup(w.Close)
-	s, n, ok := attachGluePath(id, "me", a, w)
+	s, n, ok := attachGluePath(id, alice, a, w)
 	if !ok || n != 1 {
 		t.Fatalf("expected 1 path, got %d", n)
 	}
@@ -124,8 +125,10 @@ func TestGlueSessionOwnedByOneClient(t *testing.T) {
 	defer b.Close()
 	w := sched.NewPathWriter(a, 4, 0)
 	defer w.Close()
-	if _, _, ok := attachGluePath("owned", "stranger", a, w); ok {
-		t.Fatal("a different client joined the session")
+	for _, other := range []auth.Peer{bob, fakeAlice} {
+		if _, _, ok := attachGluePath("owned", other, a, w); ok {
+			t.Fatalf("%s joined alice's session", other)
+		}
 	}
 }
 
@@ -148,12 +151,13 @@ func TestGlueFlowLimit(t *testing.T) {
 // A client gets a few sessions; sessions left over from a restart (no
 // paths) make room for new ones, sessions in use don't.
 func TestSessionsPerClient(t *testing.T) {
+	perClient := auth.Peer{KeyID: "key-per-client", Name: "per-client"}
 	var conns []net.Conn
 	attach := func(id string) bool {
 		a, b := net.Pipe()
 		conns = append(conns, a, b)
 		w := sched.NewPathWriter(a, 4, 0)
-		_, _, ok := attachGluePath(id, "per-client", a, w)
+		_, _, ok := attachGluePath(id, perClient, a, w)
 		return ok
 	}
 	defer func() {
@@ -162,7 +166,7 @@ func TestSessionsPerClient(t *testing.T) {
 		}
 		glueSessions.mu.Lock()
 		for id, s := range glueSessions.m {
-			if s.owner == "per-client" {
+			if s.owner == perClient {
 				delete(glueSessions.m, id)
 			}
 		}

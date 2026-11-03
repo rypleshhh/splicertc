@@ -82,7 +82,7 @@ func cleanupDrop(now time.Time) {
 func handleDroppableConn(conn net.Conn) {
 	defer conn.Close()
 	startHandshake(conn)
-	name, ok := checkAuth(conn)
+	peer, ok := checkAuth(conn)
 	if !ok {
 		return
 	}
@@ -96,7 +96,7 @@ func handleDroppableConn(conn net.Conn) {
 	sid := hex.EncodeToString(sidBuf)
 	sess := getDropSession(sid)
 	defer sess.leave()
-	log.Printf("droppable path connected: %s (session %s, client %q)", conn.RemoteAddr(), sid, name)
+	log.Printf("droppable path connected: %s (session %s, client %s)", conn.RemoteAddr(), sid, peer)
 
 	for {
 		f, err := frame.ReadFrame(conn)

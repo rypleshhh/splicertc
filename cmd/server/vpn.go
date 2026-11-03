@@ -11,6 +11,7 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/sched"
 )
@@ -51,7 +52,7 @@ var keepaliveFlow = sched.FlowKey{Proto: 255}
 // vpnPeer is a client connection plus its send queue. The TUN reader
 // only puts packets in the queue, writeLoop sends them.
 type vpnPeer struct {
-	name string
+	id   auth.Peer
 	conn net.Conn
 	q    *sched.Scheduler
 }
@@ -171,8 +172,8 @@ func claimVPN(peer *vpnPeer) (old *vpnPeer, err error) {
 		return nil, errVPNStopped
 	}
 	old = currentVPN
-	if old != nil && old.name != peer.name {
-		return nil, fmt.Errorf("vpn channel is used by %q", old.name)
+	if old != nil && old.id.KeyID != peer.id.KeyID {
+		return nil, fmt.Errorf("vpn channel is used by %s", old.id)
 	}
 	currentVPN = peer
 	return old, nil
@@ -182,23 +183,23 @@ func claimVPN(peer *vpnPeer) (old *vpnPeer, err error) {
 func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 	defer conn.Close()
 	startHandshake(conn)
-	name, ok := checkAuth(conn)
+	id, ok := checkAuth(conn)
 	if !ok {
 		return
 	}
 	endHandshake(conn)
 
-	peer := &vpnPeer{name: name, conn: conn, q: sched.New(sched.Config{})}
+	peer := &vpnPeer{id: id, conn: conn, q: sched.New(sched.Config{})}
 	old, err := claimVPN(peer)
 	if err != nil {
-		log.Printf("vpn: refusing %s (%q): %v", conn.RemoteAddr(), name, err)
+		log.Printf("vpn: refusing %s (%s): %v", conn.RemoteAddr(), id, err)
 		return
 	}
 	if old != nil {
-		log.Printf("vpn: %q reconnected from %s, closing the old connection %s", name, conn.RemoteAddr(), old.conn.RemoteAddr())
+		log.Printf("vpn: %s reconnected from %s, closing the old connection %s", id, conn.RemoteAddr(), old.conn.RemoteAddr())
 		old.conn.Close()
 	}
-	log.Printf("vpn: client connected: %s (%q)", conn.RemoteAddr(), name)
+	log.Printf("vpn: client connected: %s (%s)", conn.RemoteAddr(), id)
 
 	done := make(chan struct{})
 	go peer.writeLoop()
@@ -234,7 +235,7 @@ func handleVPNConn(conn net.Conn, dev tun.Device, vn vpnNet) {
 		if !fromClient(f.Payload, vn.clientIP) {
 			if !spoofLogged {
 				spoofLogged = true
-				log.Printf("vpn: dropping packets from %q with a source address other than %s", name, vn.clientIP)
+				log.Printf("vpn: dropping packets from %s with a source address other than %s", id, vn.clientIP)
 			}
 			continue
 		}

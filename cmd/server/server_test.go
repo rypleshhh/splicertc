@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/config"
 	"tcp-dormtun/internal/frame"
 	"tcp-dormtun/internal/proto"
@@ -30,18 +31,26 @@ func TestFromClientRejectsSpoofedSource(t *testing.T) {
 	}
 }
 
+var (
+	alice     = auth.Peer{KeyID: "key-alice", Name: "alice"}
+	bob       = auth.Peer{KeyID: "key-bob", Name: "bob"}
+	fakeAlice = auth.Peer{KeyID: "key-other", Name: "alice"} // чужой ключ, то же имя
+)
+
 func TestClaimVPN(t *testing.T) {
 	defer func() { currentVPN = nil }()
-	a := &vpnPeer{name: "alice"}
+	a := &vpnPeer{id: alice}
 	if _, err := claimVPN(a); err != nil {
 		t.Fatalf("first client was refused: %v", err)
 	}
-	a2 := &vpnPeer{name: "alice"}
+	a2 := &vpnPeer{id: alice}
 	if old, err := claimVPN(a2); err != nil || old != a {
-		t.Fatal("reconnect of the same client must replace the old connection")
+		t.Fatal("reconnect of the same key must replace the old connection")
 	}
-	if _, err := claimVPN(&vpnPeer{name: "bob"}); err == nil {
-		t.Fatal("another client kicked the current one")
+	for _, other := range []auth.Peer{bob, fakeAlice} {
+		if _, err := claimVPN(&vpnPeer{id: other}); err == nil {
+			t.Fatalf("%s kicked the current client", other)
+		}
 	}
 	if currentVPN != a2 {
 		t.Fatal("current client changed")
@@ -58,7 +67,7 @@ func TestStopVPNRefusesClients(t *testing.T) {
 	}()
 	server, client := net.Pipe()
 	defer client.Close()
-	if _, err := claimVPN(&vpnPeer{name: "alice", conn: server}); err != nil {
+	if _, err := claimVPN(&vpnPeer{id: alice, conn: server}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,7 +76,7 @@ func TestStopVPNRefusesClients(t *testing.T) {
 	if _, err := client.Write([]byte{1}); err == nil {
 		t.Fatal("the current client was not disconnected")
 	}
-	if _, err := claimVPN(&vpnPeer{name: "alice"}); !errors.Is(err, errVPNStopped) {
+	if _, err := claimVPN(&vpnPeer{id: alice}); !errors.Is(err, errVPNStopped) {
 		t.Fatalf("expected errVPNStopped, got %v", err)
 	}
 }

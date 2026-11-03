@@ -110,11 +110,11 @@ func TestHandshakeSucceedsWithAuthorizedKey(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var serverErr error
-	var name string
+	var peer Peer
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		name, serverErr = ServerHandshake(serverConn, keys)
+		peer, serverErr = ServerHandshake(serverConn, keys)
 	}()
 
 	clientErr := ClientHandshake(clientConn, seed)
@@ -126,8 +126,8 @@ func TestHandshakeSucceedsWithAuthorizedKey(t *testing.T) {
 	if serverErr != nil {
 		t.Fatalf("server handshake: %v", serverErr)
 	}
-	if name != "friend1" {
-		t.Errorf("expected server to identify the caller as %q, got %q", "friend1", name)
+	if peer.Name != "friend1" || peer.KeyID != EncodeKey(pub) {
+		t.Errorf("expected server to identify the caller as friend1/%s, got %+v", EncodeKey(pub), peer)
 	}
 }
 
