@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -42,15 +43,19 @@ type gluePaths struct {
 	srv endpoint
 	key []byte
 	sid []byte
-	// onFrame gets every frame from the server except path pings. It's
-	// called from several goroutines at once.
-	onFrame func(frame.Frame)
+	// onFrame gets every frame from the server except path pings, with
+	// the epoch of the server session its path joined. It's called from
+	// several goroutines at once.
+	onFrame func(epoch uint64, f frame.Frame)
+	// onEpoch gets the epoch of every newly connected path before any of
+	// its frames, can be nil
+	onEpoch func(epoch uint64)
 	// onFatal gets errors that reconnecting won't fix (wrong key or
 	// certificate). The path stops; the caller should shut down.
 	onFatal func(error)
 
 	// can be replaced in tests
-	dial func() (net.Conn, error)
+	dial func() (net.Conn, uint64, error)
 
 	mu      sync.Mutex
 	writers map[int]*sched.PathWriter
@@ -58,12 +63,13 @@ type gluePaths struct {
 
 // startGluePaths dials n paths. It fails only if none of them could
 // connect; paths that failed are dialed again in the background.
-func startGluePaths(srv endpoint, key []byte, n int, onFrame func(frame.Frame), onFatal func(error)) (*gluePaths, error) {
-	g := newGluePaths(srv, key, onFrame, onFatal)
+func startGluePaths(srv endpoint, key []byte, n int, replies *replyHandler, onFatal func(error)) (*gluePaths, error) {
+	g := newGluePaths(srv, key, replies.handle, onFatal)
+	g.onEpoch = replies.setEpoch
 	return g, g.start(n)
 }
 
-func newGluePaths(srv endpoint, key []byte, onFrame func(frame.Frame), onFatal func(error)) *gluePaths {
+func newGluePaths(srv endpoint, key []byte, onFrame func(uint64, frame.Frame), onFatal func(error)) *gluePaths {
 	g := &gluePaths{
 		srv:     srv,
 		key:     key,
@@ -106,24 +112,40 @@ func (g *gluePaths) start(n int) error {
 	return nil
 }
 
-// dialServer connects one path: TLS, auth, session ID.
-func (g *gluePaths) dialServer() (net.Conn, error) {
+// dialServer connects one path: TLS, auth, hello. It returns the epoch
+// of the server session the path joined.
+func (g *gluePaths) dialServer() (net.Conn, uint64, error) {
 	c, err := transport.Dial(g.srv.addr, g.srv.dc)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	_ = c.SetDeadline(time.Now().Add(transport.DialTimeout))
 	if err := auth.ClientHandshake(c, g.key); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("auth: %w", err)
+		return nil, 0, fmt.Errorf("auth: %w", err)
 	}
-	if _, err := c.Write(g.sid); err != nil {
+	epoch, err := joinSession(c, g.sid)
+	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("send session id: %w", err)
+		return nil, 0, err
 	}
 	_ = c.SetDeadline(time.Time{})
 	transport.SetSendBuffer(c, glueSendBuffer)
-	return c, nil
+	return c, epoch, nil
+}
+
+// joinSession sends the hello and reads the server's accept.
+func joinSession(c net.Conn, sid []byte) (epoch uint64, err error) {
+	if _, err := c.Write(glue.EncodeHello(sid)); err != nil {
+		return 0, fmt.Errorf("send hello: %w", err)
+	}
+	accept := make([]byte, glue.AcceptSize)
+	if _, err := io.ReadFull(c, accept); err != nil {
+		// a server older than the client reads the hello as a session ID
+		// and never answers
+		return 0, fmt.Errorf("no accept from the server (older server version?): %w", err)
+	}
+	return glue.DecodeAccept(accept)
 }
 
 // keepPath keeps path i connected. It stops only on a permanent dial
@@ -132,9 +154,12 @@ func (g *gluePaths) dialServer() (net.Conn, error) {
 func (g *gluePaths) keepPath(i int, first chan<- error) {
 	backoff := redialMin
 	for {
-		c, err := g.dial()
+		c, epoch, err := g.dial()
 		var w *sched.PathWriter
 		if err == nil {
+			if g.onEpoch != nil {
+				g.onEpoch(epoch)
+			}
 			// registered before reporting, so live() is right after start()
 			w = sched.NewPathWriter(c, gluePathDepth, glueStaleAfter)
 			g.mu.Lock()
@@ -160,7 +185,7 @@ func (g *gluePaths) keepPath(i int, first chan<- error) {
 		}
 
 		started := time.Now()
-		reason := g.servePath(i, c, w)
+		reason := g.servePath(i, c, w, epoch)
 		log.Printf("glue: path %d lost: %s, reconnecting", i, reason)
 		// a path that worked for a while gets redialed right away
 		if time.Since(started) > 10*time.Second {
@@ -172,7 +197,7 @@ func (g *gluePaths) keepPath(i int, first chan<- error) {
 }
 
 // servePath runs one connected path until it dies.
-func (g *gluePaths) servePath(i int, c net.Conn, w *sched.PathWriter) string {
+func (g *gluePaths) servePath(i int, c net.Conn, w *sched.PathWriter, epoch uint64) string {
 	var lastEcho atomic.Int64
 	lastEcho.Store(time.Now().UnixNano())
 
@@ -189,7 +214,7 @@ func (g *gluePaths) servePath(i int, c net.Conn, w *sched.PathWriter) string {
 				lastEcho.Store(time.Now().UnixNano())
 				continue
 			}
-			g.onFrame(f)
+			g.onFrame(epoch, f)
 		}
 	}()
 
@@ -232,37 +257,69 @@ func (g *gluePaths) send(wire []byte) {
 	g.mu.Unlock()
 }
 
-// glueReplyHandler makes an onFrame func: replies come on every path, so
-// duplicates are dropped, the rest is written into the TUN. onPing can
-// be nil.
-func glueReplyHandler(flows *flowTable, devWrite func([]byte), onPing func(nonce uint64)) func(frame.Frame) {
-	recv := frame.NewReceiver(150 * time.Millisecond)
-	var mu sync.Mutex
-	return func(f frame.Frame) {
-		// ping reply, stats ignores duplicates
-		if nonce, isPing := glue.DecodePing(f.Payload); isPing {
-			if onPing != nil {
-				onPing(nonce)
-			}
-			return
+const replyMaxAge = 150 * time.Millisecond
+
+// replyHandler takes replies from all paths: duplicates are dropped, the
+// rest is written into the TUN.
+type replyHandler struct {
+	flows    *flowTable
+	devWrite func([]byte)
+	onPing   func(nonce uint64) // can be nil
+
+	mu    sync.Mutex
+	epoch uint64
+	recv  *frame.Receiver
+}
+
+func newReplyHandler(flows *flowTable, devWrite func([]byte), onPing func(nonce uint64)) *replyHandler {
+	return &replyHandler{flows: flows, devWrite: devWrite, onPing: onPing, recv: frame.NewReceiver(replyMaxAge)}
+}
+
+// setEpoch is called for every path that connects. A new epoch is a new
+// server session whose seq starts from zero; the old dedup window would
+// drop its replies as "too old" until seq caught up. The latest path
+// wins: paths of the old session are dead anyway (a session is replaced
+// only after it lost all paths or the server restarted).
+func (h *replyHandler) setEpoch(epoch uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if epoch == h.epoch {
+		return
+	}
+	if h.epoch != 0 {
+		log.Printf("glue: new server session (epoch %x), reply sequence restarts", epoch)
+	}
+	h.epoch = epoch
+	h.recv = frame.NewReceiver(replyMaxAge)
+}
+
+func (h *replyHandler) handle(epoch uint64, f frame.Frame) {
+	// ping reply, stats ignores duplicates
+	if nonce, isPing := glue.DecodePing(f.Payload); isPing {
+		if h.onPing != nil {
+			h.onPing(nonce)
 		}
-		mu.Lock()
-		ok, _ := recv.Accept(f)
-		mu.Unlock()
-		if !ok {
-			return // duplicate or too old
-		}
-		flowID, payload, err := glue.DecodeInbound(f.Payload)
-		if err != nil {
-			return
-		}
-		fi, known := flows.lookup(flowID, time.Now())
-		if !known {
-			return
-		}
-		if pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload); pkt != nil {
-			devWrite(pkt)
-		}
+		return
+	}
+	h.mu.Lock()
+	ok := epoch == h.epoch
+	if ok {
+		ok, _ = h.recv.Accept(f)
+	}
+	h.mu.Unlock()
+	if !ok {
+		return // old session, duplicate or too old
+	}
+	flowID, payload, err := glue.DecodeInbound(f.Payload)
+	if err != nil {
+		return
+	}
+	fi, known := h.flows.lookup(flowID, time.Now())
+	if !known {
+		return
+	}
+	if pkt := pktfilter.BuildIPv4UDP(fi.origDst, fi.origSrc, fi.origDstPort, fi.origSrcPort, payload); pkt != nil {
+		h.devWrite(pkt)
 	}
 }
 

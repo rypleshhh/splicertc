@@ -41,12 +41,12 @@ func fakeGlueServer(c net.Conn, echo bool, got chan<- []byte) {
 
 func TestGluePathsRedialDeadPath(t *testing.T) {
 	var dials atomic.Int32
-	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, nil)
-	g.dial = func() (net.Conn, error) {
+	g := newGluePaths(endpoint{}, nil, func(uint64, frame.Frame) {}, nil)
+	g.dial = func() (net.Conn, uint64, error) {
 		client, server := net.Pipe()
 		// the first connection never answers pings, later ones do
 		go fakeGlueServer(server, dials.Add(1) > 1, nil)
-		return client, nil
+		return client, 1, nil
 	}
 	if err := g.start(1); err != nil {
 		t.Fatal(err)
@@ -72,13 +72,13 @@ func TestGluePathsRedialDeadPath(t *testing.T) {
 func TestGluePathsSendAndReceive(t *testing.T) {
 	got := make(chan []byte, 16)
 	recv := make(chan frame.Frame, 16)
-	g := newGluePaths(endpoint{}, nil, func(f frame.Frame) { recv <- f }, nil)
+	g := newGluePaths(endpoint{}, nil, func(_ uint64, f frame.Frame) { recv <- f }, nil)
 	var servers []net.Conn
-	g.dial = func() (net.Conn, error) {
+	g.dial = func() (net.Conn, uint64, error) {
 		client, server := net.Pipe()
 		servers = append(servers, server)
 		go fakeGlueServer(server, true, got)
-		return client, nil
+		return client, 1, nil
 	}
 	if err := g.start(1); err != nil {
 		t.Fatal(err)
@@ -110,8 +110,8 @@ func TestGluePathsSendAndReceive(t *testing.T) {
 }
 
 func TestGluePathsStartFailsWhenNothingConnects(t *testing.T) {
-	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, nil)
-	g.dial = func() (net.Conn, error) { return nil, errors.New("refused") }
+	g := newGluePaths(endpoint{}, nil, func(uint64, frame.Frame) {}, nil)
+	g.dial = func() (net.Conn, uint64, error) { return nil, 0, errors.New("refused") }
 	if err := g.start(3); err == nil {
 		t.Fatal("expected an error when no path can connect")
 	}
@@ -166,10 +166,10 @@ func TestVPNLinkReconnects(t *testing.T) {
 func TestGluePathsPermanentErrorStops(t *testing.T) {
 	var dials atomic.Int32
 	fatal := make(chan error, 4)
-	g := newGluePaths(endpoint{}, nil, func(frame.Frame) {}, func(err error) { fatal <- err })
-	g.dial = func() (net.Conn, error) {
+	g := newGluePaths(endpoint{}, nil, func(uint64, frame.Frame) {}, func(err error) { fatal <- err })
+	g.dial = func() (net.Conn, uint64, error) {
 		dials.Add(1)
-		return nil, fmt.Errorf("auth: %w", auth.ErrRejected)
+		return nil, 0, fmt.Errorf("auth: %w", auth.ErrRejected)
 	}
 	if err := g.start(2); !errors.Is(err, auth.ErrRejected) {
 		t.Fatalf("start: got %v", err)
@@ -255,5 +255,101 @@ func TestVPNLinkClose(t *testing.T) {
 	}
 	if n := dials.Load(); n != 0 {
 		t.Fatalf("%d dials after close", n)
+	}
+}
+
+// Регрессия: после рестарта сервера новая сессия шлёт seq с нуля, клиент
+// видел seq 4096. Ответы новой сессии должны доходить.
+func TestGlueRepliesAfterServerRestart(t *testing.T) {
+	flows := newFlowTable()
+	fi := flowInfo{origSrc: [4]byte{10, 66, 0, 2}, origDst: [4]byte{1, 2, 3, 4}, origSrcPort: 50000, origDstPort: 27015}
+	flowID, _ := flows.id(fi, time.Now())
+	delivered := make(chan []byte, 8)
+	replies := newReplyHandler(flows, func(pkt []byte) { delivered <- pkt }, nil)
+
+	servers := make(chan net.Conn, 4)
+	var epoch atomic.Uint64
+	g := newGluePaths(endpoint{}, nil, replies.handle, nil)
+	g.onEpoch = replies.setEpoch
+	g.dial = func() (net.Conn, uint64, error) {
+		client, server := net.Pipe()
+		go func() {
+			// эхо path ping, чтобы путь считался живым
+			for {
+				f, err := frame.ReadFrame(server)
+				if err != nil {
+					return
+				}
+				if glue.IsPathPing(f.Payload) {
+					if _, err := server.Write(f.Marshal()); err != nil {
+						return
+					}
+				}
+			}
+		}()
+		servers <- server
+		return client, epoch.Add(1), nil // каждый dial — новая серверная сессия
+	}
+	if err := g.start(1); err != nil {
+		t.Fatal(err)
+	}
+
+	expect := func(what string) {
+		t.Helper()
+		select {
+		case <-delivered:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: reply not delivered", what)
+		}
+	}
+	first := <-servers
+	go first.Write(frame.New(4096, glue.EncodeInbound(flowID, []byte("old"))).Marshal())
+	expect("first session")
+
+	first.Close() // сервер перезапустился
+	var second net.Conn
+	select {
+	case second = <-servers:
+	case <-time.After(5 * time.Second):
+		t.Fatal("path was not redialed")
+	}
+	go second.Write(frame.New(0, glue.EncodeInbound(flowID, []byte("new"))).Marshal())
+	expect("new session")
+}
+
+func TestReplyHandlerEpochs(t *testing.T) {
+	flows := newFlowTable()
+	fi := flowInfo{origSrc: [4]byte{10, 66, 0, 2}, origDst: [4]byte{1, 2, 3, 4}, origSrcPort: 50000, origDstPort: 27015}
+	flowID, _ := flows.id(fi, time.Now())
+	var n int
+	h := newReplyHandler(flows, func([]byte) { n++ }, nil)
+	reply := func(seq uint32) frame.Frame { return frame.New(seq, glue.EncodeInbound(flowID, []byte("x"))) }
+
+	steps := []struct {
+		name    string
+		epoch   uint64 // 0 = только setEpoch
+		set     uint64
+		seq     uint32
+		deliver bool
+	}{
+		{name: "join session 1", set: 1},
+		{name: "reply of session 1", epoch: 1, seq: 4096, deliver: true},
+		{name: "duplicate", epoch: 1, seq: 4096},
+		{name: "same session, another path", set: 1},
+		{name: "duplicate after same-epoch join", epoch: 1, seq: 4096},
+		{name: "join session 2", set: 2},
+		{name: "seq restarts in session 2", epoch: 2, seq: 0, deliver: true},
+		{name: "late frame of session 1", epoch: 1, seq: 5000},
+	}
+	for _, st := range steps {
+		before := n
+		if st.set != 0 {
+			h.setEpoch(st.set)
+			continue
+		}
+		h.handle(st.epoch, reply(st.seq))
+		if got := n > before; got != st.deliver {
+			t.Fatalf("%s: delivered=%v, want %v", st.name, got, st.deliver)
+		}
 	}
 }

@@ -136,7 +136,7 @@ func runVPNMode(srv endpoint, key []byte, tunName string, mtu int, glueSrv endpo
 	)
 	if len(gameProcesses) > 0 {
 		flows := newFlowTable()
-		paths, err = startGluePaths(glueSrv, key, gamePaths, glueReplyHandler(flows, devWrite, nil), fail)
+		paths, err = startGluePaths(glueSrv, key, gamePaths, newReplyHandler(flows, devWrite, nil), fail)
 		if err != nil {
 			return fmt.Errorf("dial glue channel: %w", err)
 		}
