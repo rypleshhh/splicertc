@@ -86,6 +86,18 @@ type AuthorizedKeys struct {
 	byKey map[string]string // pubkey bytes -> name
 }
 
+// Peer is an authenticated client. Rights, session ownership and quotas
+// go by KeyID; Name is only a label for logs and can repeat.
+type Peer struct {
+	KeyID string // base64 public key
+	Name  string
+}
+
+// String is for logs: the name and a short key prefix.
+func (p Peer) String() string {
+	return fmt.Sprintf("%q (key %.8s)", p.Name, p.KeyID)
+}
+
 // LoadAuthorizedKeys reads authorized_keys.json.
 func LoadAuthorizedKeys(path string) (*AuthorizedKeys, error) {
 	raw, err := os.ReadFile(path)
@@ -137,45 +149,44 @@ func bindingMessage(tc *tls.Conn, challenge []byte) ([]byte, error) {
 	return msg, nil
 }
 
-// ServerHandshake checks the client and returns its name from
-// authorized_keys.json.
-func ServerHandshake(conn net.Conn, keys *AuthorizedKeys) (string, error) {
+// ServerHandshake checks the client and returns who it is.
+func ServerHandshake(conn net.Conn, keys *AuthorizedKeys) (Peer, error) {
 	tc, err := ensureTLS(conn)
 	if err != nil {
-		return "", err
+		return Peer{}, err
 	}
 
 	challenge := make([]byte, challengeSize)
 	if _, err := rand.Read(challenge); err != nil {
-		return "", fmt.Errorf("generate challenge: %w", err)
+		return Peer{}, fmt.Errorf("generate challenge: %w", err)
 	}
 	if _, err := conn.Write(challenge); err != nil {
-		return "", fmt.Errorf("send challenge: %w", err)
+		return Peer{}, fmt.Errorf("send challenge: %w", err)
 	}
 
 	resp := make([]byte, ed25519.PublicKeySize+ed25519.SignatureSize)
 	if _, err := io.ReadFull(conn, resp); err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return Peer{}, fmt.Errorf("read response: %w", err)
 	}
 	pub := ed25519.PublicKey(resp[:ed25519.PublicKeySize])
 	sig := resp[ed25519.PublicKeySize:]
 
 	name, known := keys.byKey[string(pub)]
 	if !known {
-		return "", fmt.Errorf("%w: unrecognized public key", ErrUnauthorized)
+		return Peer{}, fmt.Errorf("%w: unrecognized public key", ErrUnauthorized)
 	}
 
 	msg, err := bindingMessage(tc, challenge)
 	if err != nil {
-		return "", err
+		return Peer{}, err
 	}
 	if !ed25519.Verify(pub, msg, sig) {
-		return "", fmt.Errorf("%w: invalid signature for %q", ErrUnauthorized, name)
+		return Peer{}, fmt.Errorf("%w: invalid signature for %q", ErrUnauthorized, name)
 	}
 	if _, err := conn.Write([]byte{authOK}); err != nil {
-		return "", fmt.Errorf("send ok: %w", err)
+		return Peer{}, fmt.Errorf("send ok: %w", err)
 	}
-	return name, nil
+	return Peer{KeyID: EncodeKey(pub), Name: name}, nil
 }
 
 // ClientHandshake signs the server's challenge with our key.

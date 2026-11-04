@@ -146,11 +146,12 @@ func cleanupAuthFailures(now time.Time) {
 	}
 }
 
-// checkAuth runs the auth handshake (if enabled) and returns the client
-// name. Must be called right after Accept, after startHandshake.
-func checkAuth(conn net.Conn) (name string, ok bool) {
+// checkAuth runs the auth handshake (if enabled) and returns the client.
+// With auth off every client is the same zero Peer. Must be called right
+// after Accept, after startHandshake.
+func checkAuth(conn net.Conn) (peer auth.Peer, ok bool) {
 	if authorizedKeys == nil {
-		return "", true
+		return auth.Peer{}, true
 	}
 
 	ip := banKey(authIP(conn))
@@ -158,10 +159,10 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 		if first {
 			log.Printf("auth: rejecting %s until %s (banned after too many failed attempts; further attempts are not logged)", ip, until.Format(time.RFC3339))
 		}
-		return "", false
+		return auth.Peer{}, false
 	}
 
-	name, err := auth.ServerHandshake(conn, authorizedKeys)
+	peer, err := auth.ServerHandshake(conn, authorizedKeys)
 	if err != nil {
 		log.Printf("auth: rejected %s: %v", conn.RemoteAddr(), err)
 		// only a wrong key counts towards the ban, not network errors:
@@ -169,10 +170,10 @@ func checkAuth(conn net.Conn) (name string, ok bool) {
 		if errors.Is(err, auth.ErrUnauthorized) {
 			recordAuthFailure(ip)
 		}
-		return "", false
+		return auth.Peer{}, false
 	}
 	recordAuthSuccess(ip)
-	return name, true
+	return peer, true
 }
 
 // startHandshake puts a deadline on the whole connection setup (TLS,

@@ -35,12 +35,12 @@ func smuxConfig() *smux.Config {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 	startHandshake(conn)
-	name, ok := checkAuth(conn)
+	peer, ok := checkAuth(conn)
 	if !ok {
 		return
 	}
 	endHandshake(conn)
-	log.Printf("client connected: %s (%q)", conn.RemoteAddr(), name)
+	log.Printf("client connected: %s (%s)", conn.RemoteAddr(), peer)
 
 	sess, err := smux.Server(conn, smuxConfig())
 	if err != nil {
@@ -62,7 +62,7 @@ func handleConn(conn net.Conn) {
 		default:
 			if !limitLogged {
 				limitLogged = true
-				log.Printf("client %q: more than %d streams at once, refusing new ones", name, maxStreamsPerSession)
+				log.Printf("client %s: more than %d streams at once, refusing new ones", peer, maxStreamsPerSession)
 			}
 			stream.Write([]byte{0x01}) // "could not connect"
 			stream.Close()

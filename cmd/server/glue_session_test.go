@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"tcp-dormtun/internal/auth"
+	"tcp-dormtun/internal/frame"
+	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/sched"
 )
 
@@ -25,7 +28,7 @@ func testSession(t *testing.T, id string) (*glueSession, net.Conn) {
 	t.Cleanup(func() { b.Close() })
 	w := sched.NewPathWriter(a, 4, 0)
 	t.Cleanup(w.Close)
-	s, n, ok := attachGluePath(id, "me", a, w)
+	s, n, ok := attachGluePath(id, alice, a, w)
 	if !ok || n != 1 {
 		t.Fatalf("expected 1 path, got %d", n)
 	}
@@ -70,6 +73,15 @@ func TestGlueFlowReusedAndRebound(t *testing.T) {
 	_ = b.SetReadDeadline(time.Now().Add(time.Second))
 	if _, _, err := b.ReadFromUDP(buf); err != nil {
 		t.Fatalf("packet did not reach the new destination: %v", err)
+	}
+
+	// старый reader завершился и не должен удалить новый сокет
+	time.Sleep(50 * time.Millisecond)
+	s.mu.Lock()
+	f := s.udpFlows[7]
+	s.mu.Unlock()
+	if f == nil || f.conn != c3 {
+		t.Fatal("the old socket's reader removed the rebound flow")
 	}
 }
 
@@ -124,8 +136,10 @@ func TestGlueSessionOwnedByOneClient(t *testing.T) {
 	defer b.Close()
 	w := sched.NewPathWriter(a, 4, 0)
 	defer w.Close()
-	if _, _, ok := attachGluePath("owned", "stranger", a, w); ok {
-		t.Fatal("a different client joined the session")
+	for _, other := range []auth.Peer{bob, fakeAlice} {
+		if _, _, ok := attachGluePath("owned", other, a, w); ok {
+			t.Fatalf("%s joined alice's session", other)
+		}
 	}
 }
 
@@ -148,12 +162,13 @@ func TestGlueFlowLimit(t *testing.T) {
 // A client gets a few sessions; sessions left over from a restart (no
 // paths) make room for new ones, sessions in use don't.
 func TestSessionsPerClient(t *testing.T) {
+	perClient := auth.Peer{KeyID: "key-per-client", Name: "per-client"}
 	var conns []net.Conn
 	attach := func(id string) bool {
 		a, b := net.Pipe()
 		conns = append(conns, a, b)
 		w := sched.NewPathWriter(a, 4, 0)
-		_, _, ok := attachGluePath(id, "per-client", a, w)
+		_, _, ok := attachGluePath(id, perClient, a, w)
 		return ok
 	}
 	defer func() {
@@ -162,7 +177,7 @@ func TestSessionsPerClient(t *testing.T) {
 		}
 		glueSessions.mu.Lock()
 		for id, s := range glueSessions.m {
-			if s.owner == "per-client" {
+			if s.owner == perClient {
 				delete(glueSessions.m, id)
 			}
 		}
@@ -210,5 +225,151 @@ func TestTotalFlowsCounter(t *testing.T) {
 	cleanupGlue(time.Now().Add(glueFlowIdle + time.Second))
 	if totalFlows.Load() != before {
 		t.Fatal("closed flow not uncounted")
+	}
+}
+
+// echoUDP answers every datagram with the same bytes.
+func echoUDP(t *testing.T, l *net.UDPConn) {
+	t.Helper()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := l.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = l.WriteToUDP(buf[:n], from)
+		}
+	}()
+}
+
+// readableSession is testSession with access to what the path receives.
+func readableSession(t *testing.T, id string) (*glueSession, net.Conn) {
+	t.Helper()
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	w := sched.NewPathWriter(a, 16, 0)
+	t.Cleanup(w.Close)
+	s, _, ok := attachGluePath(id, alice, a, w)
+	if !ok {
+		t.Fatal("attach failed")
+	}
+	t.Cleanup(func() {
+		glueSessions.mu.Lock()
+		s.mu.Lock()
+		s.closeAllFlowsLocked()
+		s.mu.Unlock()
+		delete(glueSessions.m, id)
+		glueSessions.mu.Unlock()
+	})
+	return s, b
+}
+
+func expectReply(t *testing.T, path net.Conn, want string) {
+	t.Helper()
+	_ = path.SetReadDeadline(time.Now().Add(2 * time.Second))
+	f, err := frame.ReadFrame(path)
+	if err != nil {
+		t.Fatalf("no reply on the path: %v", err)
+	}
+	_, payload, err := glue.DecodeInbound(f.Payload)
+	if err != nil || string(payload) != want {
+		t.Fatalf("got %q (%v), want %q", payload, err, want)
+	}
+}
+
+// Регрессия: reader упал, flow не должен остаться без чтения.
+func TestGlueFlowRecreatedAfterReaderError(t *testing.T) {
+	s, path := readableSession(t, "reader-error")
+	echo := udpListener(t)
+	echoUDP(t, echo)
+	lo := net.IPv4(127, 0, 0, 1)
+	port := uint16(echo.LocalAddr().(*net.UDPAddr).Port)
+	before := totalFlows.Load()
+
+	uc, err := s.flow("reader-error", 1, lo, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = uc.SetReadDeadline(time.Now().Add(-time.Second)) // ошибка чтения
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		_, still := s.udpFlows[1]
+		s.mu.Unlock()
+		if !still {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("flow with a dead reader stayed in the session")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := totalFlows.Load(); n != before {
+		t.Fatalf("flow quota not released: %d, want %d", n, before)
+	}
+
+	uc2, err := s.flow("reader-error", 1, lo, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uc2 == uc {
+		t.Fatal("dead socket was reused")
+	}
+	if _, err := uc2.Write([]byte("again")); err != nil {
+		t.Fatal(err)
+	}
+	expectReply(t, path, "again")
+}
+
+// ICMP port unreachable (Linux: ECONNREFUSED на connected socket) не
+// закрывает flow: игровой сервер знает клиента по этому source port.
+func TestGlueFlowSurvivesPortUnreachable(t *testing.T) {
+	s, path := readableSession(t, "unreachable")
+	tmp := udpListener(t)
+	port := tmp.LocalAddr().(*net.UDPAddr).Port
+	tmp.Close()
+	lo := net.IPv4(127, 0, 0, 1)
+
+	uc, err := s.flow("unreachable", 1, lo, uint16(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = uc.Write([]byte("nobody")) // порт закрыт
+	time.Sleep(100 * time.Millisecond)
+
+	l, err := net.ListenUDP("udp", &net.UDPAddr{IP: lo, Port: port})
+	if err != nil {
+		t.Skipf("port %d was taken in between: %v", port, err)
+	}
+	t.Cleanup(func() { l.Close() })
+	echoUDP(t, l)
+
+	uc2, err := s.flow("unreachable", 1, lo, uint16(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uc2 != uc {
+		t.Fatal("flow was recreated after port unreachable")
+	}
+	if _, err := uc.Write([]byte("back")); err != nil {
+		t.Fatal(err)
+	}
+	expectReply(t, path, "back")
+}
+
+func TestReserveFlowStopsAtLimit(t *testing.T) {
+	saved := totalFlows.Load()
+	t.Cleanup(func() { totalFlows.Store(saved) })
+	totalFlows.Store(maxTotalFlows - 1)
+	if !reserveFlow() {
+		t.Fatal("last free slot refused")
+	}
+	if reserveFlow() {
+		t.Fatal("slot reserved over the limit")
+	}
+	if n := totalFlows.Load(); n != maxTotalFlows {
+		t.Fatalf("counter %d after a refused reservation, want %d", n, maxTotalFlows)
 	}
 }
