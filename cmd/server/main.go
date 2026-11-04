@@ -193,8 +193,11 @@ func main() {
 	}
 
 	go janitor()
+	// one limit for all channels: it's about sockets and memory, not
+	// about which channel uses them
+	slots := make(chan struct{}, maxActiveConns)
 	for _, ch := range channels {
-		go acceptLoop(ch.name, ch.ln, ch.handle)
+		go acceptLoop(ch.name, ch.ln, ch.handle, slots)
 	}
 
 	<-ctx.Done()
@@ -244,8 +247,16 @@ func listen(name, addr, cert, key string) net.Listener {
 	return ln
 }
 
-// acceptLoop runs handle in its own goroutine for every connection.
-func acceptLoop(name string, ln net.Listener, handle func(net.Conn)) {
+// Connections of all channels at once, including ones still in the TLS
+// and auth handshake. The handshake timeout limits how long a socket can
+// be held, this limits how many: file descriptors, goroutines and TLS
+// state. Not per IP: a whole dorm can be behind one NAT address.
+const maxActiveConns = 1024
+
+// acceptLoop runs handle in its own goroutine for every connection that
+// gets a slot; with no free slot the connection is closed right away.
+func acceptLoop(name string, ln net.Listener, handle func(net.Conn), slots chan struct{}) {
+	var lastFullLog time.Time
 	for {
 		conn, err := ln.Accept()
 		if errors.Is(err, net.ErrClosed) {
@@ -257,7 +268,20 @@ func acceptLoop(name string, ln net.Listener, handle func(net.Conn)) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handle(conn)
+		select {
+		case slots <- struct{}{}:
+		default:
+			conn.Close()
+			if time.Since(lastFullLog) > time.Minute {
+				lastFullLog = time.Now()
+				log.Printf("%s: %d connections open, refusing new ones (logged once a minute)", name, cap(slots))
+			}
+			continue
+		}
+		go func() {
+			defer func() { <-slots }()
+			handle(conn)
+		}()
 	}
 }
 
