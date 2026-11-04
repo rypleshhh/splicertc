@@ -90,9 +90,13 @@ Program Files. The tray runs as administrator and starts `client.exe` and
 program can swap these files and get admin rights. Outside Program Files
 the tray warns once.
 
-`wintun.dll` in the repository: version 0.14.1 from
-https://www.wintun.net/, signed by WireGuard LLC, SHA-256
-`E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE`.
+`wintun.dll` is not in the repository: WireGuard LLC ships it under its
+own license. `.\get-wintun.ps1` downloads version 0.14.1 from
+https://www.wintun.net/ and puts it next to itself; a file with any other
+SHA-256 (`E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE`)
+is refused. Straight into the program folder:
+`.\get-wintun.ps1 -Dir "C:\Program Files\splicertc"` from an
+administrator window.
 
 In the tray: name, server address (`IP:587`), key, games (optional),
 "Подключиться" (connect). On the first connect the client remembers the

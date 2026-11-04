@@ -52,6 +52,10 @@ if (-not (Test-Path $routeScript)) {
     Write-Error "$routeScript not found."
     exit 1
 }
+if (-not (Test-Path (Join-Path (Get-Location).Path "wintun.dll"))) {
+    Write-Error "wintun.dll not found next to client.exe, run .\get-wintun.ps1 first."
+    exit 1
+}
 
 # --- 1. TUN parameters for the route script, computed like client.exe
 #        does: client is .2 and gateway .1 of vpn_subnet ---

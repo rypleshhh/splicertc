@@ -14,6 +14,8 @@ devcerts/
 
 # Build output
 *.exe
+# WireGuard LLC's license, get it with get-wintun.ps1
+wintun.dll
 *.exe~
 /server
 /client
