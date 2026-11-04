@@ -61,6 +61,25 @@ func newTestSched(cfg Config) (*Scheduler, *fakeClock) {
 	return s, c
 }
 
+// newSeparateSched is newTestSched where keys land in different buckets.
+// The hash seed is random per scheduler, so two keys share a bucket in
+// 1 of flowBuckets schedulers, and then they are one flow.
+func newSeparateSched(t *testing.T, cfg Config, keys ...FlowKey) (*Scheduler, *fakeClock) {
+	t.Helper()
+	for range 100 {
+		s, c := newTestSched(cfg)
+		buckets := make(map[uint32]bool)
+		for _, k := range keys {
+			buckets[s.bucketOf(k)] = true
+		}
+		if len(buckets) == len(keys) {
+			return s, c
+		}
+	}
+	t.Fatal("keys share a bucket with 100 random seeds")
+	return nil, nil
+}
+
 func mustDequeue(t *testing.T, s *Scheduler) []byte {
 	t.Helper()
 	s.mu.Lock()
@@ -80,9 +99,9 @@ func pkt(tag byte, size int) []byte {
 
 // A new small flow should go out before a backlogged bulk flow.
 func TestSparseFlowJumpsBacklog(t *testing.T) {
-	s, _ := newTestSched(Config{})
 	bulk := FlowKey{Proto: 6, SrcPort: 1}
 	game := FlowKey{Proto: 17, SrcPort: 2}
+	s, _ := newSeparateSched(t, Config{}, bulk, game)
 
 	for i := 0; i < 100; i++ {
 		s.Enqueue(bulk, pkt('B', 1400))
@@ -117,9 +136,9 @@ func TestPerFlowOrderPreserved(t *testing.T) {
 
 // Two bulk flows should get about the same number of bytes.
 func TestBulkFlowsShareFairly(t *testing.T) {
-	s, _ := newTestSched(Config{})
 	big := FlowKey{Proto: 6, SrcPort: 1}
 	small := FlowKey{Proto: 6, SrcPort: 2}
+	s, _ := newSeparateSched(t, Config{}, big, small)
 	for i := 0; i < 400; i++ {
 		s.Enqueue(big, pkt('B', 1400))
 		s.Enqueue(small, pkt('S', 200))
@@ -136,9 +155,9 @@ func TestBulkFlowsShareFairly(t *testing.T) {
 }
 
 func TestOverflowDropsFromFattestFlow(t *testing.T) {
-	s, _ := newTestSched(Config{LimitBytes: 10_000})
 	hog := FlowKey{Proto: 6, SrcPort: 1}
 	quiet := FlowKey{Proto: 17, SrcPort: 2}
+	s, _ := newSeparateSched(t, Config{LimitBytes: 10_000}, hog, quiet)
 	s.Enqueue(quiet, pkt('Q', 100))
 	for i := 0; i < 50; i++ {
 		s.Enqueue(hog, pkt('H', 1400))
