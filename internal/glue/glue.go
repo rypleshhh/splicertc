@@ -5,6 +5,7 @@ package glue
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 )
@@ -17,6 +18,65 @@ const (
 	// without seq dedup. Used to check each path separately.
 	msgPathPing byte = 4
 )
+
+// Path setup, after auth. The client sends a hello (protocol version and
+// session ID), the server answers with an accept: a status and the
+// epoch of the server session the path joined. A new epoch means a new
+// server session (server restart, or the old one expired) whose reply
+// seq starts from zero again.
+const (
+	ProtocolVersion byte = 1
+	SessionIDSize        = 8
+	HelloSize            = 1 + SessionIDSize
+	AcceptSize           = 1 + 8
+)
+
+// Accept statuses.
+const (
+	StatusOK          byte = 0
+	StatusBusy        byte = 1 // a server or per-client limit is reached
+	StatusRefused     byte = 2 // the session belongs to another client
+	StatusUnsupported byte = 3 // unknown protocol version
+)
+
+// ErrUnsupportedVersion: client and server speak different glue
+// versions, reconnecting won't help.
+var ErrUnsupportedVersion = errors.New("glue protocol version not supported by the server (update the client and the server together)")
+
+func EncodeHello(sid []byte) []byte {
+	buf := make([]byte, HelloSize)
+	buf[0] = ProtocolVersion
+	copy(buf[1:], sid)
+	return buf
+}
+
+// DecodeHello: sid points into b.
+func DecodeHello(b []byte) (version byte, sid []byte) {
+	return b[0], b[1:HelloSize]
+}
+
+func EncodeAccept(status byte, epoch uint64) []byte {
+	buf := make([]byte, AcceptSize)
+	buf[0] = status
+	binary.BigEndian.PutUint64(buf[1:], epoch)
+	return buf
+}
+
+// DecodeAccept returns the epoch, or an error for any status but OK.
+func DecodeAccept(b []byte) (epoch uint64, err error) {
+	switch b[0] {
+	case StatusOK:
+		return binary.BigEndian.Uint64(b[1:AcceptSize]), nil
+	case StatusBusy:
+		return 0, errors.New("server refused the path: session or path limit reached")
+	case StatusRefused:
+		return 0, errors.New("server refused the path: session belongs to another client")
+	case StatusUnsupported:
+		return 0, ErrUnsupportedVersion
+	default:
+		return 0, fmt.Errorf("server refused the path: unknown status %d", b[0])
+	}
+}
 
 // EncodePathPing makes a path ping. The nonce is usually a send time.
 func EncodePathPing(nonce uint64) []byte {

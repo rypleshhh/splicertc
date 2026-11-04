@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -24,10 +25,15 @@ import (
 type glueSession struct {
 	// another key can't join, even with the same name
 	owner auth.Peer
+	// random, sent to every path that joins: the client resets its reply
+	// dedup when it sees a new one, replySeq of a new session starts at 0
+	epoch uint64
 
 	mu       sync.Mutex
 	recv     *frame.Receiver
 	udpFlows map[uint16]*udpFlow
+	// nil writer: the path is accepted but its accept message is not
+	// written yet, broadcasts skip it
 	paths    map[net.Conn]*sched.PathWriter
 	replySeq uint32
 	// when the last path went away, zero while there are paths
@@ -92,25 +98,26 @@ var glueSessions = struct {
 	m  map[string]*glueSession
 }{m: make(map[string]*glueSession)}
 
-// attachGluePath finds or creates the session and adds the path to it.
+// attachGluePath finds or creates the session and reserves a path slot
+// for conn; setWriter turns it on once the accept message is written.
 // Both happen under glueSessions.mu so the janitor can't delete the
-// session in between. ok is false if the session belongs to another
-// client or a limit is reached.
-func attachGluePath(id string, owner auth.Peer, conn net.Conn, w *sched.PathWriter) (s *glueSession, paths int, ok bool) {
+// session in between. status is glue.StatusOK or the reason to refuse.
+func attachGluePath(id string, owner auth.Peer, conn net.Conn) (s *glueSession, paths int, status byte) {
 	glueSessions.mu.Lock()
 	defer glueSessions.mu.Unlock()
 	s, exists := glueSessions.m[id]
 	if !exists {
 		if !makeRoomForSession(owner.KeyID) {
 			log.Printf("glue: %s already has %d active sessions, rejecting %s", owner, maxSessionsPerClient, conn.RemoteAddr())
-			return nil, 0, false
+			return nil, 0, glue.StatusBusy
 		}
 		if len(glueSessions.m) >= maxGlueSessions {
 			log.Printf("glue: too many sessions (%d), rejecting %s", maxGlueSessions, conn.RemoteAddr())
-			return nil, 0, false
+			return nil, 0, glue.StatusBusy
 		}
 		s = &glueSession{
 			owner:    owner,
+			epoch:    newEpoch(),
 			recv:     frame.NewReceiver(150 * time.Millisecond),
 			udpFlows: make(map[uint16]*udpFlow),
 			paths:    make(map[net.Conn]*sched.PathWriter),
@@ -119,17 +126,35 @@ func attachGluePath(id string, owner auth.Peer, conn net.Conn, w *sched.PathWrit
 	}
 	if s.owner.KeyID != owner.KeyID {
 		log.Printf("glue: session %s belongs to %s, rejecting %s from %s", id, s.owner, owner, conn.RemoteAddr())
-		return nil, 0, false
+		return nil, 0, glue.StatusRefused
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.paths) >= maxPathsPerSession {
 		log.Printf("glue: session %s already has %d paths, rejecting %s", id, maxPathsPerSession, conn.RemoteAddr())
-		return nil, 0, false
+		return nil, 0, glue.StatusBusy
 	}
-	s.paths[conn] = w
+	s.paths[conn] = nil
 	s.emptySince = time.Time{}
-	return s, len(s.paths), true
+	return s, len(s.paths), glue.StatusOK
+}
+
+// setWriter starts sending replies to a path reserved by attachGluePath.
+func (s *glueSession) setWriter(conn net.Conn, w *sched.PathWriter) {
+	s.mu.Lock()
+	if _, ok := s.paths[conn]; ok {
+		s.paths[conn] = w
+	}
+	s.mu.Unlock()
+}
+
+// newEpoch is never 0: the client starts with 0 as "no session yet".
+func newEpoch() uint64 {
+	for {
+		if e := rand.Uint64(); e != 0 {
+			return e
+		}
+	}
 }
 
 // makeRoomForSession checks the per-client session limit. Sessions of a
@@ -287,7 +312,9 @@ func (s *glueSession) broadcast(build func(seq uint32) []byte) {
 	s.replySeq++
 	writers := make([]*sched.PathWriter, 0, len(s.paths))
 	for _, w := range s.paths {
-		writers = append(writers, w)
+		if w != nil {
+			writers = append(writers, w)
+		}
 	}
 	s.mu.Unlock()
 
@@ -330,25 +357,38 @@ func handleGlueConn(conn net.Conn) {
 		return
 	}
 
-	sidBuf := make([]byte, 8)
-	if _, err := io.ReadFull(conn, sidBuf); err != nil {
-		log.Printf("glue: read session id: %v", err)
+	hello := make([]byte, glue.HelloSize)
+	if _, err := io.ReadFull(conn, hello); err != nil {
+		log.Printf("glue: read hello: %v", err)
+		return
+	}
+	version, sidBuf := glue.DecodeHello(hello)
+	if version != glue.ProtocolVersion {
+		log.Printf("glue: %s speaks protocol version %d, this server %d", conn.RemoteAddr(), version, glue.ProtocolVersion)
+		_, _ = conn.Write(glue.EncodeAccept(glue.StatusUnsupported, 0))
+		return
+	}
+	sid := hex.EncodeToString(sidBuf)
+
+	sess, nPaths, status := attachGluePath(sid, peer, conn)
+	if status != glue.StatusOK {
+		_, _ = conn.Write(glue.EncodeAccept(status, 0))
+		return
+	}
+	defer sess.detachPath(conn)
+	// written before the writer exists, so no reply can get in front of it
+	if _, err := conn.Write(glue.EncodeAccept(glue.StatusOK, sess.epoch)); err != nil {
+		log.Printf("glue: send accept: %v", err)
 		return
 	}
 	endHandshake(conn)
-	sid := hex.EncodeToString(sidBuf)
 	transport.SetNotSentLowat(conn, glueNotSentLowat)
 
 	writer := sched.NewPathWriter(conn, gluePathDepth, glueStaleAfter)
-	sess, nPaths, ok := attachGluePath(sid, peer, conn, writer)
-	if !ok {
-		writer.Close()
-		return
-	}
+	sess.setWriter(conn, writer)
 	log.Printf("glue path connected: %s (session %s, client %s, %d path(s) now)", conn.RemoteAddr(), sid, peer, nPaths)
 
 	defer func() {
-		sess.detachPath(conn)
 		writer.Close()
 		if d := writer.Drops(); d > 0 {
 			log.Printf("glue path %s: %d reply frame(s) dropped while this path was backed up (the other paths carried them)", conn.RemoteAddr(), d)

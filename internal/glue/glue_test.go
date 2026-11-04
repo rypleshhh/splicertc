@@ -2,6 +2,7 @@ package glue
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"testing"
 )
@@ -78,5 +79,42 @@ func TestPathPingRoundTrip(t *testing.T) {
 func TestEncodeOutboundRefusesIPv6(t *testing.T) {
 	if _, err := EncodeOutbound(1, net.ParseIP("2001:db8::1"), 443, nil); err == nil {
 		t.Fatal("IPv6 destination encoded (it would be sent to 0.0.0.0)")
+	}
+}
+
+func TestHelloAcceptRoundTrip(t *testing.T) {
+	sid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	v, got := DecodeHello(EncodeHello(sid))
+	if v != ProtocolVersion || string(got) != string(sid) {
+		t.Fatalf("hello: version %d sid %x", v, got)
+	}
+
+	tests := []struct {
+		name    string
+		status  byte
+		wantErr error
+	}{
+		{"ok", StatusOK, nil},
+		{"busy", StatusBusy, nil},
+		{"refused", StatusRefused, nil},
+		{"unsupported", StatusUnsupported, ErrUnsupportedVersion},
+		{"unknown", 42, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			epoch, err := DecodeAccept(EncodeAccept(tt.status, 77))
+			if tt.status == StatusOK {
+				if err != nil || epoch != 77 {
+					t.Fatalf("got %d, %v", epoch, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("non-OK status decoded without an error")
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("got %v, want %v", err, tt.wantErr)
+			}
+		})
 	}
 }

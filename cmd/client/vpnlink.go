@@ -10,6 +10,7 @@ import (
 
 	"tcp-dormtun/internal/auth"
 	"tcp-dormtun/internal/frame"
+	"tcp-dormtun/internal/glue"
 	"tcp-dormtun/internal/transport"
 )
 
@@ -39,7 +40,8 @@ type vpnLink struct {
 // isPermanentDialError is true for errors that won't go away by
 // reconnecting: wrong key or a different server certificate.
 func isPermanentDialError(err error) bool {
-	return errors.Is(err, auth.ErrRejected) || errors.Is(err, transport.ErrPinMismatch)
+	return errors.Is(err, auth.ErrRejected) || errors.Is(err, transport.ErrPinMismatch) ||
+		errors.Is(err, glue.ErrUnsupportedVersion)
 }
 
 func dialVPN(srv endpoint, key []byte) (net.Conn, error) {

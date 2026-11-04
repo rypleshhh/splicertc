@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -22,13 +25,24 @@ func udpListener(t *testing.T) *net.UDPConn {
 	return l
 }
 
+// attachWithWriter is attach + setWriter, what handleGlueConn does
+// around writing the accept.
+func attachWithWriter(id string, owner auth.Peer, conn net.Conn, w *sched.PathWriter) (*glueSession, int, bool) {
+	s, n, status := attachGluePath(id, owner, conn)
+	if status != glue.StatusOK {
+		return nil, 0, false
+	}
+	s.setWriter(conn, w)
+	return s, n, true
+}
+
 func testSession(t *testing.T, id string) (*glueSession, net.Conn) {
 	t.Helper()
 	a, b := net.Pipe()
 	t.Cleanup(func() { b.Close() })
 	w := sched.NewPathWriter(a, 4, 0)
 	t.Cleanup(w.Close)
-	s, n, ok := attachGluePath(id, alice, a, w)
+	s, n, ok := attachWithWriter(id, alice, a, w)
 	if !ok || n != 1 {
 		t.Fatalf("expected 1 path, got %d", n)
 	}
@@ -137,7 +151,7 @@ func TestGlueSessionOwnedByOneClient(t *testing.T) {
 	w := sched.NewPathWriter(a, 4, 0)
 	defer w.Close()
 	for _, other := range []auth.Peer{bob, fakeAlice} {
-		if _, _, ok := attachGluePath("owned", other, a, w); ok {
+		if _, _, ok := attachWithWriter("owned", other, a, w); ok {
 			t.Fatalf("%s joined alice's session", other)
 		}
 	}
@@ -168,7 +182,7 @@ func TestSessionsPerClient(t *testing.T) {
 		a, b := net.Pipe()
 		conns = append(conns, a, b)
 		w := sched.NewPathWriter(a, 4, 0)
-		_, _, ok := attachGluePath(id, perClient, a, w)
+		_, _, ok := attachWithWriter(id, perClient, a, w)
 		return ok
 	}
 	defer func() {
@@ -250,7 +264,7 @@ func readableSession(t *testing.T, id string) (*glueSession, net.Conn) {
 	t.Cleanup(func() { a.Close(); b.Close() })
 	w := sched.NewPathWriter(a, 16, 0)
 	t.Cleanup(w.Close)
-	s, _, ok := attachGluePath(id, alice, a, w)
+	s, _, ok := attachWithWriter(id, alice, a, w)
 	if !ok {
 		t.Fatal("attach failed")
 	}
@@ -371,5 +385,71 @@ func TestReserveFlowStopsAtLimit(t *testing.T) {
 	}
 	if n := totalFlows.Load(); n != maxTotalFlows {
 		t.Fatalf("counter %d after a refused reservation, want %d", n, maxTotalFlows)
+	}
+}
+
+// glueClient does the glue setup against handleGlueConn (auth is off in
+// tests) and returns the accept status and epoch.
+func glueClient(t *testing.T, hello []byte) (net.Conn, uint64, error) {
+	t.Helper()
+	client, server := net.Pipe()
+	go handleGlueConn(server)
+	t.Cleanup(func() { client.Close() })
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	accept := make([]byte, glue.AcceptSize)
+	if _, err := io.ReadFull(client, accept); err != nil {
+		t.Fatalf("no accept: %v", err)
+	}
+	_ = client.SetDeadline(time.Time{})
+	epoch, err := glue.DecodeAccept(accept)
+	return client, epoch, err
+}
+
+func TestGlueAcceptCarriesSessionEpoch(t *testing.T) {
+	sid := []byte("epochsid")
+	t.Cleanup(func() {
+		glueSessions.mu.Lock()
+		delete(glueSessions.m, hex.EncodeToString(sid))
+		glueSessions.mu.Unlock()
+	})
+
+	c1, e1, err := glueClient(t, glue.EncodeHello(sid))
+	if err != nil || e1 == 0 {
+		t.Fatalf("first path: epoch %d, %v", e1, err)
+	}
+	_, e2, err := glueClient(t, glue.EncodeHello(sid))
+	if err != nil || e2 != e1 {
+		t.Fatalf("second path of the same session: epoch %d (want %d), %v", e2, e1, err)
+	}
+
+	// сессия истекла (janitor), тот же sid получает новую epoch
+	c1.Close()
+	glueSessions.mu.Lock()
+	delete(glueSessions.m, hex.EncodeToString(sid))
+	glueSessions.mu.Unlock()
+	_, e3, err := glueClient(t, glue.EncodeHello(sid))
+	if err != nil || e3 == e1 {
+		t.Fatalf("new session reused epoch %d (%v)", e3, err)
+	}
+}
+
+func TestGlueRejectsUnknownVersion(t *testing.T) {
+	hello := glue.EncodeHello([]byte("versions"))
+	hello[0] = glue.ProtocolVersion + 1
+	if _, _, err := glueClient(t, hello); !errors.Is(err, glue.ErrUnsupportedVersion) {
+		t.Fatalf("got %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+func TestGlueRefusesSessionOfAnotherClient(t *testing.T) {
+	testSession(t, hex.EncodeToString([]byte("takensid")))
+	glueSessions.mu.Lock()
+	glueSessions.m[hex.EncodeToString([]byte("takensid"))].owner = bob
+	glueSessions.mu.Unlock()
+	if _, _, err := glueClient(t, glue.EncodeHello([]byte("takensid"))); err == nil {
+		t.Fatal("joined a session of another client")
 	}
 }

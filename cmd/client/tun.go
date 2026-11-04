@@ -47,7 +47,7 @@ func runTunMode(srv endpoint, key []byte, tunName string, mtu int, paths int, do
 	if stats != nil {
 		onPing = stats.OnRecv
 	}
-	gp, err := startGluePaths(srv, key, paths, glueReplyHandler(flows, func(pkt []byte) {
+	gp, err := startGluePaths(srv, key, paths, newReplyHandler(flows, func(pkt []byte) {
 		if _, err := dev.Write([][]byte{pkt}, 0); err != nil {
 			log.Printf("TUN write: %v", err)
 		}
