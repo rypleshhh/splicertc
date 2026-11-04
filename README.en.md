@@ -285,3 +285,10 @@ GOOS=linux go build ./cmd/server
 
 CI (`.github/workflows/ci.yml`) runs gofmt, staticcheck, race tests on
 Linux and Windows, govulncheck and a Docker image build on every push.
+
+## License
+
+[MIT](LICENSE). `wintun.dll` is not covered: it is a WireGuard LLC build
+under its own prebuilt binaries license, see
+[wintun.net](https://www.wintun.net/). Go dependencies are under MIT and
+BSD-3-Clause.
